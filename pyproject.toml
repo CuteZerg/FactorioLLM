@@ -1,7 +1,7 @@
 [project]
 name = "factoriollm"
 version = "0.1.0"
-description = "Add your description here"
+description = "LLM based text to blueprint project for Factorio"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
