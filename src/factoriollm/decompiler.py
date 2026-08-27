@@ -1,6 +1,7 @@
 from draftsman.blueprintable import Blueprint
 from draftsman.entity import new_entity
 
+
 def decompile_blueprint_to_code(blueprint_string: str) -> str:
     """
     Accepts a Factorio blueprint string and generates Python code

@@ -1,124 +1,111 @@
-# FactoLLM: Text-to-Blueprint Generator
+# FactorioLLM: Text-to-Blueprint Generator
 
 ![Factorio](https://img.shields.io/badge/Game-Factorio-orange)
 ![Machine Learning](https://img.shields.io/badge/AI-Generative_NLP-blue)
 ![Python](https://img.shields.io/badge/Language-Python_3.10+-yellow)
+![License](https://img.shields.io/badge/License-MIT-green)
 
-**FactoLLM** is a Machine Learning pet project that generates working blueprints for the game Factorio based on natural language text prompts. 
+**FactorioLLM** is an AI-powered tool that generates functional, ready-to-use blueprints for the game Factorio based on natural language prompts. 
 
-Instead of manually designing layouts, a user can simply write: *"Create an expandable copper smelting line for 24 furnaces using red belts,"* and receive a ready-to-use blueprint string to paste directly into the game.
+Instead of manually placing entities or searching the web for specific layouts, you can just type: 
+> *"Create an expandable copper smelting line for 24 furnaces using red belts,"* 
 
----
-
-## Architectural Solution (Why not raw JSON?)
-
-Under the hood, Factorio blueprints are JSON objects containing lists of coordinates (e.g., `{"name": "inserter", "x": 12.5, "y": -4.0}`), compressed via `zlib` and encoded in `base64`. 
-
-**The Problem:** Large Language Models (LLMs) lack spatial reasoning. Forcing an LLM to generate raw coordinates for hundreds of objects in a JSON file results in a chaotic, non-functional mess. The model cannot grasp the concepts of exact proportions or "tileability" (the ability to place blueprints seamlessly side-by-side).
-
-**The Solution (Intermediate Code Generation):** 
-FactoLLM utilizes a **Text-to-Code** approach. 
-Instead of JSON, the LLM generates **Python code** using the [factorio-draftsman](https://github.com/redruin1/factorio-draftsman) library. 
-Tileability, ratios, and spacing are easily expressed in code through `for` loops, mathematical variables, and logic. The backend then executes this code and compiles it into a perfect, error-free blueprint.
+...and receive a working blueprint string instantly.
 
 ---
 
-## Pipeline Architecture (Agentic Loop)
+## How It Works (The Core Concept)
 
-The project implements a Self-Healing execution loop.
+Factorio blueprints are essentially JSON objects containing raw coordinates, compressed via `zlib` and encoded in `base64`. 
+
+**The Challenge:** Large Language Models (LLMs) lack spatial reasoning. Asking an LLM to output a raw JSON blueprint with exact x/y coordinates for hundreds of entities results in broken, non-functional layouts. Models do not inherently understand "tileability" or belt alignment.
+
+**The Solution:** FactorioLLM uses a **Text-to-Code** approach. 
+Instead of predicting JSON coordinates, the LLM generates a **Python script** utilizing the [factorio-draftsman](https://github.com/redruin1/factorio-draftsman) library. Concepts like spacing, alignment, and ratios are naturally handled through Python `for` loops, variables, and math. The backend then safely executes this script to compile a flawless blueprint string.
+
+### The Agentic Loop Pipeline
+
+The project features an automatic self-healing loop:
 
 ```mermaid
 graph TD;
-    A[User] -->|Text Prompt| B(LLM: CodeQwen / Llama-3);
-    B -->|Generates Python Script| C{Isolated Sandbox Environment};
+    A[User Prompt] --> B(LLM: CodeQwen / Llama-3);
+    B -->|Generates Python Script| C{Docker / Sandbox Execution};
     C -->|Syntax / Logic Error| B;
-    C -->|Successful Compilation| D[factorio-draftsman module];
+    C -->|Successful Compilation| D[Draftsman API];
     D -->|Generates Base64| E[Ready Blueprint String];
     E --> A;
 ```
-
-1. **Request:** The user submits a prompt.
-2. **Generation:** The LLM writes a Python script (using Draftsman syntax).
-3. **Validation:** The script is executed in a secure environment (sandbox/Docker).
-4. **Self-Healing:** If the `draftsman` library throws an error (e.g., pipes don't align), the error traceback is sent back to the LLM with a request to fix the code.
-5. **Result:** Upon successful execution, the user receives the final blueprint string.
 
 ---
 
 ## Tech Stack
 
-*   **Model:** Llama-3-8B-Instruct / CodeQwen-1.5-7B.
-*   **Fine-tuning:** Hugging Face `transformers`, `PEFT`, `Unsloth` (for 2x faster LoRA training).
-*   **Factorio API:** `factorio-draftsman` (programmable blueprint generation).
-*   **Backend:** `FastAPI` (request handling) and `Docker` (for isolated code execution).
-*   **Interface:** `Gradio` (Web UI) or `aiogram` (Telegram Bot).
+* **AI Models:** Fine-tuned Code-specific LLMs (Llama-3-8B-Instruct, CodeQwen).
+* **Training:** `Unsloth`, Hugging Face `transformers`, `PEFT` (LoRA).
+* **Factorio API:** `factorio-draftsman` for programmable blueprint compilation.
+* **Backend:** `FastAPI` (serving) & isolated `Docker` environments (safe code execution).
 
 ---
 
-## Implementation Roadmap
+## Getting Started
 
-### Phase 1: Data Engineering & Synthetic Dataset 
-Since ready-made "Text -> Draftsman Code" pairs do not exist, the dataset is built via reverse engineering:
-- Write ~50-100 baseline Python scripts for typical layouts (balancers, smelting lines, malls, train stations).
-- Use powerful model APIs (GPT-4o/Claude 3.5) to generate dozens of diverse user prompt variations for each script.
-- Format the dataset in an `Instruct` layout (Instruction -> Context -> Response).
+*(Note: The project is currently in active development. These instructions represent the local testing setup).*
 
-### Phase 2: LLM Fine-Tuning
-- Quantize the chosen Open-Source model (4-bit/8-bit).
-- Train a LoRA adapter using the `Unsloth` framework on the generated dataset.
-- Expose the model to Factorio-specific vocabulary (*main bus*, *tileable*, *mall*, *yellow belt*, *throughput*).
+### Prerequisites
+* Python 3.10+
+* Factorio (for testing the generated blueprints)
 
-### Phase 3: Infrastructure & Agentic Loop
-- Set up a secure sandbox (Docker) for executing LLM-generated code.
-- Implement reflection logic (re-prompting the LLM automatically when catching a `Traceback` error).
+### Installation
 
-### Phase 4: User Interface
-- Deploy a user-friendly UI using Gradio or Streamlit.
-- Integrate a blueprint renderer to show a preview image of the layout before the user pastes it into the game.
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/yourusername/FactorioLLM.git
+   cd FactorioLLM
+   ```
 
----
+2. Create a virtual environment and activate it:
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   ```
 
-## Example of Execution
+3. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+   *(Make sure `factorio-draftsman` is included in your requirements)*
 
-**User Prompt:**
-> "Write a script for an iron smelting line with 12 stone furnaces. Use yellow belts and standard inserters. Make it tileable along the X-axis."
+### Basic Usage
 
-**Generated LLM Code (Draftsman):**
-```python
-from draftsman.blueprintable import Blueprint
-from draftsman.entity import StoneFurnace, Inserter, TransportBelt
-
-bp = Blueprint()
-bp.name = "Expandable Iron Smelting"
-
-furnace_count = 12
-for i in range(furnace_count):
-    # Place furnaces
-    furnace = StoneFurnace("stone-furnace", position={"x": i * 2, "y": 0})
-    bp.entities.append(furnace)
-    
-    # Input belt for ore and coal
-    belt_in = TransportBelt("transport-belt", position={"x": i * 2, "y": -2})
-    bp.entities.append(belt_in)
-    
-    # Inserters
-    ins_in = Inserter("inserter", position={"x": i * 2, "y": -1}, direction=4)
-    bp.entities.append(ins_in)
-
-# Blueprint string compilation is handled automatically by the backend
+To test the blueprint generation via a script:
+```bash
+python generate.py --prompt "Create a 4x4 belt balancer using fast transport belts"
 ```
-
-**Result Output:**
-`0eNq1kNsKwyAMhl... [LONG BASE64 STRING] ...`
+The console will output the base64 string starting with `0eN...` which you can paste directly into Factorio using the **Import String** tool.
 
 ---
 
-## Future Improvements
-Planned features include:
-1. Support for major overhaul mods (Space Exploration, Krastorio 2).
-2. Resource cost optimization algorithms.
-3. Circuit network (combinator logic) generation based on textual condition descriptions.
+## Project Roadmap
+
+- [x] **Phase 0: Proof of Concept** - Manual validation of Draftsman code generation.
+- [ ] **Phase 1: Data Engineering** - Building a decompiler to convert existing JSON blueprints into Draftsman Python scripts to create a massive dataset.
+- [ ] **Phase 2: Synthetic Prompts** - Using frontier models (GPT-4o/Claude) to attach diverse human prompts to the decompiled scripts.
+- [ ] **Phase 3: Fine-Tuning** - Training a LoRA adapter for open-source LLMs to understand Factorio logic and Draftsman syntax.
+- [ ] **Phase 4: Agentic Loop** - Implementing the self-healing sandbox execution.
+- [ ] **Phase 5: User Interface** - Releasing a Web UI (Gradio) or a Telegram bot for public use.
 
 ---
-*This project is created for educational and portfolio purposes. Factorio is a trademark of Wube Software.*
+
+## Contributing
+
+Contributions are welcome! If you love Factorio and Machine Learning, feel free to open an issue or submit a Pull Request. We are currently looking for help with:
+* Gathering and filtering high-quality blueprints for the dataset.
+* Optimizing the `decompiler.py` for complex mods and circuit networks.
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+*Disclaimer: This project is created for educational and community purposes. "Factorio" is a registered trademark of Wube Software Ltd.*
 ```
