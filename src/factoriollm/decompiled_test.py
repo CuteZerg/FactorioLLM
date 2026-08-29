@@ -1,5 +1,5 @@
 from draftsman.blueprintable import Blueprint
-from draftsman.entity import UndergroundBelt, Splitter, TransportBelt
+from draftsman.entity import Splitter, TransportBelt, UndergroundBelt
 
 # Blueprint: Normalized Blueprint
 bp = Blueprint()
@@ -11,24 +11,24 @@ bp.entities.append(TransportBelt('transport-belt', position={'x': 0.0, 'y': 5.0}
 bp.entities.append(TransportBelt('transport-belt', position={'x': 0.0, 'y': 6.0}, direction=0))
 bp.entities.append(TransportBelt('transport-belt', position={'x': 0.0, 'y': 7.0}, direction=0))
 bp.entities.append(TransportBelt('transport-belt', position={'x': 0.0, 'y': 9.0}, direction=0))
-bp.entities.append(Splitter('splitter', position={'x': 0.5, 'y': 1.0}, direction=0))
-bp.entities.append(Splitter('splitter', position={'x': 0.5, 'y': 8.0}, direction=0))
+bp.entities.append(Splitter('splitter', position={'x': 0.5, 'y': 1.0}, direction=0, input_priority='none', output_priority='none'))
+bp.entities.append(Splitter('splitter', position={'x': 0.5, 'y': 8.0}, direction=0, input_priority='none', output_priority='none'))
 bp.entities.append(TransportBelt('transport-belt', position={'x': 1.0, 'y': 0.0}, direction=0))
-bp.entities.append(UndergroundBelt('underground-belt', position={'x': 1.0, 'y': 2.0}, direction=0))
+bp.entities.append(UndergroundBelt('underground-belt', position={'x': 1.0, 'y': 2.0}, direction=0, io_type='output'))
 bp.entities.append(TransportBelt('transport-belt', position={'x': 1.0, 'y': 3.0}, direction=12))
 bp.entities.append(TransportBelt('transport-belt', position={'x': 1.0, 'y': 5.0}, direction=0))
-bp.entities.append(UndergroundBelt('underground-belt', position={'x': 1.0, 'y': 6.0}, direction=0))
+bp.entities.append(UndergroundBelt('underground-belt', position={'x': 1.0, 'y': 6.0}, direction=0, io_type='input'))
 bp.entities.append(TransportBelt('transport-belt', position={'x': 1.0, 'y': 9.0}, direction=0))
-bp.entities.append(Splitter('splitter', position={'x': 1.5, 'y': 4.0}, direction=0))
-bp.entities.append(Splitter('splitter', position={'x': 1.5, 'y': 7.0}, direction=0))
+bp.entities.append(Splitter('splitter', position={'x': 1.5, 'y': 4.0}, direction=0, input_priority='none', output_priority='none'))
+bp.entities.append(Splitter('splitter', position={'x': 1.5, 'y': 7.0}, direction=0, input_priority='none', output_priority='none'))
 bp.entities.append(TransportBelt('transport-belt', position={'x': 2.0, 'y': 0.0}, direction=0))
-bp.entities.append(UndergroundBelt('underground-belt', position={'x': 2.0, 'y': 2.0}, direction=0))
+bp.entities.append(UndergroundBelt('underground-belt', position={'x': 2.0, 'y': 2.0}, direction=0, io_type='output'))
 bp.entities.append(TransportBelt('transport-belt', position={'x': 2.0, 'y': 3.0}, direction=4))
 bp.entities.append(TransportBelt('transport-belt', position={'x': 2.0, 'y': 5.0}, direction=0))
-bp.entities.append(UndergroundBelt('underground-belt', position={'x': 2.0, 'y': 6.0}, direction=0))
+bp.entities.append(UndergroundBelt('underground-belt', position={'x': 2.0, 'y': 6.0}, direction=0, io_type='input'))
 bp.entities.append(TransportBelt('transport-belt', position={'x': 2.0, 'y': 9.0}, direction=0))
-bp.entities.append(Splitter('splitter', position={'x': 2.5, 'y': 1.0}, direction=0))
-bp.entities.append(Splitter('splitter', position={'x': 2.5, 'y': 8.0}, direction=0))
+bp.entities.append(Splitter('splitter', position={'x': 2.5, 'y': 1.0}, direction=0, input_priority='none', output_priority='none'))
+bp.entities.append(Splitter('splitter', position={'x': 2.5, 'y': 8.0}, direction=0, input_priority='none', output_priority='none'))
 bp.entities.append(TransportBelt('transport-belt', position={'x': 3.0, 'y': 0.0}, direction=0))
 bp.entities.append(TransportBelt('transport-belt', position={'x': 3.0, 'y': 2.0}, direction=0))
 bp.entities.append(TransportBelt('transport-belt', position={'x': 3.0, 'y': 3.0}, direction=0))
@@ -36,5 +36,4 @@ bp.entities.append(TransportBelt('transport-belt', position={'x': 3.0, 'y': 5.0}
 bp.entities.append(TransportBelt('transport-belt', position={'x': 3.0, 'y': 6.0}, direction=0))
 bp.entities.append(TransportBelt('transport-belt', position={'x': 3.0, 'y': 7.0}, direction=0))
 bp.entities.append(TransportBelt('transport-belt', position={'x': 3.0, 'y': 9.0}, direction=0))
-# Check the result
 print(bp.to_string())
