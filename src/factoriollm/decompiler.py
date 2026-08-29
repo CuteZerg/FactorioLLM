@@ -3,7 +3,7 @@ from draftsman.entity import new_entity
 
 
 def format_class_name(entity_name: str) -> str:
-    """Превращает 'underground-belt' в 'UndergroundBelt'"""
+    """Turns 'underground-belt' into 'UndergroundBelt'"""
     return "".join(word.capitalize() for word in entity_name.split("-"))
 
 def decompile_and_normalize(blueprint_string: str) -> str:
@@ -16,11 +16,11 @@ def decompile_and_normalize(blueprint_string: str) -> str:
     if not bp.entities:
         return "bp = Blueprint()"
 
-    # 1. НОРМАЛИЗАЦИЯ КООРДИНАТ (ищем минимальные x и y)
+    # 1. Normalizing coords (searching for min x, y)
     min_x = min(ent.position['x'] for ent in bp.entities if ent.position)
     min_y = min(ent.position['y'] for ent in bp.entities if ent.position)
 
-    # 2. Собираем уникальные классы для импорта
+    # 2. Collecting unique classes for imports
     used_classes = set(format_class_name(ent.name) for ent in bp.entities)
     imports_str = ", ".join(used_classes)
 
@@ -33,11 +33,10 @@ def decompile_and_normalize(blueprint_string: str) -> str:
         ""
     ]
 
-    # 3. Генерируем код со сдвигом к нулю
+    # 3. Generatig code from 0 coords
     for i, ent in enumerate(bp.entities):
         class_name = format_class_name(ent.name)
         
-        # Сдвигаем координаты!
         norm_x = ent.position['x'] - min_x
         norm_y = ent.position['y'] - min_y
         
@@ -52,7 +51,6 @@ def decompile_and_normalize(blueprint_string: str) -> str:
         
     return "\n".join(script_lines)
 
-# Запусти этот код с той же строкой балансировщика!
 
 # --- TEST ---
 
@@ -60,10 +58,10 @@ TEST_BLUEPRINT_STRING = "0eNqdlttuwyAMQP/Fz6wKBnL7lWmaekEVUkoiQqZVVf59STqp3Qpt8F
 
 try:
     generated_python_code = decompile_and_normalize(TEST_BLUEPRINT_STRING)
-    print("=== GENERATED PYTHON CODE ===")
-    print(generated_python_code)
+    #print("=== GENERATED PYTHON CODE ===")
+    #print(generated_python_code)
     
-    with open("decompiled_test.py", "w", encoding="utf-8") as f:
+    with open("./src/factoriollm/decompiled_test.py", "w", encoding="utf-8") as f:
         f.write(generated_python_code)
         f.write("\n# Check the result\n")
         f.write("print(bp.to_string())\n")
