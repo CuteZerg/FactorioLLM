@@ -1,5 +1,6 @@
 from draftsman.blueprintable import Blueprint
 
+
 def format_class_name(entity_name: str) -> str:
     """Converts 'underground-belt' to 'UndergroundBelt'"""
     return "".join(word.capitalize() for word in entity_name.split("-"))

@@ -9,3 +9,8 @@ wheels/
 # Virtual environments
 .venv
 .env
+
+# Data pipeline outputs
+data/
+
+ABOUT.md
