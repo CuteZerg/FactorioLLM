@@ -12,6 +12,7 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 from tqdm import tqdm
+from factoriollm.database import get_pool
 
 load_dotenv(override=True)
 
@@ -28,10 +29,6 @@ REQUEST_DELAY_SEC = 0.3
 MAX_CONCURRENT_REQUESTS = 10
 
 # Data paths
-DATA_DIR = Path("data")
-RAW_DIR = DATA_DIR / "raw"
-CACHE_FILE = RAW_DIR / "blueprints_cache.jsonl"
-KEYS_FILE = RAW_DIR / "all_keys.json"
 
 
 def _get_http_client() -> httpx.AsyncClient:
@@ -143,25 +140,34 @@ async def fetch_blueprint(
             return key, None
 
 
-def _load_cached_keys() -> set[str]:
-    """Load keys that have already been cached to disk."""
-    cached: set[str] = set()
-    if CACHE_FILE.exists():
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    record = json.loads(line.strip())
-                    cached.add(record.get("_key", ""))
-                except json.JSONDecodeError:
-                    continue
-    return cached
+async def _load_cached_keys(pool) -> set[str]:
+    """Load keys that have already been cached to Postgres."""
+    async with pool.acquire() as conn:
+        records = await conn.fetch("SELECT key FROM blueprints")
+        return {r["key"] for r in records}
 
 
-def _save_to_cache(key: str, data: dict[str, Any]) -> None:
-    """Append a single blueprint record to the cache file."""
-    record = {"_key": key, **data}
-    with open(CACHE_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+async def _save_to_cache(pool, key: str, data: dict[str, Any]) -> None:
+    """Insert a single blueprint record to Postgres."""
+    title = data.get("title", "")
+    bp_string = data.get("blueprintString", "")
+    favorites = data.get("favorites", data.get("numberOfFavorites", 0))
+    if isinstance(favorites, dict):
+        favorites = len(favorites)
+    else:
+        try:
+            favorites = int(favorites)
+        except (ValueError, TypeError):
+            favorites = 0
+
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO blueprints (key, title, blueprint_string, favorites, raw_data)
+            VALUES ($1, $2, $3, $4, $5::jsonb)
+            ON CONFLICT (key) DO UPDATE SET
+                title = EXCLUDED.title,
+                favorites = EXCLUDED.favorites
+        """, str(key), str(title), str(bp_string), favorites, json.dumps(data))
 
 
 async def scrape_and_filter(
@@ -169,29 +175,15 @@ async def scrape_and_filter(
 ) -> list[dict[str, Any]]:
     """
     Main scraping pipeline: fetch keys, download blueprints, filter, and cache.
-
-    Args:
-        batch_size: If set, limit the number of blueprints to process.
-
-    Returns:
-        List of filtered blueprint data dicts.
     """
-    # Ensure data directories exist
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
-
+    pool = await get_pool()
+    
     async with _get_http_client() as client:
-        # Step 1: Get all keys (or load from cache)
-        if KEYS_FILE.exists():
-            with open(KEYS_FILE, "r", encoding="utf-8") as f:
-                all_keys = json.load(f)
-            print(f"[*] Loaded {len(all_keys)} keys from cache")
-        else:
-            all_keys = await fetch_all_keys(client)
-            with open(KEYS_FILE, "w", encoding="utf-8") as f:
-                json.dump(all_keys, f)
+        # Step 1: Get all keys
+        all_keys = await fetch_all_keys(client)
 
         # Step 2: Determine which keys still need downloading
-        cached_keys = _load_cached_keys()
+        cached_keys = await _load_cached_keys(pool)
         keys_to_fetch = [k for k in all_keys if k not in cached_keys]
         print(f"[*] Already cached: {len(cached_keys)}, remaining: {len(keys_to_fetch)}")
 
@@ -217,7 +209,7 @@ async def scrape_and_filter(
                 continue
 
             stats["downloaded"] += 1
-            _save_to_cache(key, data)
+            await _save_to_cache(pool, key, data)
 
             passed, reason = filter_blueprint(data)
             if passed:
@@ -228,20 +220,21 @@ async def scrape_and_filter(
                 stats["filtered_out"] += 1
 
     # Also include previously cached blueprints that pass filtering
-    if CACHE_FILE.exists():
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    record = json.loads(line.strip())
-                    key = record.get("_key", "")
-                    if key in cached_keys:
-                        passed, _ = filter_blueprint(record)
-                        if passed and not any(r.get("_key") == key for r in results):
-                            results.append(record)
-                except json.JSONDecodeError:
-                    continue
+    async with pool.acquire() as conn:
+        records = await conn.fetch("SELECT key, raw_data FROM blueprints")
+        for r in records:
+            try:
+                record = json.loads(r["raw_data"])
+                key = r["key"]
+                if key in cached_keys:
+                    record["_key"] = key
+                    passed, _ = filter_blueprint(record)
+                    if passed and not any(r.get("_key") == key for r in results):
+                        results.append(record)
+            except json.JSONDecodeError:
+                continue
 
-    print(f"\n[*] Scraping complete:")
+    print(f"\\n[*] Scraping complete:")
     print(f"    Downloaded:   {stats['downloaded']}")
     print(f"    Passed filter: {stats['filtered_in']}")
     print(f"    Filtered out:  {stats['filtered_out']}")
@@ -251,23 +244,24 @@ async def scrape_and_filter(
     return results
 
 
-def load_cached_blueprints() -> list[dict[str, Any]]:
-    """Load and filter all previously cached blueprints without network access."""
+async def load_cached_blueprints() -> list[dict[str, Any]]:
+    """Load and filter all previously cached blueprints from Postgres."""
+    pool = await get_pool()
     results: list[dict[str, Any]] = []
-    if not CACHE_FILE.exists():
-        return results
-
-    with open(CACHE_FILE, "r", encoding="utf-8") as f:
-        for line in f:
+    
+    async with pool.acquire() as conn:
+        records = await conn.fetch("SELECT key, raw_data FROM blueprints")
+        for r in records:
             try:
-                record = json.loads(line.strip())
+                record = json.loads(r["raw_data"])
+                record["_key"] = r["key"]
                 passed, _ = filter_blueprint(record)
                 if passed:
                     results.append(record)
             except json.JSONDecodeError:
                 continue
-
-    print(f"[*] Loaded {len(results)} usable blueprints from cache")
+                
+    print(f"[*] Loaded {len(results)} usable blueprints from DB cache")
     return results
 
 
