@@ -2,7 +2,7 @@
 
 ![Factorio](https://img.shields.io/badge/Game-Factorio-orange)
 ![Machine Learning](https://img.shields.io/badge/AI-Generative_NLP-blue)
-![Python](https://img.shields.io/badge/Language-Python_3.10+-yellow)
+![Python](https://img.shields.io/badge/Language-Python_3.12-yellow)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 **FactorioLLM** is an AI-powered tool that generates functional, ready-to-use blueprints for the game Factorio based on natural language prompts. 
@@ -29,10 +29,10 @@ The project features an automatic self-healing loop:
 
 ```mermaid
 graph TD;
-    A[User Prompt] --> B(LLM: CodeQwen / Llama-3);
-    B -->|Generates Python Script| C{Docker / Sandbox Execution};
+    A[User Prompt] --> B(LLM: Llama-3 8B Fine-Tuned);
+    B -->|Generates Python Script| C{Draftsman API / Execution};
     C -->|Syntax / Logic Error| B;
-    C -->|Successful Compilation| D[Draftsman API];
+    C -->|Successful Compilation| D[Draftsman Output];
     D -->|Generates Base64| E[Ready Blueprint String];
     E --> A;
 ```
@@ -41,10 +41,10 @@ graph TD;
 
 ## Tech Stack
 
-* **AI Models:** Fine-tuned Code-specific LLMs (Llama-3-8B-Instruct, CodeQwen).
-* **Training:** `Unsloth`, Hugging Face `transformers`, `PEFT` (LoRA).
-* **Factorio API:** `factorio-draftsman` for programmable blueprint compilation.
-* **Backend:** `FastAPI` (serving) & isolated `Docker` environments (safe code execution).
+* **AI Models:** Fine-tuned Code-specific LLMs (`unsloth/llama-3-8b-Instruct-bnb-4bit`).
+* **Training:** `Unsloth` for 2x faster 4-bit LoRA training, Hugging Face `transformers`, `PEFT` (LoRA).
+* **Dataset Generation:** Google Gemini (`google-genai`), `factorio-draftsman`.
+* **Package Management:** `uv`
 
 ---
 
@@ -53,8 +53,10 @@ graph TD;
 *(Note: The project is currently in active development. These instructions represent the local testing setup).*
 
 ### Prerequisites
-* Python 3.10+
+* Python 3.12+
+* `uv` package manager
 * Factorio (for testing the generated blueprints)
+* A GPU with CUDA support for training.
 
 ### Installation
 
@@ -64,48 +66,37 @@ graph TD;
    cd FactorioLLM
    ```
 
-2. Create a virtual environment and activate it:
+2. Sync dependencies using `uv`:
    ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   uv sync
    ```
 
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-   *(Make sure `factorio-draftsman` is included in your requirements)*
+### Training
 
-### Basic Usage
-
-To test the blueprint generation via a script:
+To train the model on the generated dataset:
 ```bash
-python generate.py --prompt "Create a 4x4 belt balancer using fast transport belts"
+uv run python src/factoriollm/train_model.py
 ```
-The console will output the base64 string starting with `0eN...` which you can paste directly into Factorio using the **Import String** tool.
 
 ---
 
 ## Project Roadmap
 
 - [x] **Phase 0: Proof of Concept** - Manual validation of Draftsman code generation.
-- [ ] **Phase 1: Data Engineering** - Building a decompiler to convert existing JSON blueprints into Draftsman Python scripts to create a massive dataset.
-- [ ] **Phase 2: Synthetic Prompts** - Using frontier models (GPT-4o/Claude) to attach diverse human prompts to the decompiled scripts.
-- [ ] **Phase 3: Fine-Tuning** - Training a LoRA adapter for open-source LLMs to understand Factorio logic and Draftsman syntax.
-- [ ] **Phase 4: Agentic Loop** - Implementing the self-healing sandbox execution.
-- [ ] **Phase 5: User Interface** - Releasing a Web UI (Gradio) or a Telegram bot for public use.
+- [x] **Phase 1: Data Engineering** - Fetching blueprints from factorioprints and decompiling them.
+- [x] **Phase 2: Synthetic Prompts** - Using Google Gemini to attach diverse human prompts to the decompiled scripts.
+- [x] **Phase 3: Fine-Tuning** - Training a LoRA adapter for Llama-3 to understand Factorio logic and Draftsman syntax. *(IN PROGRESS)*
+- [ ] **Phase 4: Inference & Agentic Loop** - Implementing the self-healing sandbox execution.
+- [ ] **Phase 5: User Interface** - Releasing a Web UI or a local app.
 
 ---
 
 ## Contributing
 
-Contributions are welcome! If you love Factorio and Machine Learning, feel free to open an issue or submit a Pull Request. We are currently looking for help with:
-* Gathering and filtering high-quality blueprints for the dataset.
-* Optimizing the `decompiler.py` for complex mods and circuit networks.
+Contributions are welcome! If you love Factorio and Machine Learning, feel free to open an issue or submit a Pull Request.
 
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 *Disclaimer: This project is created for educational and community purposes. "Factorio" is a registered trademark of Wube Software Ltd.*
-```

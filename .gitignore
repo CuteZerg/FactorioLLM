@@ -17,3 +17,6 @@ data/
 ABOUT.md
 
 fetch*
+
+factorio_lora_model/
+outputs/
