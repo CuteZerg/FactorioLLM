@@ -1,5 +1,6 @@
 import json
 import os
+import asyncio
 from typing import Any
 
 from dotenv import load_dotenv
@@ -45,7 +46,7 @@ def _get_client() -> genai.Client:
     retry=retry_if_exception_type(Exception),
     reraise=True,
 )
-def refactor_blueprint_code(flat_code: str) -> dict[str, Any] | None:
+async def refactor_blueprint_code(flat_code: str) -> dict[str, Any] | None:
     """
     Send flat draftsman code to Gemini and return a JSON containing
     the refactored code and synthetic user prompts.
@@ -86,7 +87,7 @@ def refactor_blueprint_code(flat_code: str) -> dict[str, Any] | None:
     model_name = "gemini-3.5-flash-lite"
     print(f"[*] Sending request to {model_name}...")
 
-    response = client.models.generate_content(
+    response = await client.aio.models.generate_content(
         model=model_name,
         contents=prompt,
         config=config,
@@ -117,7 +118,7 @@ if __name__ == "__main__":
         flat_code = f.read()
 
     # Send to Gemini
-    result = refactor_blueprint_code(flat_code)
+    result = asyncio.run(refactor_blueprint_code(flat_code))
 
     if result:
         print("\n=== GENERATED PROMPTS ===")

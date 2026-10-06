@@ -19,7 +19,7 @@ FIREBASE_BASE_URL = "https://facorio-blueprints.firebaseio.com/blueprints"
 PROXY_URL = os.getenv("PROXY_URL")
 
 # Filtering constants
-MIN_FAVORITES = 5
+MIN_FAVORITES = 3
 MAX_ENTITIES = 300
 MIN_VERSION = 1.0
 

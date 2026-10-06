@@ -5,6 +5,7 @@ description = "LLM based text to blueprint project for Factorio"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "asyncpg>=0.31.0",
     "factorio-draftsman>=3.3.1",
     "google-genai>=2.20.0",
     "httpx[socks]>=0.28.1",

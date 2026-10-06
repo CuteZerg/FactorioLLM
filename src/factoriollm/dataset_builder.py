@@ -1,6 +1,7 @@
 """Dataset builder: orchestrates scraper -> decompiler -> ai_refactor -> JSONL output."""
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import warnings
@@ -72,7 +73,7 @@ def _build_dataset_entry(user_prompt: str, assistant_code: str) -> dict[str, Any
     }
 
 
-def process_single_blueprint(
+async def process_single_blueprint(
     data: dict[str, Any],
 ) -> list[dict[str, Any]]:
     """
@@ -103,7 +104,7 @@ def process_single_blueprint(
 
     # Step 2: AI refactor (generates loops + 3 synthetic prompts)
     try:
-        result = refactor_blueprint_code(flat_code)
+        result = await refactor_blueprint_code(flat_code)
     except Exception as e:
         logger.warning("Key %s (%s): ai_refactor error: %s", key, title, e)
         return []
@@ -130,7 +131,7 @@ def process_single_blueprint(
     return entries
 
 
-def build_dataset(
+async def build_dataset(
     blueprints: list[dict[str, Any]],
     limit: int | None = None,
 ) -> None:
@@ -158,26 +159,42 @@ def build_dataset(
     successful = 0
     failed = 0
 
-    for bp_data in tqdm(to_process, desc="Building dataset"):
+    max_workers = 10
+    semaphore = asyncio.Semaphore(max_workers)
+
+    async def _process_with_semaphore(bp):
+        async with semaphore:
+            try:
+                entries = await process_single_blueprint(bp)
+                return bp, entries, None
+            except Exception as e:
+                return bp, [], e
+
+    tasks = [_process_with_semaphore(bp) for bp in to_process]
+
+    for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Building dataset"):
+        bp_data, entries, exc = await coro
         key = bp_data.get("_key", "unknown")
         title = bp_data.get("title", "Untitled")
+        safe_title = title.encode("ascii", "ignore").decode("ascii")
 
-        entries = process_single_blueprint(bp_data)
+        if exc:
+            logger.warning("Blueprint %s generated an exception: %s", key, exc)
 
-        if entries:
-            for entry in entries:
-                _append_to_dataset(entry)
-            total_entries += len(entries)
-            successful += 1
-            tqdm.write(
-                f"  [OK] [{successful}/{len(to_process)}] "
-                f"\"{title}\" -> {len(entries)} entries"
-            )
-        else:
-            failed += 1
-            tqdm.write(f"  [SKIP] [{successful}/{len(to_process)}] \"{title}\" -> skipped")
+            if entries:
+                for entry in entries:
+                    _append_to_dataset(entry)
+                total_entries += len(entries)
+                successful += 1
+                tqdm.write(
+                    f"  [OK] [{successful}/{len(to_process)}] "
+                    f"\"{safe_title}\" -> {len(entries)} entries"
+                )
+            else:
+                failed += 1
+                tqdm.write(f"  [SKIP] [{successful}/{len(to_process)}] \"{safe_title}\" -> skipped")
 
-        _mark_processed(key)
+            _mark_processed(key)
 
     print(f"\n[*] Dataset building complete:")
     print(f"    Blueprints processed:  {successful + failed}")
@@ -211,7 +228,7 @@ async def run_full_pipeline(
         return
 
     # Step 2: Build the dataset
-    build_dataset(blueprints, limit=build_limit)
+    await build_dataset(blueprints, limit=build_limit)
 
 
 # --- MAIN EXECUTION ---
