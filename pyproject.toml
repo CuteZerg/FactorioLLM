@@ -3,7 +3,7 @@ name = "factoriollm"
 version = "0.1.0"
 description = "LLM based text to blueprint project for Factorio"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = "==3.12.*"
 dependencies = [
     "asyncpg>=0.31.0",
     "factorio-draftsman>=3.3.1",
@@ -16,15 +16,13 @@ dependencies = [
     "bitsandbytes>=0.41.0",
     "datasets>=2.16.0",
     "peft>=0.11.1",
-    "torch==2.6.0",
-    "torchao==0.13.0",
-    "torchaudio==2.6.0",
-    "torchvision==0.21.0",
+    "torch==2.14.1",
+    "torchao",
     "transformers>=4.40.0",
-    "triton-windows",
     "trl>=0.9.0",
     "unsloth",
     "unsloth-zoo>=2026.10.1",
+    "triton-windows>=3.8.0.post29",
 ]
 
 [project.scripts]
@@ -36,11 +34,9 @@ build-backend = "uv_build"
 
 [tool.uv]
 index = [
-  { name = "pytorch-cu124", url = "https://download.pytorch.org/whl/cu124", explicit = true }
+  { name = "pytorch-cu132", url = "https://download.pytorch.org/whl/cu132", explicit = true }
 ]
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu124" }
-torchvision = { index = "pytorch-cu124" }
-torchaudio = { index = "pytorch-cu124" }
+torch = { index = "pytorch-cu132" }
 unsloth = { git = "https://github.com/unslothai/unsloth.git" }
