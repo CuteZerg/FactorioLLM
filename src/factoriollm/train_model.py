@@ -1,4 +1,6 @@
 import torch
+if getattr(torch.utils, "_pytree", None) and not hasattr(torch.utils._pytree, "register_constant"):
+    torch.utils._pytree.register_constant = lambda x: None
 from unsloth import FastLanguageModel
 from datasets import load_dataset
 from trl import SFTTrainer
