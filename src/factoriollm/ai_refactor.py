@@ -63,13 +63,21 @@ async def refactor_blueprint_code(flat_code: str) -> dict[str, Any] | None:
     ```
     
     Do the following:
-    1. Refactor the code. Find repeating patterns (belt lines, furnace rows, etc.) and replace them with `for` loops and variables.
-    2. Create 3 human-like user prompts (in English and Russian) that a player might use to request this exact blueprint.
+    1. Refactor the code into a scalable, algorithmic generator script. Identify repeating patterns (e.g. rows of furnaces, balancer sections, repeating belts/inserters) and replace them with loops, variables, and math formulas. Combine duplicated entities where appropriate. 
+    2. Maintain exactly the same geometry, coordinates, and logic as the original blueprint. Do not omit any entities.
+    3. Create 6 distinct, human-like user prompts (3 in English, 3 in Russian) that a player might use to request this exact blueprint. They should be natural and descriptive.
     
     Return the result strictly in this JSON format:
     {{
         "refactored_code": "string containing the full python code",
-        "user_prompts": ["prompt 1", "prompt 2", "prompt 3"]
+        "user_prompts": [
+            "english prompt 1", 
+            "english prompt 2", 
+            "english prompt 3",
+            "russian prompt 1",
+            "russian prompt 2",
+            "russian prompt 3"
+        ]
     }}
     """
 

@@ -21,7 +21,7 @@ PROXY_URL = os.getenv("PROXY_URL")
 
 # Filtering constants
 MIN_FAVORITES = 3
-MAX_ENTITIES = 300
+MAX_ENTITIES = 500
 MIN_VERSION = 1.0
 
 # Rate limiting
@@ -92,6 +92,15 @@ def filter_blueprint(data: dict[str, Any]) -> tuple[bool, str]:
     # Only vanilla blueprints
     if any("/mods/modded/" in tag for tag in tags):
         return False, "modded blueprint"
+
+    # Filter out Space Age / 2.0 / Expansion content
+    title = data.get("title", "").lower()
+    space_age_keywords = [
+        "space age", "fulgora", "vulcanus", "gleba", "aquilo", 
+        "quality", "legendary", "epic", "rare", "uncommon"
+    ]
+    if any(kw in title for kw in space_age_keywords) or any("space" in t.lower() or "2.0" in t.lower() for t in tags):
+        return False, "space age content"
 
     # Version filter: >= 1.0
     version = _parse_version_from_tags(tags)
@@ -220,18 +229,20 @@ async def scrape_and_filter(
                 stats["filtered_out"] += 1
 
     # Also include previously cached blueprints that pass filtering
+    result_keys = {r.get("_key") for r in results}
     async with pool.acquire() as conn:
         records = await conn.fetch("SELECT key, raw_data FROM blueprints")
         for r in records:
             try:
-                record = json.loads(r["raw_data"])
+                record = json.loads(r["raw_data"]) if isinstance(r["raw_data"], str) else r["raw_data"]
                 key = r["key"]
                 if key in cached_keys:
                     record["_key"] = key
                     passed, _ = filter_blueprint(record)
-                    if passed and not any(r.get("_key") == key for r in results):
+                    if passed and key not in result_keys:
                         results.append(record)
-            except json.JSONDecodeError:
+                        result_keys.add(key)
+            except (json.JSONDecodeError, TypeError):
                 continue
 
     print(f"\\n[*] Scraping complete:")

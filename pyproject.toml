@@ -3,7 +3,7 @@ name = "factoriollm"
 version = "0.1.0"
 description = "LLM based text to blueprint project for Factorio"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 dependencies = [
     "asyncpg>=0.31.0",
     "factorio-draftsman>=3.3.1",

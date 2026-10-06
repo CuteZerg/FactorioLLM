@@ -165,7 +165,7 @@ async def build_dataset(
     successful = 0
     failed = 0
 
-    max_workers = 10
+    max_workers = 50
     semaphore = asyncio.Semaphore(max_workers)
 
     async def _process_with_semaphore(bp):
