@@ -12,6 +12,18 @@ dependencies = [
     "python-dotenv>=1.2.3",
     "tenacity>=9.1.2",
     "tqdm>=4.67.1",
+    "accelerate>=0.21.0",
+    "bitsandbytes>=0.41.0",
+    "datasets>=2.16.0",
+    "numpy<2",
+    "peft>=0.11.1",
+    "torch==2.6.0",
+    "torchaudio==2.6.0",
+    "torchvision==0.21.0",
+    "transformers>=4.40.0",
+    "trl>=0.9.0",
+    "unsloth",
+    "unsloth-zoo",
 ]
 
 [project.scripts]
@@ -20,3 +32,14 @@ factoriollm = "factoriollm:main"
 [build-system]
 requires = ["uv_build>=0.12.6,<0.13.0"]
 build-backend = "uv_build"
+
+[tool.uv]
+index = [
+  { name = "pytorch-cu124", url = "https://download.pytorch.org/whl/cu124", explicit = true }
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
+torchaudio = { index = "pytorch-cu124" }
+unsloth = { git = "https://github.com/unslothai/unsloth.git" }
