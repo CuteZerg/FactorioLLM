@@ -71,9 +71,27 @@ graph TD;
    uv sync
    ```
 
+### Usage
+
+#### 1. Interactive Web Studio (Gradio)
+Launch the local web application:
+```bash
+uv run python src/factoriollm/generate.py --web
+# or
+uv run python src/factoriollm/app.py
+```
+Open your browser at `http://127.0.0.1:7860`.
+
+#### 2. Terminal CLI
+Generate a blueprint directly from command line:
+```bash
+uv run python src/factoriollm/generate.py -p "Create a 4x4 belt balancer with fast transport belts"
+```
+The blueprint string will be automatically copied to your clipboard ready for in-game `Ctrl + V`.
+
 ### Training
 
-To train the model on the generated dataset:
+To train or re-train the model on the dataset:
 ```bash
 uv run python src/factoriollm/train_model.py
 ```
@@ -85,9 +103,9 @@ uv run python src/factoriollm/train_model.py
 - [x] **Phase 0: Proof of Concept** - Manual validation of Draftsman code generation.
 - [x] **Phase 1: Data Engineering** - Fetching blueprints from factorioprints and decompiling them.
 - [x] **Phase 2: Synthetic Prompts** - Using Google Gemini to attach diverse human prompts to the decompiled scripts.
-- [x] **Phase 3: Fine-Tuning** - Training a LoRA adapter for Llama-3 to understand Factorio logic and Draftsman syntax. *(IN PROGRESS)*
-- [ ] **Phase 4: Inference & Agentic Loop** - Implementing the self-healing sandbox execution.
-- [ ] **Phase 5: User Interface** - Releasing a Web UI or a local app.
+- [x] **Phase 3: Fine-Tuning** - Training a LoRA adapter for Llama-3 to understand Factorio logic and Draftsman syntax (`factorio_lora_model`).
+- [x] **Phase 4: Inference & Agentic Loop** - Closed Docker sandbox execution with automatic error recovery (3 retries).
+- [x] **Phase 5: User Interface** - Interactive Gradio Web Studio and CLI runner with clipboard integration.
 
 ---
 

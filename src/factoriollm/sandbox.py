@@ -54,6 +54,26 @@ class ExecutionResult:
         return "\n\n".join(parts)
 
 
+# Dynamic compatibility shim to resolve synthetic entity class names from dataset
+# (e.g., StoneFurnace -> Furnace, SmallLamp -> Lamp, MediumElectricPole -> ElectricPole)
+COMPATIBILITY_SHIM = """
+import re
+import draftsman.entity as _d_ent
+
+def _compat_getattr(name):
+    if name in _d_ent.__dict__:
+        return _d_ent.__dict__[name]
+    s1 = re.sub(r'(.)([A-Z][a-z]+)', r'\\1-\\2', name)
+    kebab = re.sub(r'([a-z0-9])([A-Z])', r'\\1-\\2', s1).lower()
+    try:
+        return _d_ent.get_entity_class(kebab)
+    except Exception:
+        raise AttributeError(f"module 'draftsman.entity' has no attribute '{name}'")
+
+_d_ent.__getattr__ = _compat_getattr
+"""
+
+
 class DockerSandbox:
     """
     Executes Python scripts inside an isolated Docker container with strict constraints:
@@ -159,11 +179,14 @@ class DockerSandbox:
             "python", "-",
         ]
 
+        # Prepend compatibility shim to automatically resolve synthetic entity classes
+        script_to_run = COMPATIBILITY_SHIM + "\n" + code
+
         start_time = time.perf_counter()
         try:
             proc = subprocess.run(
                 docker_cmd,
-                input=code,
+                input=script_to_run,
                 capture_output=True,
                 text=True,
                 timeout=self.timeout,

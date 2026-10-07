@@ -23,6 +23,7 @@ dependencies = [
     "unsloth",
     "unsloth-zoo>=2026.10.1",
     "triton-windows>=3.8.0.post29",
+    "gradio>=6.29.1",
 ]
 
 [project.scripts]

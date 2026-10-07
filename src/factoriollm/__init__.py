@@ -1,2 +1,3 @@
-def main() -> None:
-    print("Hello from factoriollm!")
+from factoriollm.generate import main
+
+__all__ = ["main"]

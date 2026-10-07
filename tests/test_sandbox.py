@@ -57,6 +57,23 @@ while True:
         self.assertFalse(res.success)
         self.assertIn("TimeoutExpired", res.error_message or "")
 
+    def test_sandbox_synthetic_classes(self):
+        code = """
+from draftsman.blueprintable import Blueprint
+from draftsman.entity import StoneFurnace, SmallLamp, MediumElectricPole, LongHandedInserter
+
+bp = Blueprint()
+bp.entities.append(StoneFurnace('stone-furnace', position={'x': 1.0, 'y': 2.0}))
+bp.entities.append(MediumElectricPole('medium-electric-pole', position={'x': 3.0, 'y': 2.0}))
+bp.entities.append(LongHandedInserter('long-handed-inserter', position={'x': 2.0, 'y': 2.0}))
+bp.entities.append(SmallLamp('small-lamp', position={'x': 4.0, 'y': 2.0}))
+print(bp.to_string())
+"""
+        res = self.sandbox.execute(code)
+        self.assertTrue(res.success)
+        self.assertIsNotNone(res.blueprint_string)
+        self.assertTrue(res.blueprint_string.startswith("0e"))
+
     def test_sandbox_network_isolated(self):
         code = """
 import urllib.request
