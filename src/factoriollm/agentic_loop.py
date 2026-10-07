@@ -119,13 +119,12 @@ class AgenticBlueprintGenerator:
                 if attempt < retries_limit:
                     retry_prompt = (
                         f"Generation failed: The script was incomplete and truncated ({comp_reason}).\n"
-                        f"This happened because repeating entities (like conveyor belts) were hardcoded line-by-line instead of using loops, exceeding generation limits.\n\n"
-                        f"You MUST rewrite the entire Python script from scratch using compact Python 'for' loops (e.g. 'for x in range(start, end, step): bp.entities.append(...)') for all conveyor belts and repeating entities.\n"
-                        f"CRITICAL RULES:\n"
-                        f"- NEVER hardcode repeating belts one by one. Always wrap straight belt lines in a for-loop.\n"
-                        f"- Output the COMPLETE standalone Python script from imports to print(bp.to_string()).\n"
-                        f"- Do NOT output continuation fragments. Start directly from the imports.\n"
-                        f"- Keep the entire script under 60-80 lines."
+                        f"This occurred because repetitive entity placements exceeded the output token budget.\n\n"
+                        f"Please rewrite the entire Python script from scratch using compact, algorithmic code (such as 'for' loops and mathematical expressions) for all repeating structures.\n"
+                        f"Requirements:\n"
+                        f"- Output only the complete standalone Python script from imports to print(bp.to_string()).\n"
+                        f"- Do not output continuation fragments; start directly with the imports.\n"
+                        f"- Keep the script concise and algorithmic."
                     )
 
                     # Sanitize history to prevent continuation hallucinations (like "'y': 7.0}, direction=4))")
@@ -133,7 +132,7 @@ class AgenticBlueprintGenerator:
                         {"role": "user", "content": prompt},
                         {
                             "role": "assistant",
-                            "content": "# [Note: Previous generation was truncated due to hardcoding repeating belts without loops]",
+                            "content": "# [Note: Previous generation was truncated due to output token limit]",
                         },
                         {"role": "user", "content": retry_prompt},
                     ]

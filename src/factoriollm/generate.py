@@ -42,7 +42,8 @@ def run_cli_generation(
 
     final_result = None
     try:
-        for event in stream:
+        while True:
+            event = next(stream)
             if event.event_type == "info":
                 print(f"[*] {event.message}")
             elif event.event_type == "code":
@@ -53,7 +54,7 @@ def run_cli_generation(
                 print(f"[*] Running in Docker sandbox (timeout {sandbox.timeout}s)...")
             elif event.event_type == "retry":
                 print(f"[!] Execution failed. Triggering self-healing recovery...")
-                if event.execution_result:
+                if event.execution_result and event.execution_result.error_message:
                     print(f"    Error: {event.execution_result.error_message}")
             elif event.event_type == "success":
                 print(f"\n[+] {event.message}")

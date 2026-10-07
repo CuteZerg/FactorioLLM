@@ -55,13 +55,16 @@ print(bp.to_string())
 
     def test_repetition_detection(self):
         repeated_text = "\n".join([
-            f"bp.entities.append(TransportBelt('transport-belt', position={{'x': {i}.0, 'y': 7.0}}))"
-            for i in range(110)
+            "bp.entities.append(TransportBelt('transport-belt', position={'x': 1.0, 'y': 1.0}))"
+            for _ in range(12)
         ])
-        self.assertTrue(is_stuck_in_repetition(repeated_text))
+        self.assertTrue(is_stuck_in_repetition(repeated_text, consecutive_threshold=8))
 
-        short_text = "bp.entities.append(TransportBelt('transport-belt'))"
-        self.assertFalse(is_stuck_in_repetition(short_text))
+        non_repeating_text = "\n".join([
+            f"bp.entities.append(TransportBelt('transport-belt', position={{'x': {i}.0, 'y': 1.0}}))"
+            for i in range(12)
+        ])
+        self.assertFalse(is_stuck_in_repetition(non_repeating_text, consecutive_threshold=8))
 
 
 if __name__ == "__main__":

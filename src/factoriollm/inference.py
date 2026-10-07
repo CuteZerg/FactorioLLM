@@ -14,14 +14,11 @@ from typing import Generator, List, Dict, Any, Optional
 # Default system prompt with clear domain rules matching factorio-draftsman
 DEFAULT_SYSTEM_PROMPT = (
     "You are an expert Factorio blueprint generator AI. Write Python code using the factorio-draftsman library "
-    "to build the exact requested blueprint.\n"
-    "Guidelines:\n"
-    "- ALWAYS use Python 'for' loops (e.g. 'for x in range(start, end, step): bp.entities.append(...)') to place repeating entities such as conveyor belts, underground belts, power poles, furnaces, and inserters.\n"
-    "- CRITICAL: NEVER hardcode repeating belts line-by-line (e.g., repeating bp.entities.append(TransportBelt(...)) 10+ times). Always wrap straight belt lines in a 'for' loop!\n"
-    "- When red belts/splitters/underground belts are requested ('красные конвейеры' / 'red belts'), use 'fast-transport-belt', 'fast-splitter', 'fast-underground-belt' (or FastTransportBelt, FastSplitter, FastUndergroundBelt).\n"
-    "- For belt balancers/mixers: use TransportBelt, Splitter, and UndergroundBelt.\n"
-    "- For smelting/production: use Furnace/StoneFurnace, Inserter, TransportBelt/FastTransportBelt, and ElectricPole.\n"
-    "- Keep the script compact and clean (under 60-80 lines) by taking advantage of math and loops.\n"
+    "to construct the exact requested blueprint.\n"
+    "Requirements:\n"
+    "- Write compact, algorithmic code using Python loops (e.g., 'for i in range(...):') and mathematical expressions for repeating structures.\n"
+    "- Never hardcode repetitive entity placements line-by-line; always fold repetitive structures into loops or comprehensions.\n"
+    "- Ensure correct entity prototype names, valid orientations, non-overlapping coordinates, and proper connections.\n"
     "- The script must always conclude with: print(bp.to_string())"
 )
 
@@ -83,13 +80,13 @@ def is_code_complete(code_text: str) -> tuple[bool, str]:
     if not code:
         return False, "Code is empty."
 
-    # Check for blueprint string output
-    if "to_string()" not in code:
-        return False, "Script does not call print(bp.to_string())."
-
     # Check for blueprint object creation
     if "Blueprint(" not in code:
         return False, "Script does not instantiate Blueprint()."
+
+    # Check for blueprint string output
+    if "to_string()" not in code:
+        return False, "Script does not call print(bp.to_string())."
 
     # Check Python syntax
     try:
@@ -103,26 +100,18 @@ def is_code_complete(code_text: str) -> tuple[bool, str]:
     return True, "Complete"
 
 
-def is_stuck_in_repetition(text: str, max_line_repeats: int = 25) -> bool:
+def is_stuck_in_repetition(text: str, consecutive_threshold: int = 8) -> bool:
     """
-    Detects if the text has repeated identical lines or near-identical lines
-    more than max_line_repeats times consecutively.
+    Detects autoregressive repetition degeneration by checking if identical non-empty
+    lines repeat consecutively more than consecutive_threshold times.
+    Completely domain-agnostic.
     """
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if len(lines) < max_line_repeats:
+    if len(lines) < consecutive_threshold:
         return False
 
-    # Check last N lines for identical lines
-    last_n = lines[-max_line_repeats:]
-    if len(set(last_n)) <= 2:
-        return True
-
-    # Check if repetitive belt lines exceed an excessive count
-    belt_lines = [l for l in lines if "TransportBelt(" in l]
-    if len(belt_lines) > 100:
-        return True
-
-    return False
+    last_slice = lines[-consecutive_threshold:]
+    return len(set(last_slice)) == 1
 
 
 class FactorioInference:
@@ -191,6 +180,7 @@ class FactorioInference:
         conversation_history: List[Dict[str, str]],
         temperature: float = 0.2,
         top_p: float = 0.95,
+        repetition_penalty: float = 1.12,
         max_new_tokens: int = 2560,
     ) -> str:
         """Synchronously generates the assistant's reply."""
@@ -212,6 +202,7 @@ class FactorioInference:
                 max_new_tokens=max_new_tokens,
                 temperature=max(temperature, 1e-4),
                 top_p=top_p,
+                repetition_penalty=repetition_penalty,
                 do_sample=temperature > 1e-4,
                 pad_token_id=self.tokenizer.eos_token_id,
             )
@@ -227,6 +218,7 @@ class FactorioInference:
         conversation_history: List[Dict[str, str]],
         temperature: float = 0.2,
         top_p: float = 0.95,
+        repetition_penalty: float = 1.12,
         max_new_tokens: int = 2560,
         max_total_tokens: int = 4096,
         auto_continue: bool = True,
@@ -263,6 +255,7 @@ class FactorioInference:
             max_new_tokens=max_new_tokens,
             temperature=max(temperature, 1e-4),
             top_p=top_p,
+            repetition_penalty=repetition_penalty,
             do_sample=temperature > 1e-4,
             pad_token_id=self.tokenizer.eos_token_id,
         )
@@ -323,6 +316,7 @@ class FactorioInference:
                 max_new_tokens=chunk_tokens,
                 temperature=max(temperature, 1e-4),
                 top_p=top_p,
+                repetition_penalty=repetition_penalty,
                 do_sample=temperature > 1e-4,
                 pad_token_id=self.tokenizer.eos_token_id,
             )
