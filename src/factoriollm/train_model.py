@@ -1,3 +1,4 @@
+import os
 import torch
 if getattr(torch.utils, "_pytree", None) and not hasattr(torch.utils._pytree, "register_constant"):
     torch.utils._pytree.register_constant = lambda x: None
@@ -50,7 +51,9 @@ def train():
         return { "text" : texts }
 
     # Using load_dataset with json will memory-map the file
-    dataset = load_dataset("json", data_files="data/dataset.jsonl", split="train")
+    dataset_path = "data/dataset_v2.jsonl" if os.path.exists("data/dataset_v2.jsonl") else "data/dataset.jsonl"
+    print(f"[*] Loading training dataset from '{dataset_path}'...")
+    dataset = load_dataset("json", data_files=dataset_path, split="train")
     dataset = dataset.map(formatting_prompts_func, batched = True)
 
     # 4. Train
