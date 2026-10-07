@@ -74,6 +74,25 @@ _d_ent.__getattr__ = _compat_getattr
 """
 
 
+def get_helpers_shim() -> str:
+    """Returns Python code string injecting draftsman_helpers module and functions into sandbox."""
+    helpers_file = Path(__file__).resolve().parent / "helpers.py"
+    if helpers_file.exists():
+        content = helpers_file.read_text(encoding="utf-8")
+        return f"""
+import sys as _sys, types as _types
+_dh_mod = _types.ModuleType("draftsman_helpers")
+exec({repr(content)}, _dh_mod.__dict__)
+_sys.modules["draftsman_helpers"] = _dh_mod
+
+import builtins as _builtins
+for _k in ("add_belt_line", "add_underground_pair", "add_entity_row", "add_power_poles", "resolve_direction"):
+    if hasattr(_dh_mod, _k):
+        setattr(_builtins, _k, getattr(_dh_mod, _k))
+"""
+    return ""
+
+
 class DockerSandbox:
     """
     Executes Python scripts inside an isolated Docker container with strict constraints:
@@ -179,8 +198,8 @@ class DockerSandbox:
             "python", "-",
         ]
 
-        # Prepend compatibility shim to automatically resolve synthetic entity classes
-        script_to_run = COMPATIBILITY_SHIM + "\n" + code
+        # Prepend compatibility shim and high-level helpers
+        script_to_run = COMPATIBILITY_SHIM + "\n" + get_helpers_shim() + "\n" + code
 
         start_time = time.perf_counter()
         try:

@@ -88,6 +88,23 @@ except Exception as e:
         self.assertNotIn("NETWORK_ACCESSIBLE", res.stdout)
 
 
+    def test_sandbox_helpers_macro(self):
+        code = """
+from draftsman.blueprintable import Blueprint
+from draftsman_helpers import add_belt_line, add_entity_row, add_power_poles
+
+bp = Blueprint()
+add_belt_line(bp, start=(0, 0), length=16, direction="east", belt_type="fast-transport-belt")
+add_entity_row(bp, "stone-furnace", start=(0, 2), count=8, step=(3.0, 0.0))
+add_power_poles(bp, start=(0, 4), count=4, step=(7.0, 0.0))
+print(bp.to_string())
+"""
+        res = self.sandbox.execute(code)
+        self.assertTrue(res.success, f"Execution failed: {res.error_message}\n{res.stderr}")
+        self.assertIsNotNone(res.blueprint_string)
+        self.assertTrue(res.blueprint_string.startswith("0e"))
+
+
 if __name__ == "__main__":
     unittest.main()
 
