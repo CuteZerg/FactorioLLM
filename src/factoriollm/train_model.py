@@ -71,8 +71,12 @@ def train():
         texts = [tokenizer.apply_chat_template(convo, tokenize=False, add_generation_prompt=False) for convo in convos]
         return { "text" : texts }
 
-    # Using load_dataset with json will memory-map the file
-    dataset_path = "data/dataset_v2.jsonl" if os.path.exists("data/dataset_v2.jsonl") else "data/dataset.jsonl"
+    if os.path.exists("data/dataset_v3.jsonl"):
+        dataset_path = "data/dataset_v3.jsonl"
+    elif os.path.exists("data/dataset_v2.jsonl"):
+        dataset_path = "data/dataset_v2.jsonl"
+    else:
+        dataset_path = "data/dataset.jsonl"
     print(f"[*] Loading training dataset from '{dataset_path}'...")
     dataset = load_dataset("json", data_files=dataset_path, split="train")
     dataset = dataset.map(formatting_prompts_func, batched = True)

@@ -352,6 +352,7 @@ def execute_script_to_blueprint(code: str) -> Optional[Blueprint]:
         "add_entity_row": helpers.add_entity_row,
         "add_power_poles": helpers.add_power_poles,
         "resolve_direction": helpers.resolve_direction,
+        "print": lambda *args, **kwargs: None,
     }
     # Also add entity prototypes
     for k, v in _d_ent.__dict__.items():
@@ -359,8 +360,7 @@ def execute_script_to_blueprint(code: str) -> Optional[Blueprint]:
             glob[k] = v
 
     try:
-        with contextlib.redirect_stdout(io.StringIO()):
-            exec(code, glob, loc)
+        exec(code, glob, loc)
     except Exception:
         return None
 
