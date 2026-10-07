@@ -1,5 +1,26 @@
 import os
+import sys
 import torch
+
+# Live TeeLogger for real-time unbuffered logging to file and console
+class TeeLogger:
+    def __init__(self, filename="training.log"):
+        self.terminal = sys.stdout
+        self.log = open(filename, "w", encoding="utf-8", buffering=1)
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.terminal.flush()
+        self.log.write(message)
+        self.log.flush()
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+sys.stdout = TeeLogger("training.log")
+sys.stderr = sys.stdout
+
 if getattr(torch.utils, "_pytree", None) and not hasattr(torch.utils._pytree, "register_constant"):
     torch.utils._pytree.register_constant = lambda x: None
 from unsloth import FastLanguageModel
@@ -64,7 +85,7 @@ def train():
         train_dataset = dataset,
         dataset_text_field = "text",
         max_seq_length = max_seq_length,
-        dataset_num_proc = 2,
+        dataset_num_proc = 1,
         packing = False, # Can make training 5x faster for short sequences.
         args = TrainingArguments(
             per_device_train_batch_size = 2, # Small batch size for 12GB VRAM
@@ -74,7 +95,7 @@ def train():
             learning_rate = 2e-4,
             fp16 = not torch.cuda.is_bf16_supported(),
             bf16 = torch.cuda.is_bf16_supported(),
-            logging_steps = 10,
+            logging_steps = 5,
             optim = "adamw_8bit",
             weight_decay = 0.01,
             lr_scheduler_type = "linear",
