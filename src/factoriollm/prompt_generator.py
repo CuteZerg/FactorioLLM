@@ -18,13 +18,14 @@ import json
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
+from factoriollm.blueprint_ir import VANILLA_ENTITIES
 from factoriollm.database import get_pool
 
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
@@ -120,6 +121,107 @@ def is_grounded(prompt: str, numbers: Set[int]) -> bool:
     return all(int(n) in numbers for n in re.findall(r"\d+", prompt))
 
 
+# --- Post-generation cleanup ------------------------------------------------------------------
+
+_PROTOTYPE_ID = re.compile(r"\b(" + "|".join(sorted(map(re.escape, VANILLA_ENTITIES), key=len, reverse=True)) + r")(s?)\b")
+
+# Words players use for entities (EN / RU stems), most specific first.
+_ENTITY_WORDS: List[Tuple[str, Set[str]]] = [
+    (r"stone furnace|каменн\w* печ", {"stone-furnace"}),
+    (r"steel furnace|стальн\w* печ", {"steel-furnace"}),
+    (r"electric furnace|электр\w* печ|электропеч", {"electric-furnace"}),
+    (r"furnace|печ", {"stone-furnace", "steel-furnace", "electric-furnace"}),
+    (r"long[- ]handed inserter|длинн\w* манипулятор", {"long-handed-inserter"}),
+    (r"fast inserter|быстр\w* манипулятор", {"fast-inserter"}),
+    (r"bulk inserter|stack inserter|объемн\w* манипулятор|объёмн\w* манипулятор", {"bulk-inserter"}),
+    (r"inserter|манипулятор", {"burner-inserter", "inserter", "long-handed-inserter", "fast-inserter", "bulk-inserter"}),
+    (r"\blabs?\b|лаборатор|\bлаб", {"lab"}),
+    (r"solar panel|солнечн\w* панел", {"solar-panel"}),
+    (r"accumulator|аккумулятор", {"accumulator"}),
+    (r"boiler|котл|котёл|котел", {"boiler"}),
+    (r"steam engine|паров\w* двигател|паров\w* машин", {"steam-engine"}),
+    (r"steam turbine|паров\w* турбин|турбин", {"steam-turbine"}),
+    (r"beacon|маяк", {"beacon"}),
+    (r"nuclear reactor|ядерн\w* реактор|реактор", {"nuclear-reactor"}),
+    (r"roboport|робопорт|дронстанц", {"roboport"}),
+    (r"assembl|сборочн|собирающ|сборщик|ассемблер", {"assembling-machine-1", "assembling-machine-2", "assembling-machine-3"}),
+    (r"mining drill|\bdrills?\b|бур", {"electric-mining-drill", "burner-mining-drill"}),
+    (r"chemical plant|химическ\w* завод|химзавод", {"chemical-plant"}),
+    (r"refiner|нефтеперераб", {"oil-refinery"}),
+    (r"pumpjack|качалк", {"pumpjack"}),
+    (r"flamethrower|огнем[её]т", {"flamethrower-turret"}),
+    (r"laser|лазерн", {"laser-turret"}),
+    (r"turret|турел", {"gun-turret", "laser-turret", "flamethrower-turret", "artillery-turret"}),
+    (r"\bwalls?\b|стен", {"stone-wall"}),
+    (r"\blamps?\b|ламп|фонар", {"small-lamp"}),
+    (r"centrifuge|центрифуг", {"centrifuge"}),
+    (r"splitter|разделител|делител|сплиттер", {"splitter", "fast-splitter", "express-splitter"}),
+    (r"substation|подстанц", {"substation"}),
+    (r"radar|радар", {"radar"}),
+    (r"chest|сундук|ящик", {"wooden-chest", "iron-chest", "steel-chest", "active-provider-chest", "passive-provider-chest",
+                            "storage-chest", "buffer-chest", "requester-chest"}),
+    (r"underground|подземн", {"underground-belt", "fast-underground-belt", "express-underground-belt", "pipe-to-ground"}),
+    (r"\bbelts?\b|конвейер|лент", {"transport-belt", "fast-transport-belt", "express-transport-belt"}),
+    (r"\bpoles?\b|столб|опор", {"small-electric-pole", "medium-electric-pole", "big-electric-pole"}),
+]
+_ASSEMBLERS = {"assembling-machine-1", "assembling-machine-2", "assembling-machine-3"}
+_BELTS = {"transport-belt", "fast-transport-belt", "express-transport-belt"}
+MAX_BELT_LANES = 8  # "4 blue belts" in a balancer request means lanes, not belt tiles
+_NUMBER_WITH_TAIL = re.compile(r"(?<![\w.\-])(\d+)(?![\d.,]\d)\s+([^\d,.;:!?]{2,40})")
+# "13 by 18", "1 to 2", "2-8", "4x4", "4 + 1", "4 к 4": the number is a size or a ratio, not a count
+_PAIR_BEFORE = re.compile(r"\d+\s*(x|by|на|×|to|-|в|к|:|\+)\s*$")
+_PAIR_AFTER = re.compile(r"^(x|by|на|×|to|-|в|к|:|\+)\s*\d")
+# "Level 2", "assembling machine 2", "сборочных заводах 2": the number is a tier
+_TIER_BEFORE = re.compile(r"(level|tier|mk|уровн\w*|тир|machines?|assemblers?|автомат\w*|завод\w*|машин\w*|сборщик\w*)\s*$")
+# "90 degree", "160 MW", "3 input", "16 lane": the number measures something else
+_UNIT_AFTER = re.compile(r"^(degrees?|°|[kmg]w\b|[кмг]вт|inputs?|outputs?|lanes?|полос|вход|выход|spm|i/s|items?/)")
+
+
+def normalize_prompt(prompt: str) -> str:
+    """Replaces raw prototype ids ("assembling-machine-2", "stone-walls") with natural names."""
+    return _PROTOTYPE_ID.sub(lambda m: m.group(1).replace("-", " ") + m.group(2), " ".join(prompt.split()))
+
+
+def prompt_language(prompt: str) -> str:
+    return "ru" if re.search("[а-яё]", prompt.lower()) else "en"
+
+
+def count_conflicts(prompt: str, facts: Dict[str, Any]) -> List[str]:
+    """
+    Finds "<number> <entity>" claims that contradict the blueprint: the entity is absent or the
+    number matches neither its count nor (for assemblers) a recipe count. Size phrases like
+    "13 by 18" are ignored. Unnumbered mentions are not judged (too many false positives).
+    """
+    counts: Dict[str, int] = facts.get("entity_counts", {})
+    recipe_counts = set((facts.get("recipes") or {}).values())
+    low = prompt.lower()
+    conflicts = []
+    for m in _NUMBER_WITH_TAIL.finditer(low):
+        n, tail = int(m.group(1)), m.group(2)
+        before = low[:m.start()]
+        if _PAIR_BEFORE.search(before) or _PAIR_AFTER.search(tail) or _TIER_BEFORE.search(before) or _UNIT_AFTER.search(tail):
+            continue
+        head = " ".join(tail.split()[:3])  # the counted noun must follow within three words
+        best = None  # earliest (and then longest) entity word
+        for pattern, names in _ENTITY_WORDS:
+            hit = re.search(pattern, head)
+            if hit and (best is None or (hit.start(), -len(hit.group(0))) < best[0]):
+                best = ((hit.start(), -len(hit.group(0))), names)
+        if best is None:
+            continue
+        names = best[1]
+        present = {name: counts[name] for name in names if name in counts}
+        ok = bool(present) and (
+            n == sum(present.values())
+            or n in present.values()
+            or (names <= _ASSEMBLERS and n in recipe_counts)
+            or (names <= _BELTS and n <= MAX_BELT_LANES)
+        )
+        if not ok:
+            conflicts.append(f"{n} {tail.strip()[:30]!r}: blueprint has {present or 'none'}")
+    return conflicts
+
+
 def _retry_delay_seconds(err_text: str) -> Optional[float]:
     m = re.search(r"retry(?:Delay|_delay)['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)s", err_text)
     return float(m.group(1)) if m else None
@@ -208,16 +310,17 @@ async def generate_prompts(
             row = by_local_id.get(item.get("id"))
             if row is None:
                 continue
-            numbers = allowed_numbers(json.loads(row["facts"]), row["label"] or "", row["title"] or "")
+            facts = json.loads(row["facts"])
+            numbers = allowed_numbers(facts, row["label"] or "", row["title"] or "")
             for lang in ("en", "ru"):
                 for prompt in (item.get(lang) or [])[:2]:
-                    prompt = " ".join(str(prompt).split())
+                    prompt = normalize_prompt(str(prompt))
                     if not prompt:
                         continue
-                    if not is_grounded(prompt, numbers):
+                    if not is_grounded(prompt, numbers) or count_conflicts(prompt, facts):
                         stats["rejected_ungrounded"] += 1
                         continue
-                    records.append((row["id"], lang, prompt, model))
+                    records.append((row["id"], prompt_language(prompt), prompt, model))
                     answered.add(row["id"])
         stats["missing"] += len(batch) - len(answered)
         stats["blueprints"] += len(answered)

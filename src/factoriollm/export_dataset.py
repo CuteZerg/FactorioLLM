@@ -25,6 +25,7 @@ from factoriollm.canonical_builder import make_token_counter
 from factoriollm.database import get_pool
 from factoriollm.dataset_lifter import lift_and_verify_locally
 from factoriollm.inference import DEFAULT_SYSTEM_PROMPT
+from factoriollm.prompt_generator import count_conflicts, normalize_prompt, prompt_language
 
 DATA_DIR = Path("data")
 
@@ -88,7 +89,7 @@ async def export_dataset_to_jsonl(
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT c.id, c.blueprint_key, c.canonical_code, c.ir, p.lang, p.prompt
+            SELECT c.id, c.blueprint_key, c.canonical_code, c.ir, c.facts, p.prompt
             FROM canonical_blueprints c JOIN generated_prompts p ON p.canonical_id = c.id
             WHERE c.status = 'ok'
             ORDER BY c.id, p.id
@@ -105,7 +106,11 @@ async def export_dataset_to_jsonl(
 
     for r in rows:
         split = "eval" if _stable_fraction(r["blueprint_key"]) < eval_fraction else "train"
-        prompt, code = r["prompt"], r["canonical_code"]
+        prompt, code = normalize_prompt(r["prompt"]), r["canonical_code"]
+        if count_conflicts(prompt, json.loads(r["facts"])):
+            stats["dropped_count_conflict"] += 1
+            continue
+        lang = prompt_language(prompt)
         k = int(_stable_fraction(f"{r['id']}|{prompt}") * 4) % 4 if rotate else 0
         if k:
             key = (r["id"], k)
@@ -123,7 +128,7 @@ async def export_dataset_to_jsonl(
             continue
         lengths.append(n_tokens)
         splits[split].append(build_record(prompt, code))
-        stats[f"{split}_{r['lang']}"] += 1
+        stats[f"{split}_{lang}"] += 1
 
     for split, name in (("train", output_file), ("eval", eval_file)):
         with open(DATA_DIR / name, "w", encoding="utf-8") as f:
