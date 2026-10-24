@@ -20,3 +20,14 @@ fetch*
 
 factorio_lora_model/
 outputs/
+unsloth_compiled_cache/
+
+.vscode/
+# Claude Code: personal local settings
+.claude/settings.local.json
+
+# AI
+docs/
+CLAUDE.md
+.mcp.json
+.claude/
