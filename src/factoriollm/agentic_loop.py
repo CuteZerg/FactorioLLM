@@ -211,7 +211,7 @@ class AgenticBlueprintGenerator:
                     exec_result = ExecutionResult(
                         success=False,
                         blueprint_string=exec_result.blueprint_string,
-                        stdout=exec_result.stdout,
+                        # no stdout: it holds the blueprint string, which is noise in the retry prompt
                         error_message="The blueprint compiles but cannot work in game:\n" + validation.feedback(),
                         execution_time=exec_result.execution_time,
                     )

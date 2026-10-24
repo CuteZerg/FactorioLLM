@@ -185,6 +185,8 @@ def summarize(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             "issue_totals": dict(sorted(issue_totals.items(), key=lambda kv: -kv[1])),
             "mean_gen_tokens": round(statistics.mean(r["gen_tokens"] for r in rows), 1) if rows else None,
             "mean_gen_seconds": round(statistics.mean(r["gen_seconds"] for r in rows), 2) if rows else None,
+            "mean_attempts": round(statistics.mean(r.get("attempts", 1) for r in rows), 2) if rows else None,
+            "valid_first_attempt": _rate([r.get("valid_first_attempt", r["valid"]) for r in rows]),
         }
 
     summary = {"all": block(results)}
@@ -195,7 +197,9 @@ def summarize(results: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 # --- Running ------------------------------------------------------------------------------
 
-def run_eval(adapter: Optional[str], sets: str = "all", limit: Optional[int] = None, max_new_tokens: int = 3500) -> Dict[str, Any]:
+def run_eval(adapter: Optional[str], sets: str = "all", limit: Optional[int] = None, max_new_tokens: int = 3500,
+             retries: int = 1) -> Dict[str, Any]:
+    """retries=1 measures the model alone; retries>1 runs the full agentic loop (sandbox + validator feedback)."""
     from factoriollm.inference import FactorioInference, extract_python_code
 
     cases: List[EvalCase] = []
@@ -210,16 +214,28 @@ def run_eval(adapter: Optional[str], sets: str = "all", limit: Optional[int] = N
     infer.load_model()
     print(f"[*] Adapter: {infer.model_path}; {len(cases)} cases")
 
+    agent = None
+    if retries > 1:
+        from factoriollm.agentic_loop import AgenticBlueprintGenerator
+        agent = AgenticBlueprintGenerator(inference=infer, max_retries=retries)
+
     codes, stats = [], []
     for i, case in enumerate(cases, 1):
         start = time.perf_counter()
-        raw = infer.generate([{"role": "user", "content": case.prompt}], temperature=0.0, max_new_tokens=max_new_tokens)
+        if agent is None:
+            raw = infer.generate([{"role": "user", "content": case.prompt}], temperature=0.0, max_new_tokens=max_new_tokens)
+            code, attempts, first_ok = extract_python_code(raw), 1, None
+        else:
+            res = agent.generate_blueprint(case.prompt, max_retries=retries, temperature=0.0)
+            code, attempts = res.code or "", res.attempts_used
+            first_ok = bool(res.execution_history) and res.execution_history[0].success
         seconds = time.perf_counter() - start
-        codes.append(extract_python_code(raw))
-        stats.append((len(infer.tokenizer(raw, add_special_tokens=False)["input_ids"]), seconds))
-        print(f"    [{i}/{len(cases)}] {case.id}: {stats[-1][0]} tokens, {seconds:.1f}s")
+        codes.append(code)
+        tokens = len(infer.tokenizer(code, add_special_tokens=False)["input_ids"])
+        stats.append((tokens, seconds, attempts, first_ok))
+        print(f"    [{i}/{len(cases)}] {case.id}: {tokens} tokens, {seconds:.1f}s, attempts={attempts}")
 
-    return _execute_score_and_save(infer.model_path, sets, cases, codes, stats)
+    return _execute_score_and_save(infer.model_path, sets, cases, codes, stats, extra={"retries": retries})
 
 
 def _execute_score_and_save(adapter: str, sets: str, cases: List[EvalCase], codes: List[str], stats: List[tuple],
@@ -229,10 +245,14 @@ def _execute_score_and_save(adapter: str, sets: str, cases: List[EvalCase], code
 
     executions = DockerSandbox().execute_batch(codes, per_script_timeout=20)
     results = []
-    for case, code, exec_result, (tokens, seconds) in zip(cases, codes, executions, stats):
+    for case, code, exec_result, (tokens, seconds, *loop) in zip(cases, codes, executions, stats):
         report = safe_validate(exec_result.blueprint_string) if exec_result.success else None
         result = score_case(case, code, exec_result, report, tokens, seconds)
         result["code"] = code
+        if loop:
+            result["attempts"] = loop[0]
+            if loop[1] is not None:  # agentic run: was the first attempt already valid?
+                result["valid_first_attempt"] = loop[1]
         results.append(result)
 
     report = {
@@ -264,7 +284,7 @@ def rescore(path: str) -> Dict[str, Any]:
     if len(rows) != len(old["results"]):
         print(f"[!] {len(old['results']) - len(rows)} cases no longer exist and are skipped")
     cases = [known[r["id"]] for r in rows]
-    stats = [(r["gen_tokens"], r["gen_seconds"]) for r in rows]
+    stats = [(r["gen_tokens"], r["gen_seconds"], r.get("attempts", 1), r.get("valid_first_attempt")) for r in rows]
     return _execute_score_and_save(old["adapter"], old["sets"], cases, [r["code"] for r in rows], stats,
                                    extra={"rescored_from": str(path)})
 
@@ -289,7 +309,7 @@ async def _build_reference_rates() -> Dict[str, Any]:
 
 
 def print_summary(report: Dict[str, Any]) -> None:
-    keys = ["n", "complete", "exec_ok", "valid", "count_exact", "count_within10", "belt_tier_ok", "contains_ok",
+    keys = ["n", "complete", "exec_ok", "valid", "valid_first_attempt", "mean_attempts", "count_exact", "count_within10", "belt_tier_ok", "contains_ok",
             "median_warnings_per_100", "median_reference_warnings_per_100", "mean_gen_tokens", "mean_gen_seconds"]
     summary = report["summary"]
     cols = list(summary)
@@ -318,6 +338,7 @@ def main():
     parser.add_argument("--set", dest="sets", choices=["A", "B", "all"], default="all")
     parser.add_argument("--limit", type=int, default=None, help="Set B sample size (or first N of set A)")
     parser.add_argument("--max-new-tokens", type=int, default=3500)
+    parser.add_argument("--retries", type=int, default=1, help=">1: evaluate the full agentic loop with validator feedback")
     parser.add_argument("--compare", nargs=2, metavar=("REPORT_A", "REPORT_B"))
     parser.add_argument("--build-reference", action="store_true", help="Compute warning rates of real blueprints from the DB")
     parser.add_argument("--rescore", metavar="REPORT", help="Re-execute and re-score an existing report (no GPU)")
@@ -334,7 +355,7 @@ def main():
         REFERENCE_RATES.write_text(json.dumps(rates, indent=1), encoding="utf-8")
         print(json.dumps(rates, indent=1))
     else:
-        run_eval(args.adapter, args.sets, args.limit, args.max_new_tokens)
+        run_eval(args.adapter, args.sets, args.limit, args.max_new_tokens, args.retries)
 
 
 if __name__ == "__main__":

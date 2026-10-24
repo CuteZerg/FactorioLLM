@@ -28,7 +28,8 @@ class FakeSandbox:
         pass
 
     def execute(self, code, timeout=None):
-        return ExecutionResult(success=True, blueprint_string=run_trusted_script(code))
+        bp = run_trusted_script(code)
+        return ExecutionResult(success=True, blueprint_string=bp, stdout=bp + "\n")
 
 
 def run(agent, prompt="test"):
@@ -50,6 +51,7 @@ class TestAgenticLoopValidation(unittest.TestCase):
         retry_prompt = inference.histories[1][-1]["content"]
         self.assertIn("cannot work in Factorio", retry_prompt)
         self.assertIn("[inserter_target]", retry_prompt)
+        self.assertNotIn(result.execution_history[0].blueprint_string[:30], retry_prompt)  # no blueprint string noise
         self.assertIn("retry", [e.event_type for e in events])
 
     def test_validation_can_be_disabled(self):

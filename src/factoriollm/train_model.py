@@ -26,6 +26,23 @@ TEMPLATES = {
 }
 
 
+STOP_FILE = "STOP"
+
+
+def make_stop_file_callback(path: Path):
+    """Graceful stop: when the stop file appears, save a checkpoint and end training (resume with --resume).
+    transformers is imported lazily so this module stays importable without the GPU stack."""
+    from transformers import TrainerCallback
+
+    class StopFileCallback(TrainerCallback):
+        def on_step_end(self, args, state, control, **kwargs):
+            if path.exists():
+                control.should_save = True
+                control.should_training_stop = True
+            return control
+
+    return StopFileCallback()
+
 class TeeLogger:
     """Mirrors stdout/stderr into a log file (installed in main(), never at import time)."""
 
@@ -95,6 +112,7 @@ def parse_args():
     p.add_argument("--eval-steps", type=int, default=500)
     p.add_argument("--eval-max", type=int, default=200, help="Eval examples used for eval loss")
     p.add_argument("--seed", type=int, default=3407)
+    p.add_argument("--resume", action="store_true", help="Continue from the latest checkpoint in outputs/<run-name>/")
     return p.parse_args()
 
 
@@ -170,7 +188,8 @@ def train(args) -> None:
         seed=args.seed,
         dataset_num_proc=1,
     )
-    trainer = SFTTrainer(model=model, processing_class=tokenizer, train_dataset=train_ds, eval_dataset=eval_ds, args=config)
+    trainer = SFTTrainer(model=model, processing_class=tokenizer, train_dataset=train_ds, eval_dataset=eval_ds, args=config,
+                         callbacks=[make_stop_file_callback(output_dir / STOP_FILE)])
 
     if not args.packing:
         instruction_part, response_part = TEMPLATES[template]
@@ -178,7 +197,13 @@ def train(args) -> None:
         check_loss_mask(trainer, tokenizer)
 
     print("[*] Training...")
-    stats = trainer.train()
+    stop_file = output_dir / STOP_FILE
+    stop_file.unlink(missing_ok=True)
+    stats = trainer.train(resume_from_checkpoint=True if args.resume else None)
+    if stop_file.exists():
+        print(f"[*] Stopped on request ({stop_file}); a checkpoint was saved. Continue with --resume.")
+        stop_file.unlink(missing_ok=True)
+        return
     print(f"[*] Finished in {stats.metrics['train_runtime']:.0f}s; final train loss {stats.metrics.get('train_loss')}")
 
     adapter_dir.mkdir(parents=True, exist_ok=True)
@@ -205,7 +230,7 @@ def main():
     args = parse_args()
     log_dir = Path("outputs") / args.run_name
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = open(log_dir / "training.log", "w", encoding="utf-8", buffering=1)
+    log_file = open(log_dir / "training.log", "a" if args.resume else "w", encoding="utf-8", buffering=1)
     sys.stdout = TeeLogger(sys.__stdout__, log_file)
     sys.stderr = TeeLogger(sys.__stderr__, log_file)
     try:
