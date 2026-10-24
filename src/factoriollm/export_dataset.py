@@ -67,13 +67,15 @@ def ir_from_json(data: List[list]) -> IRBlueprint:
     return IRBlueprint([IREntity(n, x, y, d, tuple(sorted(extras.items()))) for n, x, y, d, extras in data])
 
 
-def build_record(prompt: str, code: str) -> Dict:
+def build_record(prompt: str, code: str, meta: Dict) -> Dict:
+    """Chat record; `meta` (canonical_id, blueprint_key, lang, rotation) is for subsampling, not training."""
     return {
         "messages": [
             {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
             {"role": "assistant", "content": code},
-        ]
+        ],
+        "meta": meta,
     }
 
 
@@ -120,6 +122,7 @@ async def export_dataset_to_jsonl(
                 prompt, code = rotate_direction_words(prompt, k), rotated_cache[key]
                 stats["rotated"] += 1
             else:
+                k = 0
                 stats["rotation_failed"] += 1
 
         n_tokens = system_tokens + count_tokens(prompt) + count_tokens(code) + 30  # + chat template overhead
@@ -127,7 +130,8 @@ async def export_dataset_to_jsonl(
             stats["too_long"] += 1
             continue
         lengths.append(n_tokens)
-        splits[split].append(build_record(prompt, code))
+        meta = {"canonical_id": r["id"], "blueprint_key": r["blueprint_key"], "lang": lang, "rotation": k * 90}
+        splits[split].append(build_record(prompt, code, meta))
         stats[f"{split}_{lang}"] += 1
 
     for split, name in (("train", output_file), ("eval", eval_file)):

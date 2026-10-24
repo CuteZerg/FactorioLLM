@@ -108,12 +108,20 @@ The `prompts` stage is free-tier friendly: several blueprints per request, `--rp
 request budget, and a graceful stop on the daily quota; rerun it to continue. Configure `GEMINI_MODEL`,
 `GEMINI_RPM`, `GEMINI_MAX_REQUESTS` in `.env`.
 
-### Training
+### Training and evaluation
 
-To train or re-train the model on the dataset:
 ```bash
-uv run python src/factoriollm/train_model.py
+# smoke test, then a pilot on one EN + one RU prompt per blueprint
+uv run python src/factoriollm/train_model.py --run-name smoke --subsample per-blueprint --max-steps 20 --eval-steps 10
+uv run python src/factoriollm/train_model.py --run-name pilot --subsample per-blueprint --epochs 1
+# evaluate an adapter (GPU + Docker) and compare two reports
+uv run python -m factoriollm.eval_suite --adapter adapters/pilot
+uv run python -m factoriollm.eval_suite --compare outputs/eval/<a>.json outputs/eval/<b>.json
 ```
+
+The default base model is `unsloth/Qwen2.5-Coder-7B-Instruct-bnb-4bit` (`--base-model` to change); the loss is
+computed on the assistant's code only. Generated blueprints are checked by `validator.py`: overlapping entities and
+inserters working with buildings that hold no items are errors, other findings are categorised warnings.
 
 ---
 

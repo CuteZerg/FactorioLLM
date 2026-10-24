@@ -6,9 +6,11 @@ Draftsman Python scripts based on user requests.
 
 from __future__ import annotations
 
+import os
 import re
 import threading
-from typing import Callable, Generator, List, Dict
+from pathlib import Path
+from typing import Callable, Generator, List, Dict, Optional
 
 # Default system prompt with clear domain rules matching factorio-draftsman.
 # Must stay in sync with the training dataset (export_dataset.py uses this exact text).
@@ -154,6 +156,25 @@ def fit_history_to_budget(
     raise ValueError(f"Prompt does not fit into {max_tokens} tokens even after shortening the history.")
 
 
+LEGACY_ADAPTER = "factorio_lora_model"
+ADAPTERS_DIR = Path("adapters")
+
+
+def resolve_adapter_path(explicit: Optional[str] = None) -> str:
+    """
+    Adapter to load: explicit path > $FACTORIOLLM_ADAPTER > newest trained run in adapters/
+    > the legacy factorio_lora_model folder.
+    """
+    if explicit:
+        return explicit
+    if os.getenv("FACTORIOLLM_ADAPTER"):
+        return os.environ["FACTORIOLLM_ADAPTER"]
+    runs = [p for p in ADAPTERS_DIR.glob("*") if (p / "adapter_config.json").exists()] if ADAPTERS_DIR.exists() else []
+    if runs:
+        return str(max(runs, key=lambda p: (p / "adapter_config.json").stat().st_mtime))
+    return LEGACY_ADAPTER
+
+
 class FactorioInference:
     """
     Wraps FastLanguageModel for fast 4-bit LoRA inference.
@@ -161,13 +182,13 @@ class FactorioInference:
 
     def __init__(
         self,
-        model_path: str = "factorio_lora_model",
+        model_path: Optional[str] = None,
         max_seq_length: int = 4096,
         load_in_4bit: bool = True,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         stream_timeout: float = 300.0,
     ):
-        self.model_path = model_path
+        self.model_path = resolve_adapter_path(model_path)
         self.max_seq_length = max_seq_length
         self.load_in_4bit = load_in_4bit
         self.system_prompt = system_prompt

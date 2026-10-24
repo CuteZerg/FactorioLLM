@@ -19,6 +19,7 @@ ABOUT.md
 fetch*
 
 factorio_lora_model/
+adapters/
 outputs/
 unsloth_compiled_cache/
 

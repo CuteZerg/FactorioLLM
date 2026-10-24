@@ -6,6 +6,7 @@ Allows generating blueprints directly from terminal or starting the Gradio Web U
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from typing import Optional
 
@@ -26,6 +27,7 @@ def run_cli_generation(
     temperature: float = 0.2,
     save_code_path: Optional[str] = None,
     save_blueprint_path: Optional[str] = None,
+    adapter: Optional[str] = None,
 ):
     print("\n" + "=" * 60)
     print("🏭 FactorioLLM Generator")
@@ -34,7 +36,8 @@ def run_cli_generation(
     print("=" * 60 + "\n")
 
     sandbox = DockerSandbox()
-    inference = FactorioInference()
+    inference = FactorioInference(model_path=adapter)
+    print(f"[*] Adapter: {inference.model_path}")
     agent = AgenticBlueprintGenerator(inference=inference, sandbox=sandbox, max_retries=max_retries)
 
     print("[*] Launching agentic generation loop...")
@@ -58,6 +61,9 @@ def run_cli_generation(
                     print(f"    Error: {event.execution_result.error_message}")
             elif event.event_type == "success":
                 print(f"\n[+] {event.message}")
+                if event.validation and event.validation.warnings:
+                    print("[i] Validator warnings (may be intentional):")
+                    print(event.validation.feedback(max_items=10, include_warnings=True))
             elif event.event_type == "failure":
                 print(f"\n[-] {event.message}")
     except StopIteration as e:
@@ -141,11 +147,19 @@ def main():
         type=str,
         help="File path to save the generated blueprint string",
     )
+    parser.add_argument(
+        "--adapter", "-a",
+        type=str,
+        default=None,
+        help="LoRA adapter directory (default: $FACTORIOLLM_ADAPTER, newest in adapters/, else factorio_lora_model)",
+    )
 
     args = parser.parse_args()
 
     if args.web or (len(sys.argv) == 1 and not args.prompt):
         # If launched with --web or without arguments, start Gradio Web UI
+        if args.adapter:
+            os.environ["FACTORIOLLM_ADAPTER"] = args.adapter  # app.py builds its inference singleton on import
         from factoriollm.app import main as launch_web
         launch_web(port=args.port)
     else:
@@ -162,6 +176,7 @@ def main():
             temperature=args.temp,
             save_code_path=args.save_code,
             save_blueprint_path=args.save_bp,
+            adapter=args.adapter,
         )
 
 
