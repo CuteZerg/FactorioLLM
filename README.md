@@ -89,6 +89,25 @@ uv run python src/factoriollm/generate.py -p "Create a 4x4 belt balancer with fa
 ```
 The blueprint string will be automatically copied to your clipboard ready for in-game `Ctrl + V`.
 
+### Dataset pipeline (v4)
+
+Blueprints are parsed from their raw JSON into an integer **tile-grid IR** (`blueprint_ir.py`): every entity is
+stored by its top-left tile, 1.x blueprints are converted to 2.0 (directions, renames), and only Factorio 2.0
+vanilla entities are kept. Generated scripts use `tile_position=(x, y)` everywhere, so 1x1 and 2x2 entities share
+one grid.
+
+```bash
+uv run python src/factoriollm/init_db.py                          # create / migrate tables
+uv run python -m factoriollm.dataset_builder scrape --batch 500   # download new blueprints
+uv run python -m factoriollm.dataset_builder canonical            # IR -> macro-lifted code -> sandbox verification
+uv run python -m factoriollm.dataset_builder prompts --max-requests 50   # Gemini: grounded EN/RU prompts
+uv run python -m factoriollm.dataset_builder export               # data/dataset_v4.jsonl + eval split
+```
+
+The `prompts` stage is free-tier friendly: several blueprints per request, `--rpm` throttling, a per-run
+request budget, and a graceful stop on the daily quota; rerun it to continue. Configure `GEMINI_MODEL`,
+`GEMINI_RPM`, `GEMINI_MAX_REQUESTS` in `.env`.
+
 ### Training
 
 To train or re-train the model on the dataset:

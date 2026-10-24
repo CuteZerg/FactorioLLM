@@ -36,6 +36,36 @@ async def init_db():
             refactored_code TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+
+        -- v4 pipeline: one canonical (tile-grid, macro-lifted, verified) script per blueprint / book child
+        CREATE TABLE IF NOT EXISTS canonical_blueprints (
+            id SERIAL PRIMARY KEY,
+            blueprint_key VARCHAR(255) NOT NULL REFERENCES blueprints(key),
+            book_index TEXT NOT NULL DEFAULT '',
+            label TEXT,
+            title TEXT,
+            canonical_code TEXT,
+            code_hash CHAR(64),
+            facts JSONB,
+            ir JSONB,
+            n_tokens INTEGER,
+            status VARCHAR(32) NOT NULL,
+            error TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (blueprint_key, book_index)
+        );
+        CREATE INDEX IF NOT EXISTS canonical_blueprints_status_idx ON canonical_blueprints (status);
+        CREATE INDEX IF NOT EXISTS canonical_blueprints_hash_idx ON canonical_blueprints (code_hash);
+
+        CREATE TABLE IF NOT EXISTS generated_prompts (
+            id SERIAL PRIMARY KEY,
+            canonical_id INTEGER NOT NULL REFERENCES canonical_blueprints(id) ON DELETE CASCADE,
+            lang VARCHAR(8) NOT NULL,
+            prompt TEXT NOT NULL,
+            model TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS generated_prompts_canonical_idx ON generated_prompts (canonical_id);
     """)
     
     print("[*] Database initialized successfully.")
