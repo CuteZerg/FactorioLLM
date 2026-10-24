@@ -255,10 +255,12 @@ def parse_blueprint_dict(
     book_path: str = "",
     allowed: Optional[frozenset] = VANILLA_ENTITIES,
     normalize: bool = True,
+    check_collisions: bool = True,
 ) -> IRBlueprint:
     """
     Converts a raw blueprint JSON dict into an IRBlueprint on the integer tile grid.
-    Raises BlueprintIRError for unknown/disallowed entities or off-grid positions.
+    Raises BlueprintIRError for unknown/disallowed entities or off-grid positions, and for
+    overlapping entities unless check_collisions=False (the validator reports those itself).
     """
     legacy = version[0] < 2
     entities: List[IREntity] = []
@@ -290,7 +292,8 @@ def parse_blueprint_dict(
     ir = IRBlueprint(entities=entities, label=_clean_text(bp.get("label")), version=version, book_path=book_path)
     if normalize:
         ir = normalized(ir)
-    _check_collisions(ir)
+    if check_collisions:
+        _check_collisions(ir)
     return ir
 
 

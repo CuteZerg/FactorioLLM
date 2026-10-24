@@ -163,6 +163,11 @@ def process_generation_stream(
                 current_status = f"✅ Success! Blueprint compiled and validated (attempt {event.attempt})."
                 blueprint_string = event.blueprint_string or ""
                 log_accumulator.append(f"[{event.attempt}] SUCCESS: Blueprint verified successfully!")
+                if event.validation and event.validation.warnings:
+                    log_accumulator.append(
+                        f"[{event.attempt}] VALIDATOR WARNINGS (may be intentional):\n"
+                        + event.validation.feedback(max_items=15, include_warnings=True)
+                    )
             elif event.event_type == "failure":
                 current_status = f"❌ Failed to generate a valid blueprint after {event.attempt} attempts."
                 log_accumulator.append(f"[{event.attempt}] FAILED: Retries exhausted.")

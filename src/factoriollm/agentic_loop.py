@@ -3,8 +3,9 @@ Agentic self-healing execution loop for FactorioLLM.
 Coordinates between LLM inference and the Docker sandbox:
 1. Generates Python Draftsman code from prompt.
 2. Runs code in isolated Docker container.
-3. If error occurs, feeds traceback back to LLM to self-heal.
-4. Returns verified Factorio blueprint string (0e...).
+3. Validates the resulting blueprint (validator.py): errors are things that never work in game.
+4. On an execution or validation error, feeds the traceback / issue list back to the LLM to self-heal.
+5. Returns verified Factorio blueprint string (0e...).
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from typing import Generator, List, Dict, Any, Optional
 
 from factoriollm.inference import FactorioInference, extract_python_code, is_code_complete
 from factoriollm.sandbox import DockerSandbox, ExecutionResult
+from factoriollm.validator import Issue, ValidationReport, validate_string
 
 
 @dataclass
@@ -25,6 +27,7 @@ class AgentStepEvent:
     code: str = ""
     execution_result: Optional[ExecutionResult] = None
     blueprint_string: Optional[str] = None
+    validation: Optional[ValidationReport] = None
 
 
 @dataclass
@@ -37,6 +40,7 @@ class AgentResult:
     conversation_history: List[Dict[str, str]] = field(default_factory=list)
     error_message: Optional[str] = None
     execution_history: List[ExecutionResult] = field(default_factory=list)
+    validation: Optional[ValidationReport] = None
 
 
 class AgenticBlueprintGenerator:
@@ -49,10 +53,19 @@ class AgenticBlueprintGenerator:
         inference: Optional[FactorioInference] = None,
         sandbox: Optional[DockerSandbox] = None,
         max_retries: int = 3,
+        validate: bool = True,
     ):
         self.inference = inference or FactorioInference()
         self.sandbox = sandbox or DockerSandbox()
         self.max_retries = max_retries
+        self.validate = validate
+
+    @staticmethod
+    def _validate(blueprint_string: str) -> ValidationReport:
+        try:
+            return validate_string(blueprint_string)
+        except Exception as e:  # undecodable / unknown entities: report instead of crashing the loop
+            return ValidationReport(errors=[Issue("unparseable", f"Blueprint cannot be analysed: {e}", (0, 0))])
 
     def generate_blueprint_stream(
         self,
@@ -191,14 +204,30 @@ class AgenticBlueprintGenerator:
                 message="Sandbox execution finished.",
             )
 
+            validation = None
+            if exec_result.success and self.validate:
+                validation = self._validate(exec_result.blueprint_string)
+                if not validation.ok:
+                    exec_result = ExecutionResult(
+                        success=False,
+                        blueprint_string=exec_result.blueprint_string,
+                        stdout=exec_result.stdout,
+                        error_message="The blueprint compiles but cannot work in game:\n" + validation.feedback(),
+                        execution_time=exec_result.execution_time,
+                    )
+                    exec_history[-1] = exec_result
+
             if exec_result.success:
+                n_warn = len(validation.warnings) if validation else 0
                 yield AgentStepEvent(
                     event_type="success",
                     attempt=attempt,
                     code=code,
                     blueprint_string=exec_result.blueprint_string,
                     execution_result=exec_result,
-                    message=f"Success! Working Factorio blueprint compiled in {exec_result.execution_time:.2f}s.",
+                    validation=validation,
+                    message=f"Success! Working Factorio blueprint compiled in {exec_result.execution_time:.2f}s"
+                    + (f" ({n_warn} validator warnings)." if n_warn else "."),
                 )
                 return AgentResult(
                     success=True,
@@ -207,20 +236,29 @@ class AgenticBlueprintGenerator:
                     attempts_used=attempt,
                     conversation_history=history,
                     execution_history=exec_history,
+                    validation=validation,
                 )
 
-            # If failed in sandbox and attempts remain: self-heal
+            # If failed in sandbox / validation and attempts remain: self-heal
             if attempt < retries_limit:
                 feedback = exec_result.get_feedback_for_model()
-                retry_prompt = (
-                    f"Executing your Python script in the Factorio sandbox failed with the following error:\n"
-                    f"{feedback}\n\n"
-                    f"Please analyze the error traceback carefully. Fix the issue in the Python code using the factorio-draftsman library.\n"
-                    f"Important instructions:\n"
-                    f"- Write compact, algorithmic code using Python for-loops instead of repeating lines.\n"
-                    f"- Ensure correct entity class names, valid positions, and proper coordinates.\n"
-                    f"- The script MUST conclude with print(bp.to_string()). Output only the corrected complete Python script."
-                )
+                if validation is not None:
+                    retry_prompt = (
+                        f"Your script runs, but the blueprint it builds cannot work in Factorio:\n"
+                        f"{feedback}\n\n"
+                        f"Fix these issues (positions are integer tiles of the entity's top-left corner). "
+                        f"Output only the corrected complete Python script ending with print(bp.to_string())."
+                    )
+                else:
+                    retry_prompt = (
+                        f"Executing your Python script in the Factorio sandbox failed with the following error:\n"
+                        f"{feedback}\n\n"
+                        f"Please analyze the error traceback carefully. Fix the issue in the Python code using the factorio-draftsman library.\n"
+                        f"Important instructions:\n"
+                        f"- Write compact, algorithmic code using Python for-loops instead of repeating lines.\n"
+                        f"- Ensure correct entity names, valid integer tile positions and directions.\n"
+                        f"- The script MUST conclude with print(bp.to_string()). Output only the corrected complete Python script."
+                    )
 
                 # Keep a bounded sliding window: original prompt + last failed code + last error
                 history = [
