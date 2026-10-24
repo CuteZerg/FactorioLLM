@@ -197,7 +197,6 @@ def summarize(results: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def run_eval(adapter: Optional[str], sets: str = "all", limit: Optional[int] = None, max_new_tokens: int = 3500) -> Dict[str, Any]:
     from factoriollm.inference import FactorioInference, extract_python_code
-    from factoriollm.sandbox import DockerSandbox
 
     cases: List[EvalCase] = []
     if sets in ("A", "all"):
@@ -220,8 +219,15 @@ def run_eval(adapter: Optional[str], sets: str = "all", limit: Optional[int] = N
         stats.append((len(infer.tokenizer(raw, add_special_tokens=False)["input_ids"]), seconds))
         print(f"    [{i}/{len(cases)}] {case.id}: {stats[-1][0]} tokens, {seconds:.1f}s")
 
-    sandbox = DockerSandbox()
-    executions = sandbox.execute_batch(codes, per_script_timeout=20)
+    return _execute_score_and_save(infer.model_path, sets, cases, codes, stats)
+
+
+def _execute_score_and_save(adapter: str, sets: str, cases: List[EvalCase], codes: List[str], stats: List[tuple],
+                            extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Runs the generated codes in the sandbox, scores them and writes the JSON report."""
+    from factoriollm.sandbox import DockerSandbox
+
+    executions = DockerSandbox().execute_batch(codes, per_script_timeout=20)
     results = []
     for case, code, exec_result, (tokens, seconds) in zip(cases, codes, executions, stats):
         report = safe_validate(exec_result.blueprint_string) if exec_result.success else None
@@ -230,20 +236,37 @@ def run_eval(adapter: Optional[str], sets: str = "all", limit: Optional[int] = N
         results.append(result)
 
     report = {
-        "adapter": infer.model_path,
+        "adapter": adapter,
         "created": datetime.now().isoformat(timespec="seconds"),
         "sets": sets,
+        **(extra or {}),
         "summary": summarize(results),
         "results": results,
     }
     if REFERENCE_RATES.exists():
         report["reference_rates"] = json.loads(REFERENCE_RATES.read_text(encoding="utf-8"))
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    out = OUTPUT_DIR / f"{Path(infer.model_path).name}-{datetime.now():%Y%m%d-%H%M%S}.json"
+    out = OUTPUT_DIR / f"{Path(adapter).name}-{datetime.now():%Y%m%d-%H%M%S}.json"
     out.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
     print_summary(report)
     print(f"[*] Report: {out}")
     return report
+
+
+def rescore(path: str) -> Dict[str, Any]:
+    """Re-executes and re-scores the codes of an existing report (no GPU), e.g. after validator changes."""
+    old = json.loads(Path(path).read_text(encoding="utf-8"))
+    known = {c.id: c for c in load_set_a()}
+    n_b = sum(r["set"] == "B" for r in old["results"])
+    if n_b:
+        known.update({c.id: c for c in load_set_b(limit=n_b)})
+    rows = [r for r in old["results"] if r["id"] in known]
+    if len(rows) != len(old["results"]):
+        print(f"[!] {len(old['results']) - len(rows)} cases no longer exist and are skipped")
+    cases = [known[r["id"]] for r in rows]
+    stats = [(r["gen_tokens"], r["gen_seconds"]) for r in rows]
+    return _execute_score_and_save(old["adapter"], old["sets"], cases, [r["code"] for r in rows], stats,
+                                   extra={"rescored_from": str(path)})
 
 
 async def _build_reference_rates() -> Dict[str, Any]:
@@ -297,10 +320,13 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=3500)
     parser.add_argument("--compare", nargs=2, metavar=("REPORT_A", "REPORT_B"))
     parser.add_argument("--build-reference", action="store_true", help="Compute warning rates of real blueprints from the DB")
+    parser.add_argument("--rescore", metavar="REPORT", help="Re-execute and re-score an existing report (no GPU)")
     args = parser.parse_args()
 
     if args.compare:
         compare(*args.compare)
+    elif args.rescore:
+        rescore(args.rescore)
     elif args.build_reference:
         import asyncio
         rates = asyncio.run(_build_reference_rates())

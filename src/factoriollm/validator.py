@@ -146,8 +146,22 @@ def validate(ir: IRBlueprint) -> ValidationReport:
 
 
 def validate_string(blueprint_string: str) -> ValidationReport:
-    """Parses (size-limited, no execution) and validates a blueprint string."""
-    return validate(parse_blueprint_string(blueprint_string, allowed=None, check_collisions=False))
+    """
+    Parses (size-limited, no execution) and validates a blueprint string. Off-grid entities are
+    snapped to the tile the game would use and reported as an `off_grid` error, so the rest of the
+    report (counts, collisions) still reflects what would appear in game.
+    """
+    stats: Dict[str, int] = {}
+    report = validate(parse_blueprint_string(blueprint_string, allowed=None, check_collisions=False,
+                                             snap_off_grid=True, stats=stats))
+    if stats.get("off_grid"):
+        report.errors.insert(0, Issue(
+            "off_grid",
+            f"{stats['off_grid']} entities are not aligned to the tile grid; use integer "
+            f"tile_position=(x, y) for the top-left tile instead of center positions",
+            (0, 0),
+        ))
+    return report
 
 
 def _check_belts(ents, tiles, inside, report: ValidationReport) -> None:

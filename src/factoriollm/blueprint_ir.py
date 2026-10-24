@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import warnings
 import zlib
 from dataclasses import dataclass
@@ -256,11 +257,14 @@ def parse_blueprint_dict(
     allowed: Optional[frozenset] = VANILLA_ENTITIES,
     normalize: bool = True,
     check_collisions: bool = True,
+    snap_off_grid: bool = False,
+    stats: Optional[Dict[str, int]] = None,
 ) -> IRBlueprint:
     """
     Converts a raw blueprint JSON dict into an IRBlueprint on the integer tile grid.
-    Raises BlueprintIRError for unknown/disallowed entities or off-grid positions, and for
-    overlapping entities unless check_collisions=False (the validator reports those itself).
+    Raises BlueprintIRError for unknown/disallowed entities, for off-grid positions (unless
+    snap_off_grid=True: they are snapped to the tile containing them, as the game does, and
+    counted in stats["off_grid"]), and for overlapping entities unless check_collisions=False.
     """
     legacy = version[0] < 2
     entities: List[IREntity] = []
@@ -286,7 +290,11 @@ def parse_blueprint_dict(
         _, _, cdx, cdy = _geometry(name, direction)
         tx, ty = float(pos.get("x", 0.0)) - cdx, float(pos.get("y", 0.0)) - cdy
         if abs(tx - round(tx)) > 1e-6 or abs(ty - round(ty)) > 1e-6:
-            raise BlueprintIRError(f"'{name}' at {pos} is off the tile grid")
+            if not snap_off_grid:
+                raise BlueprintIRError(f"'{name}' at {pos} is off the tile grid")
+            if stats is not None:
+                stats["off_grid"] = stats.get("off_grid", 0) + 1
+            tx, ty = math.floor(tx + 0.5 + 1e-9), math.floor(ty + 0.5 + 1e-9)
         entities.append(IREntity(name, int(round(tx)), int(round(ty)), direction, extras))
 
     ir = IRBlueprint(entities=entities, label=_clean_text(bp.get("label")), version=version, book_path=book_path)

@@ -89,6 +89,19 @@ class TestValidator(unittest.TestCase):
         clean = run_trusted_script(lift_ir_to_code(bp(*smelter_row(2))))
         self.assertTrue(validate_string(clean).ok)
 
+    def test_center_positions_are_snapped_and_reported_as_off_grid(self):
+        # The legacy model wrote 1x1 belts with integer *centers* (position={'x': 0.0, 'y': 0.0}).
+        from draftsman.blueprintable import Blueprint
+
+        legacy = Blueprint()
+        for x in range(3):
+            legacy.entities.append("transport-belt", position={"x": float(x), "y": 0.0}, direction=4)
+        legacy.entities.append("stone-furnace", position={"x": 1.0, "y": 2.0})  # 2x2 on grid
+        report = validate_string(legacy.to_string())
+        self.assertIn("off_grid", {i.category for i in report.errors})
+        self.assertIn("3 entities", report.errors[0].message)
+        self.assertEqual(report.facts["entity_counts"], {"transport-belt": 3, "stone-furnace": 1})
+
     def test_feedback_text(self):
         report = validate(bp(IREntity("stone-wall", 0, 0), IREntity("inserter", 0, 1), IREntity("wooden-chest", 0, 2)))
         self.assertIn("[inserter_target]", report.feedback())
