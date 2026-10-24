@@ -4,17 +4,19 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# URL базы данных по умолчанию
-# Для локальной БД без пароля часто используют postgresql://postgres@localhost:5432/factoriollm
-DATABASE_URL = os.getenv(
-    "DATABASE_URL", 
-    "postgresql://postgres:postgres@localhost:5432/factoriollm"
-)
+
+def _database_url() -> str:
+    """Возвращает DATABASE_URL из окружения/.env (без зашитых дефолтных паролей)."""
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        raise RuntimeError("DATABASE_URL is not set: add it to .env (e.g. postgresql://user:password@localhost:5432/factoriollm)")
+    return url
+
 
 async def get_pool() -> asyncpg.Pool:
     """Создает и возвращает пул соединений к PostgreSQL."""
-    return await asyncpg.create_pool(DATABASE_URL)
+    return await asyncpg.create_pool(_database_url())
 
 async def get_connection() -> asyncpg.Connection:
     """Возвращает одиночное соединение (для простых скриптов)."""
-    return await asyncpg.connect(DATABASE_URL)
+    return await asyncpg.connect(_database_url())

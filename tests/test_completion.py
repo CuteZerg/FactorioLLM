@@ -1,5 +1,5 @@
 import unittest
-from factoriollm.inference import is_code_complete, is_stuck_in_repetition
+from factoriollm.inference import fit_history_to_budget, is_code_complete, is_stuck_in_repetition
 
 
 class TestCodeCompletion(unittest.TestCase):
@@ -65,6 +65,38 @@ print(bp.to_string())
             for i in range(12)
         ])
         self.assertFalse(is_stuck_in_repetition(non_repeating_text, consecutive_threshold=8))
+
+
+def count_words(messages):
+    return sum(len(m["content"].split()) for m in messages)
+
+
+class TestHistoryBudget(unittest.TestCase):
+    def setUp(self):
+        self.old_code = "\n".join(f"bp.entities.append('inserter', tile_position=({i}, 0))" for i in range(300))
+        self.history = [
+            {"role": "system", "content": "system rules"},
+            {"role": "user", "content": "Build 24 stone furnaces"},
+            {"role": "assistant", "content": self.old_code},
+            {"role": "user", "content": "Traceback: ValueError: bad thing\nPlease fix the script."},
+        ]
+
+    def test_fits_unchanged(self):
+        self.assertEqual(fit_history_to_budget(self.history, count_words, 10_000), self.history)
+
+    def test_shrinks_old_code_but_keeps_request_and_error(self):
+        out = fit_history_to_budget(self.history, count_words, 400)
+        self.assertLessEqual(count_words(out), 400)
+        self.assertEqual(out[1]["content"], "Build 24 stone furnaces")
+        self.assertEqual(out[3]["content"], self.history[3]["content"])
+        self.assertIn("lines omitted", out[2]["content"])
+        self.assertIn("tile_position=(0, 0)", out[2]["content"])    # head kept
+        self.assertIn("tile_position=(299, 0)", out[2]["content"])  # tail kept
+        self.assertEqual(self.history[2]["content"], self.old_code)  # input not mutated
+
+    def test_raises_when_impossible(self):
+        with self.assertRaises(ValueError):
+            fit_history_to_budget(self.history, count_words, 5)
 
 
 if __name__ == "__main__":

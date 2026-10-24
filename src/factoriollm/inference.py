@@ -6,25 +6,25 @@ Draftsman Python scripts based on user requests.
 
 from __future__ import annotations
 
-import os
 import re
 import threading
-from typing import Generator, List, Dict, Any, Optional
+from typing import Callable, Generator, List, Dict
 
-# Default system prompt with clear domain rules matching factorio-draftsman
+# Default system prompt with clear domain rules matching factorio-draftsman.
+# Must stay in sync with the training dataset (export_dataset.py uses this exact text).
 DEFAULT_SYSTEM_PROMPT = (
-    "You are an expert Factorio blueprint generator AI. Write Python code using the factorio-draftsman library "
-    "to construct the exact requested blueprint.\n"
-    "Requirements:\n"
-    "- Write compact, algorithmic code. Never hardcode repeating entities line-by-line.\n"
-    "- High-level macro functions from `draftsman_helpers` are pre-imported and available to make code concise:\n"
-    "    * add_belt_line(bp, start=(x, y), length=N, direction='east'|'west'|'north'|'south', belt_type='transport-belt'|'fast-transport-belt')\n"
-    "    * add_underground_pair(bp, start=(x1, y1), end=(x2, y2), direction='east', belt_type='underground-belt'|'fast-underground-belt')\n"
-    "    * add_entity_row(bp, entity_name, start=(x, y), count=N, step=(dx, dy), direction=dir)\n"
-    "    * add_power_poles(bp, start=(x, y), count=N, step=(dx, dy), pole_type='small-electric-pole'|'medium-electric-pole')\n"
-    "- You can freely combine these macros with standard Python loops and factorio-draftsman entities.\n"
-    "- Ensure valid orientations and non-overlapping coordinates.\n"
-    "- The script must always conclude with: print(bp.to_string())"
+    "You are an expert Factorio 2.0 blueprint generator. Write Python code using the factorio-draftsman library "
+    "that builds exactly the requested blueprint.\n"
+    "Rules:\n"
+    "- Coordinates are integer tiles: (x, y) is the top-left tile of an entity; x grows east, y grows south.\n"
+    "- Place single entities with: bp.entities.append('name', tile_position=(x, y), direction=Direction.EAST)\n"
+    "- Macros from `draftsman_helpers` (directions are 'north'|'east'|'south'|'west'):\n"
+    "    * add_belt_line(bp, start=(x, y), length=N, direction='east', belt_type='transport-belt')\n"
+    "    * add_underground_pair(bp, start=(x1, y1), end=(x2, y2), direction='east', belt_type='underground-belt')\n"
+    "    * add_entity_row(bp, 'entity-name', start=(x, y), count=N, step=(dx, dy), direction=None, **kwargs)\n"
+    "    * add_power_poles(bp, start=(x, y), count=N, step=(dx, dy), pole_type='small-electric-pole')\n"
+    "- Use loops and macros for repeating structures; entities must not overlap.\n"
+    "- The script must end with: print(bp.to_string())"
 )
 
 
@@ -119,6 +119,41 @@ def is_stuck_in_repetition(text: str, consecutive_threshold: int = 8) -> bool:
     return len(set(last_slice)) == 1
 
 
+def _shorten_text(text: str, keep_lines: int, marker: str) -> str:
+    """Keeps the first and last `keep_lines` lines of a text, replacing the middle with a marker line."""
+    lines = text.splitlines()
+    if len(lines) <= 2 * keep_lines + 1:
+        return text
+    omitted = len(lines) - 2 * keep_lines
+    return "\n".join(lines[:keep_lines] + [marker.format(n=omitted)] + lines[-keep_lines:])
+
+
+def fit_history_to_budget(
+    messages: List[Dict[str, str]],
+    count_tokens: Callable[[List[Dict[str, str]]], int],
+    max_tokens: int,
+) -> List[Dict[str, str]]:
+    """
+    Shrinks a conversation so that its formatted prompt fits into `max_tokens`.
+    Old assistant code is shortened first (it is the bulk of retry prompts), then the middle of
+    long user messages (tracebacks). The system prompt and the head and tail of every user turn
+    are always kept, so the model never loses the actual request. Raises ValueError if it cannot fit.
+    """
+    msgs = [dict(m) for m in messages]
+    if count_tokens(msgs) <= max_tokens:
+        return msgs
+
+    for role, marker in (("assistant", "# ... ({n} lines omitted) ..."), ("user", "... ({n} lines omitted) ...")):
+        for keep in (40, 20, 10, 5, 2):
+            for m in msgs:
+                if m["role"] == role:
+                    m["content"] = _shorten_text(m["content"], keep, marker)
+            if count_tokens(msgs) <= max_tokens:
+                return msgs
+
+    raise ValueError(f"Prompt does not fit into {max_tokens} tokens even after shortening the history.")
+
+
 class FactorioInference:
     """
     Wraps FastLanguageModel for fast 4-bit LoRA inference.
@@ -130,11 +165,13 @@ class FactorioInference:
         max_seq_length: int = 4096,
         load_in_4bit: bool = True,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+        stream_timeout: float = 300.0,
     ):
         self.model_path = model_path
         self.max_seq_length = max_seq_length
         self.load_in_4bit = load_in_4bit
         self.system_prompt = system_prompt
+        self.stream_timeout = stream_timeout
         self.model = None
         self.tokenizer = None
         self._is_loaded = False
@@ -161,23 +198,44 @@ class FactorioInference:
         self._is_loaded = True
         print("[*] Model loaded successfully and configured for inference.")
 
+    def _with_system_prompt(self, conversation_history: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        if any(m.get("role") == "system" for m in conversation_history):
+            return list(conversation_history)
+        return [{"role": "system", "content": self.system_prompt}] + list(conversation_history)
+
     def format_messages(self, conversation_history: List[Dict[str, str]]) -> str:
         """
-        Formats conversation history into Llama-3 chat template.
+        Formats conversation history into the model's chat template.
         Ensures the system prompt is present at the beginning.
         """
-        messages = []
-        # Ensure system message is first
-        has_system = any(m.get("role") == "system" for m in conversation_history)
-        if not has_system:
-            messages.append({"role": "system", "content": self.system_prompt})
-
-        messages.extend(conversation_history)
-
         return self.tokenizer.apply_chat_template(
-            messages,
+            self._with_system_prompt(conversation_history),
             tokenize=False,
             add_generation_prompt=True,
+        )
+
+    def _count_prompt_tokens(self, messages: List[Dict[str, str]]) -> int:
+        return len(self.tokenizer(self.format_messages(messages), add_special_tokens=False)["input_ids"])
+
+    def _prepare_inputs(self, conversation_history: List[Dict[str, str]], max_new_tokens: int):
+        """Tokenizes the conversation, shrinking old turns (never truncating) to leave room for generation."""
+        history = fit_history_to_budget(
+            self._with_system_prompt(conversation_history),
+            self._count_prompt_tokens,
+            self.max_seq_length - max_new_tokens,
+        )
+        # The chat template already contains the BOS token: do not add a second one.
+        return self.tokenizer(
+            self.format_messages(history), return_tensors="pt", add_special_tokens=False
+        ).to(self.model.device)
+
+    def _sampling_kwargs(self, temperature: float, top_p: float, repetition_penalty: float) -> Dict:
+        return dict(
+            temperature=max(temperature, 1e-4),
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            do_sample=temperature > 1e-4,
+            pad_token_id=self.tokenizer.eos_token_id,
         )
 
     def generate(
@@ -190,26 +248,14 @@ class FactorioInference:
     ) -> str:
         """Synchronously generates the assistant's reply."""
         self.load_model()
-        formatted_prompt = self.format_messages(conversation_history)
-
-        max_input_length = max(self.max_seq_length - max_new_tokens, 512)
-        inputs = self.tokenizer(
-            formatted_prompt,
-            return_tensors="pt",
-            truncation=True,
-            max_length=max_input_length,
-        ).to(self.model.device)
+        inputs = self._prepare_inputs(conversation_history, max_new_tokens)
 
         import torch
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
-                temperature=max(temperature, 1e-4),
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-                do_sample=temperature > 1e-4,
-                pad_token_id=self.tokenizer.eos_token_id,
+                **self._sampling_kwargs(temperature, top_p, repetition_penalty),
             )
 
         # Slice off the input tokens to get only generated tokens
@@ -217,6 +263,55 @@ class FactorioInference:
         generated_tokens = outputs[0][input_length:]
         raw_output = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
         return raw_output.strip()
+
+    def _stream_once(self, input_ids, max_new_tokens: int, sampling: Dict, state: Dict) -> Generator[str, None, None]:
+        """
+        Runs model.generate in a worker thread and yields decoded text chunks.
+        Stores the full output ids in state["output_ids"]. Worker exceptions (e.g. CUDA OOM) are
+        re-raised here instead of leaving the streamer blocked forever.
+        """
+        import torch
+        from transformers import StoppingCriteria, StoppingCriteriaList, TextIteratorStreamer
+
+        stop_flag = threading.Event()
+
+        class _StopOnFlag(StoppingCriteria):
+            def __call__(self, *args, **kwargs) -> bool:
+                return stop_flag.is_set()
+
+        streamer = TextIteratorStreamer(
+            self.tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+            timeout=self.stream_timeout,
+        )
+
+        def _run() -> None:
+            try:
+                with torch.no_grad():
+                    state["output_ids"] = self.model.generate(
+                        input_ids=input_ids,
+                        attention_mask=torch.ones_like(input_ids),
+                        streamer=streamer,
+                        max_new_tokens=max_new_tokens,
+                        stopping_criteria=StoppingCriteriaList([_StopOnFlag()]),
+                        **sampling,
+                    )
+            except Exception as e:  # surfaced to the caller below
+                state["error"] = e
+                streamer.end()
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        try:
+            for new_text in streamer:
+                yield new_text
+        finally:
+            stop_flag.set()  # stops generation if the consumer quit early or the streamer timed out
+            thread.join()
+        if "error" in state:
+            raise RuntimeError(f"Generation failed: {state['error']}") from state["error"]
 
     def generate_stream(
         self,
@@ -229,114 +324,36 @@ class FactorioInference:
         auto_continue: bool = True,
     ) -> Generator[str, None, None]:
         """
-        Streams generated tokens one by one.
-        If generation ends before the script is complete (e.g. hits max_new_tokens mid-script),
-        automatically continues generating up to max_total_tokens to give the model
-        enough time and tokens to finish cleanly.
+        Streams generated text chunks.
+        If generation hits max_new_tokens before the script is complete, it continues from the exact
+        token ids generated so far (up to max_total_tokens new tokens and the model context length).
+        A generation that ended with EOS is never continued.
         """
         self.load_model()
-        from transformers import TextIteratorStreamer
-
-        formatted_prompt = self.format_messages(conversation_history)
-
-        max_input_length = max(self.max_seq_length - max_new_tokens, 512)
-        inputs = self.tokenizer(
-            formatted_prompt,
-            return_tensors="pt",
-            truncation=True,
-            max_length=max_input_length,
-        ).to(self.model.device)
-
-        streamer = TextIteratorStreamer(
-            self.tokenizer,
-            skip_prompt=True,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )
-
-        generation_kwargs = dict(
-            **inputs,
-            streamer=streamer,
-            max_new_tokens=max_new_tokens,
-            temperature=max(temperature, 1e-4),
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-            do_sample=temperature > 1e-4,
-            pad_token_id=self.tokenizer.eos_token_id,
-        )
-
-        thread = threading.Thread(target=self.model.generate, kwargs=generation_kwargs)
-        thread.start()
+        sampling = self._sampling_kwargs(temperature, top_p, repetition_penalty)
+        input_ids = self._prepare_inputs(conversation_history, max_new_tokens)["input_ids"]
+        prompt_length = input_ids.shape[1]
 
         full_generated_text = ""
-        total_tokens_approx = 0
-
-        for new_text in streamer:
-            full_generated_text += new_text
-            total_tokens_approx += 1
-            yield new_text
-
-        thread.join()
-
-        # If auto_continue is enabled, check if the script is complete.
-        # If incomplete and not stuck in a repetition loop, continue generating.
-        continuation_rounds = 0
+        chunk_tokens = max_new_tokens
         max_continuation_rounds = 3
 
-        while auto_continue and continuation_rounds < max_continuation_rounds:
-            code = extract_python_code(full_generated_text)
-            comp, _ = is_code_complete(code)
-            if comp:
-                break
-
-            if total_tokens_approx >= max_total_tokens:
-                break
-
-            if is_stuck_in_repetition(full_generated_text):
-                break
-
-            continuation_rounds += 1
-            tokens_remaining = max_total_tokens - total_tokens_approx
-            chunk_tokens = min(1024, max(tokens_remaining, 256))
-
-            cont_prompt = formatted_prompt + full_generated_text
-            cont_max_input = max(self.max_seq_length - chunk_tokens, 512)
-            cont_inputs = self.tokenizer(
-                cont_prompt,
-                return_tensors="pt",
-                truncation=True,
-                max_length=cont_max_input,
-            ).to(self.model.device)
-
-            cont_streamer = TextIteratorStreamer(
-                self.tokenizer,
-                skip_prompt=True,
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=False,
-            )
-
-            cont_kwargs = dict(
-                **cont_inputs,
-                streamer=cont_streamer,
-                max_new_tokens=chunk_tokens,
-                temperature=max(temperature, 1e-4),
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-                do_sample=temperature > 1e-4,
-                pad_token_id=self.tokenizer.eos_token_id,
-            )
-
-            cont_thread = threading.Thread(target=self.model.generate, kwargs=cont_kwargs)
-            cont_thread.start()
-
-            got_any = False
-            for new_text in cont_streamer:
-                got_any = True
+        for continuation_round in range(max_continuation_rounds + 1):
+            state: Dict = {}
+            for new_text in self._stream_once(input_ids, chunk_tokens, sampling, state):
                 full_generated_text += new_text
-                total_tokens_approx += 1
                 yield new_text
 
-            cont_thread.join()
-
-            if not got_any:
+            output_ids = state["output_ids"]
+            new_in_chunk = output_ids.shape[1] - input_ids.shape[1]
+            hit_token_limit = new_in_chunk >= chunk_tokens and output_ids[0, -1].item() != self.tokenizer.eos_token_id
+            if not auto_continue or not hit_token_limit or continuation_round == max_continuation_rounds:
                 break
+            if is_code_complete(extract_python_code(full_generated_text))[0] or is_stuck_in_repetition(full_generated_text):
+                break
+
+            generated_total = output_ids.shape[1] - prompt_length
+            chunk_tokens = min(1024, max_total_tokens - generated_total, self.max_seq_length - output_ids.shape[1])
+            if chunk_tokens <= 0:
+                break
+            input_ids = output_ids

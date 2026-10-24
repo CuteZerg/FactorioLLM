@@ -59,11 +59,13 @@ class AgenticBlueprintGenerator:
         prompt: str,
         max_retries: Optional[int] = None,
         temperature: float = 0.2,
+        sandbox_timeout: Optional[float] = None,
     ) -> Generator[AgentStepEvent, None, AgentResult]:
         """
         Streaming generator that yields AgentStepEvent updates during the loop.
         """
         retries_limit = max_retries if max_retries is not None else self.max_retries
+        timeout = sandbox_timeout if sandbox_timeout is not None else self.sandbox.timeout
 
         # Ensure sandbox docker image is ready
         yield AgentStepEvent(
@@ -175,10 +177,10 @@ class AgenticBlueprintGenerator:
                 event_type="sandbox_start",
                 attempt=attempt,
                 code=code,
-                message=f"Executing script inside Docker sandbox (timeout {self.sandbox.timeout}s)...",
+                message=f"Executing script inside Docker sandbox (timeout {timeout}s)...",
             )
 
-            exec_result = self.sandbox.execute(code)
+            exec_result = self.sandbox.execute(code, timeout=timeout)
             exec_history.append(exec_result)
 
             yield AgentStepEvent(
@@ -257,9 +259,10 @@ class AgenticBlueprintGenerator:
         prompt: str,
         max_retries: Optional[int] = None,
         temperature: float = 0.2,
+        sandbox_timeout: Optional[float] = None,
     ) -> AgentResult:
         """Synchronous helper that runs the generator loop to completion."""
-        gen = self.generate_blueprint_stream(prompt, max_retries, temperature)
+        gen = self.generate_blueprint_stream(prompt, max_retries, temperature, sandbox_timeout)
         result = None
         try:
             while True:

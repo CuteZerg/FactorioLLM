@@ -112,9 +112,6 @@ def process_generation_stream(
         )
         return
 
-    _sandbox.timeout = float(timeout)
-    _agent.max_retries = int(max_retries)
-
     current_code = ""
     blueprint_string = ""
     current_status = "⚙️ Initializing generation pipeline..."
@@ -136,6 +133,7 @@ def process_generation_stream(
             prompt=prompt.strip(),
             max_retries=int(max_retries),
             temperature=float(temperature),
+            sandbox_timeout=float(timeout),
         )
 
         for event in gen:
