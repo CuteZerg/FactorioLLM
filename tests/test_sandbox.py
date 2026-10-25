@@ -23,6 +23,20 @@ print(bp.to_string())
         self.assertIsNotNone(res.blueprint_string)
         self.assertTrue(res.blueprint_string.startswith("0e"))
 
+    def test_exported_poles_are_wired(self):
+        code = """
+from draftsman.blueprintable import Blueprint
+bp = Blueprint()
+for x in (0, 5, 10):
+    bp.entities.append("small-electric-pole", tile_position=(x, 0))
+print(bp.to_string())
+"""
+        res = self.sandbox.execute(code)
+        self.assertTrue(res.success, res.error_message)
+        from draftsman.blueprintable import get_blueprintable_from_string
+        wires = get_blueprintable_from_string(res.blueprint_string).to_dict()["blueprint"].get("wires", [])
+        self.assertEqual(len(wires), 2)
+
     def test_sandbox_syntax_error(self):
         code = """
 def broken(:

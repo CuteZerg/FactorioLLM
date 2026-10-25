@@ -142,6 +142,7 @@ def validate(ir: IRBlueprint) -> ValidationReport:
     _check_undergrounds(ents, report)
     _check_inserters(ents, tiles, inside, report)
     _check_power(ents, report)
+    _check_pole_network(ents, report)
     return report
 
 
@@ -223,6 +224,34 @@ def _check_inserters(ents, tiles, inside, report: ValidationReport) -> None:
                 report.warnings.append(Issue("inserter_ground", f"{e.name} at {(e.x, e.y)} {verb} empty tile {target}", (e.x, e.y)))
             elif not has_item_interface(ents[j].name):
                 report.errors.append(Issue("inserter_target", f"{e.name} at {(e.x, e.y)} {verb} {ents[j].name} at {target}, which holds no items", (e.x, e.y)))
+
+
+def _check_pole_network(ents, report: ValidationReport) -> None:
+    """Poles that cannot be wired into one network (wire reach), so some groups get no power."""
+    poles = [e for e in ents if entity_type(e.name) == "electric-pole"]
+    if len(poles) < 2:
+        return
+    centers = [_center(e) for e in poles]
+    reach = [float((_prototype(e.name) or {}).get("maximum_wire_distance") or 0) for e in poles]
+    seen, islands = set(), []
+    for start in range(len(poles)):
+        if start in seen:
+            continue
+        seen.add(start)
+        stack, size = [start], 0
+        while stack:
+            i = stack.pop()
+            size += 1
+            for j in range(len(poles)):
+                if j not in seen and math.dist(centers[i], centers[j]) <= min(reach[i], reach[j]) + 1e-9:
+                    seen.add(j)
+                    stack.append(j)
+        islands.append((size, poles[start]))
+    if len(islands) > 1:
+        islands.sort(key=lambda s: s[0])
+        size, pole = islands[0]
+        report.warnings.append(Issue("pole_islands", f"{len(islands)} separate pole networks that wires cannot join "
+                                     f"(smallest: {size} poles near {(pole.x, pole.y)})", (pole.x, pole.y)))
 
 
 def _check_power(ents, report: ValidationReport) -> None:

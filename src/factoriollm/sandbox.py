@@ -93,6 +93,20 @@ import builtins as _builtins
 for _k in ("add_belt_line", "add_underground_pair", "add_entity_row", "add_power_poles", "resolve_direction"):
     if hasattr(_dh_mod, _k):
         setattr(_builtins, _k, getattr(_dh_mod, _k))
+
+# Pasted poles never wire themselves to each other in game: wire every exported blueprint.
+if hasattr(_dh_mod, "connect_power"):
+    from draftsman.blueprintable import Blueprint as _Blueprint
+    _original_to_string = _Blueprint.to_string
+
+    def _wired_to_string(self, *args, **kwargs):
+        try:
+            _dh_mod.connect_power(self)
+        except Exception as _exc:  # never break an otherwise valid script
+            print("[connect_power failed: %s]" % _exc, file=_sys.stderr)
+        return _original_to_string(self, *args, **kwargs)
+
+    _Blueprint.to_string = _wired_to_string
 """
     return ""
 

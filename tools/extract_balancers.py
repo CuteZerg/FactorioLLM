@@ -33,11 +33,13 @@ VEC = {0: (0, -1), 4: (1, 0), 8: (0, 1), 12: (-1, 0)}
 UG_REACH = {"underground-belt": 5, "fast-underground-belt": 7, "express-underground-belt": 9}
 KINDS = {"transport-belt": "belt", "underground-belt": "underground", "splitter": "splitter"}
 MAX_IO = 8
+SPLITTER_SETTINGS = frozenset({"input_priority", "output_priority", "filter"})
 
 
 class Template:
     def __init__(self, ents):
         self.ents = ents  # [(name, x, y, d, extras)]
+        self.priority = False
 
     def analyse(self) -> Optional[dict]:
         ents = self.ents
@@ -106,6 +108,8 @@ class Template:
                     targets.append(None if inside(front) else ("out", front))
                 else:
                     targets.append(j if accepts(j, d) else None)
+            if k == "splitter":
+                targets = self._route_priority(ents[i][4], d, targets)
             open_targets = [t for t in targets if t is not None]
             # a blocked splitter side sends everything to the other side; a blocked belt is a dead end
             if not open_targets or (k != "splitter" and len(open_targets) < len(targets)):
@@ -153,14 +157,36 @@ class Template:
                     break
             matrix.append([out[t] for t in outputs])
         n_out = len(outputs)
-        if any(abs(sum(row) - 1) > 1e-6 or any(abs(v - 1 / n_out) > 1e-6 for v in row) for row in matrix):
+        if any(abs(sum(row) - 1) > 1e-6 for row in matrix):
+            return None
+        if self.priority:  # capacity-dependent: only check that every input reaches every output
+            if any(v < 1e-9 for row in matrix for v in row):
+                return None
+        elif any(abs(v - 1 / n_out) > 1e-6 for row in matrix for v in row):
             return None
 
         reach = 1
         for i, j in pair.items():
             gap = abs(ents[i][1] - ents[j][1]) + abs(ents[i][2] - ents[j][2])
             reach = max(reach, gap)
-        return {"inputs": inputs, "outputs": outputs, "flow": flow_dirs.pop(), "reach": reach, "bbox": bbox}
+        return {"inputs": inputs, "outputs": outputs, "flow": flow_dirs.pop(), "reach": reach, "bbox": bbox,
+                "exact": not self.priority}
+
+    def _route_priority(self, extras: dict, d: int, targets: list) -> list:
+        """
+        Splitter settings in the linear flow model. A filter for an item that never travels the belt
+        (the book uses the deconstruction planner) sends everything to the non-priority side; input
+        priority does not change where items go; a plain output priority depends on belt capacity
+        and cannot be judged here, so the template is only checked for connectivity.
+        """
+        priority = extras.get("output_priority")
+        if priority not in ("left", "right"):
+            return targets
+        left, right = targets if d in (0, 4) else targets[::-1]  # footprint order is left-first for north/east
+        if extras.get("filter"):
+            return [right if priority == "left" else left]
+        self.priority = True
+        return targets
 
 
 def normalise(ents, info) -> Tuple[List[tuple], int]:
@@ -174,7 +200,9 @@ def normalise(ents, info) -> Tuple[List[tuple], int]:
         W, H = x1 - x0 + 1, y1 - y0 + 1
         for _ in range(turns):  # quarter turn clockwise, as in helpers._Layout.commit
             u, v, w, h, W, H = H - v - h, u, h, w, H, W
-        out.append((KINDS[entity_type(name)], u, v, (d + 4 * turns) % 16, extras.get("io_type")))
+        kind = KINDS[entity_type(name)]
+        settings = {k: extras[k] for k in SPLITTER_SETTINGS if k in extras} if kind == "splitter" else {}
+        out.append((kind, u, v, (d + 4 * turns) % 16, extras.get("io_type") or settings or None))
     width = max(u + footprint_kind(k, d)[0] for k, u, v, d, _ in out)
     return sorted(out, key=lambda e: (e[1], e[2])), width
 
@@ -196,12 +224,89 @@ def sides_ok(template: List[tuple], width: int, n_in: int, n_out: int) -> bool:
     return len(entries) == n_in and len(exits) == n_out
 
 
-async def load_rows():
+BELT_ONLY = frozenset({
+    "transport-belt", "fast-transport-belt", "express-transport-belt",
+    "underground-belt", "fast-underground-belt", "express-underground-belt",
+    "splitter", "fast-splitter", "express-splitter",
+})
+UG_TIER = {"underground-belt": 1, "fast-underground-belt": 2, "express-underground-belt": 3}
+BOOK_TITLE = "Raynquist%Belt Balancers%"
+BOOK_LABEL = re.compile(r"^(\d+)-(\d+)(?: (yellow|red))?( TU)? balancer$")
+
+
+def prepare(ents) -> Optional[dict]:
+    """Normalised template and its properties, or None if it is not a verified n->m balancer."""
+    if not ents or any(e[0] not in BELT_ONLY for e in ents):
+        return None
+    if any(set(e[4]) - ({"io_type"} | (SPLITTER_SETTINGS if "splitter" in e[0] else set())) for e in ents):
+        return None
+    if not any("splitter" in e[0] for e in ents):
+        return None
+    info = Template(ents).analyse()
+    if info is None:
+        return None
+    template, width = normalise(ents, info)
+    n_in, n_out = len(info["inputs"]), len(info["outputs"])
+    if n_in == 1 and n_out == 1 or not sides_ok(template, width, n_in, n_out):
+        return None
+    height = max(v + footprint_kind(k, d)[1] for k, u, v, d, _ in template)
+    tier = 1 if info["reach"] <= 5 else 2 if info["reach"] <= 7 else 3
+    return {"template": template, "n_in": n_in, "n_out": n_out, "reach_tier": tier,
+            "score": (len(template), width * height), "exact": info["exact"]}
+
+
+async def load_sources():
     from factoriollm.database import get_connection
     conn = await get_connection()
     rows = await conn.fetch("SELECT id, title, label, ir FROM canonical_blueprints WHERE status = 'ok'")
+    book = await conn.fetchrow("SELECT key, blueprint_string FROM blueprints WHERE title ILIKE $1 "
+                               "ORDER BY created_at DESC NULLS LAST LIMIT 1", BOOK_TITLE)
     await conn.close()
-    return rows
+    return rows, book
+
+
+def book_templates(book) -> Dict[Tuple[int, int, int, bool], dict]:
+    """The community-standard Raynquist book: 'n-m [yellow|red] [TU] balancer' designs."""
+    from factoriollm.blueprint_ir import decode_blueprint_string, iter_blueprints, parse_blueprint_dict
+    found = {}
+    for path, bp, version in iter_blueprints(decode_blueprint_string(book["blueprint_string"])):
+        label = (bp.get("label") or "").strip()
+        m = BOOK_LABEL.match(label)
+        if not m:
+            continue
+        ir = parse_blueprint_dict(bp, version=version, allowed=None)
+        prep = prepare([(e.name, e.x, e.y, e.direction, e.extras_dict) for e in ir.entities])
+        if prep is None or (prep["n_in"], prep["n_out"]) != (int(m.group(1)), int(m.group(2))):
+            print(f"  [!] book '{label}' failed verification, skipped")
+            continue
+        compatible = [UG_TIER[c] for c in re.findall(r"item=([a-z-]*underground-belt)", bp.get("description") or "")
+                      if c in UG_TIER]
+        tier = min(compatible) if compatible else {"yellow": 1, "red": 2}.get(m.group(3), prep["reach_tier"])
+        key = (prep["n_in"], prep["n_out"], max(tier, prep["reach_tier"]), bool(m.group(4)))
+        if key not in found or prep["score"] < found[key]["score"]:
+            found[key] = {**prep, "source": f"Raynquist book {path}: {label}"}
+    return found
+
+
+def corpus_templates(rows, covered) -> Dict[Tuple[int, int, int, bool], dict]:
+    """Fallback for n->m pairs the book does not have: smallest verified design in the corpus."""
+    found = {}
+    for r in rows:
+        if re.search(r"lane|side|strict|полос|raynquist", f"{r['title']} {r['label']}", re.I):
+            continue  # lane balancers cannot be judged by the belt-level simulation; the book is handled above
+        prep = prepare([tuple(e) for e in json.loads(r["ir"])])
+        if prep is None or not prep["exact"] or (prep["n_in"], prep["n_out"]) in covered:
+            continue
+        key = (prep["n_in"], prep["n_out"], prep["reach_tier"], False)
+        if key not in found or prep["score"] < found[key]["score"]:
+            source = re.sub(r"[^\x20-\x7e]+", " ", f"{r['title']} | {r['label']}")
+            found[key] = {**prep, "source": re.sub(r"\s+", " ", f"canonical_blueprints id={r['id']} {source}")[:90]}
+    kept = {}  # keep a higher-tier template only if it is smaller than every lower-tier one
+    for key in sorted(found):
+        lower = [kept[k]["score"] for k in kept if k[:2] == key[:2]]
+        if not lower or found[key]["score"] < min(lower):
+            kept[key] = found[key]
+    return kept
 
 
 def main():
@@ -209,54 +314,25 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    rows = asyncio.run(load_rows())
-    found: Dict[Tuple[int, int, int], Tuple[int, int, List[tuple], str]] = {}
-    checked = 0
-    for r in rows:
-        ir = json.loads(r["ir"])
-        if not ir or any(e[0] not in ("transport-belt", "fast-transport-belt", "express-transport-belt",
-                                       "underground-belt", "fast-underground-belt", "express-underground-belt",
-                                       "splitter", "fast-splitter", "express-splitter") for e in ir):
-            continue
-        if any(set(e[4]) - {"io_type"} for e in ir) or not any("splitter" in e[0] for e in ir):
-            continue
-        if re.search(r"lane|side|strict|полос", f"{r['title']} {r['label']}", re.I):
-            continue  # lane balancers: the belt-level simulation cannot judge them
-        checked += 1
-        ents = [(n, x, y, d, ex) for n, x, y, d, ex in ir]
-        info = Template(ents).analyse()
-        if info is None:
-            continue
-        template, width = normalise(ents, info)
-        n_in, n_out = len(info["inputs"]), len(info["outputs"])
-        if n_in == 1 and n_out == 1 or not sides_ok(template, width, n_in, n_out):
-            continue
-        tier = 1 if info["reach"] <= 5 else 2 if info["reach"] <= 7 else 3
-        height = max(v + footprint_kind(k, d)[1] for k, u, v, d, _ in template)
-        key = (n_in, n_out, tier)
-        score = (len(template), width * height)
-        if key not in found or score < found[key][:2]:
-            source = re.sub(r"[^\x20-\x7e]+", " ", f"{r['title']} | {r['label']}")
-            found[key] = (*score, template, re.sub(r"\s+", " ", f"id={r['id']} {source}")[:90])
+    rows, book = asyncio.run(load_sources())
+    if book is None:
+        raise SystemExit("Raynquist balancer book not found in the blueprints table")
+    kept = book_templates(book)
+    kept.update(corpus_templates(rows, {k[:2] for k in kept}))
 
-    # keep a higher-tier template only if it is smaller than every lower-tier one
-    kept = {}
-    for (n_in, n_out, tier) in sorted(found):
-        lower = [kept[k] for k in kept if k[:2] == (n_in, n_out)]
-        if not lower or found[(n_in, n_out, tier)][0] < min(x[0] for x in lower):
-            kept[(n_in, n_out, tier)] = found[(n_in, n_out, tier)]
-
-    print(f"belt-only blueprints checked: {checked}; templates kept: {len(kept)}")
-    for (n_in, n_out, tier), (n, area, _, src) in sorted(kept.items()):
-        print(f"  {n_in}->{n_out} tier {tier}: {n} entities, area {area}  <- {src}")
+    print(f"templates kept: {len(kept)}")
+    for (n_in, n_out, tier, tu), t in sorted(kept.items()):
+        print(f"  {n_in}->{n_out} tier {tier}{' TU' if tu else ''}: {t['score'][0]} entities, area {t['score'][1]}  <- {t['source']}")
     if args.dry_run:
         return
 
-    lines = [BEGIN, "# (inputs, outputs, min belt tier 1..3): [(kind, u, v, direction, io_type)], items flow east",
+    lines = [BEGIN,
+             "# (inputs, outputs, min belt tier 1..3, throughput unlimited): [(kind, u, v, direction, io_type)],",
+             "# items flow east. Raynquist's balancer book first, verified corpus designs for the remaining pairs.",
              "_BALANCER_TEMPLATES = {"]
-    for key, (_, _, template, src) in sorted(kept.items()):
-        lines.append(f"    {key}: [  # canonical_blueprints {src}")
-        cells = [f"({k!r}, {u}, {v}, {d}, {io!r})" for k, u, v, d, io in template]
+    for key, t in sorted(kept.items()):
+        lines.append(f"    {key}: [  # {t['source']}")
+        cells = [f"({k!r}, {u}, {v}, {d}, {io!r})" for k, u, v, d, io in t["template"]]
         for i in range(0, len(cells), 5):
             lines.append("        " + ", ".join(cells[i:i + 5]) + ",")
         lines.append("    ],")
