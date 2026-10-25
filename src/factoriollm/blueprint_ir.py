@@ -121,14 +121,27 @@ class IRBlueprint:
     label: str = ""
     version: Tuple[int, int] = (2, 0)
     book_path: str = ""
+    # Grid snapping ("snap-to-grid" etc.): copies of a tileable blueprint line up on this grid.
+    # The game writes "absolute-snapping" only as true; a missing key means relative snapping.
+    snap: Optional[Tuple[int, int]] = None
+    absolute_snap: bool = False
+    snap_offset: Tuple[int, int] = (0, 0)
 
     @property
     def size(self) -> Tuple[int, int]:
         if not self.entities:
             return (0, 0)
-        w = max(e.x + footprint(e.name, e.direction)[0] for e in self.entities)
-        h = max(e.y + footprint(e.name, e.direction)[1] for e in self.entities)
+        w = max(e.x + footprint(e.name, e.direction)[0] for e in self.entities) - min(e.x for e in self.entities)
+        h = max(e.y + footprint(e.name, e.direction)[1] for e in self.entities) - min(e.y for e in self.entities)
         return (w, h)
+
+    def snap_key(self) -> Tuple[Any, ...]:
+        return (self.snap, self.absolute_snap, self.snap_offset if self.absolute_snap else (0, 0))
+
+    def with_entities(self, entities: List[IREntity], snap: Optional[Tuple[int, int]] = None) -> "IRBlueprint":
+        """Same blueprint metadata with other entities (and optionally another grid size)."""
+        return IRBlueprint(entities, self.label, self.version, self.book_path, snap or self.snap,
+                           self.absolute_snap, self.snap_offset)
 
     def canonical_set(self) -> frozenset:
         return frozenset(self.entities)
@@ -163,6 +176,12 @@ def _geometry(name: str, direction: int) -> Tuple[int, int, float, float]:
 def footprint(name: str, direction: int = 0) -> Tuple[int, int]:
     w, h, _, _ = _geometry(name, direction)
     return (w, h)
+
+
+@lru_cache(maxsize=None)
+def _recipe_exists(recipe: str) -> bool:
+    from draftsman.data import recipes
+    return recipe in recipes.raw
 
 
 @lru_cache(maxsize=None)
@@ -265,6 +284,8 @@ def _label_signals(raw: Dict[str, Any]) -> str:
 
 def _convert_extras(raw: Dict[str, Any], name: str = "") -> Tuple[Tuple[str, str], ...]:
     extras: Dict[str, str] = {}
+    if name == "rocket-silo":
+        raw = {k: v for k, v in raw.items() if k != "recipe"}  # its only recipe; draftsman does not export it
     if name == "constant-combinator":
         signals = _label_signals(raw)
         if signals:
@@ -277,6 +298,8 @@ def _convert_extras(raw: Dict[str, Any], name: str = "") -> Tuple[Tuple[str, str
             extras["icon"] = _signal_id(raw["icon"])
     if raw.get("recipe"):
         extras["recipe"] = str(raw["recipe"])
+        if not _recipe_exists(extras["recipe"]):  # e.g. recipes removed or renamed since 0.x / 1.x
+            raise BlueprintIRError(f"unknown recipe '{extras['recipe']}'")
     if raw.get("type") == "output":  # "input" is the default and is omitted on export
         extras["io_type"] = "output"
     for key in ("input_priority", "output_priority"):
@@ -307,6 +330,19 @@ def _circuit_wired(bp: Dict[str, Any]) -> set:
     return wired
 
 
+def _snap_fields(bp: Dict[str, Any]) -> Dict[str, Any]:
+    grid = bp.get("snap-to-grid")
+    if not isinstance(grid, dict):
+        return {}
+    size = (int(grid.get("x", 0)), int(grid.get("y", 0)))
+    if min(size) < 1 or max(size) > 10_000:
+        raise BlueprintIRError(f"invalid snap-to-grid {grid}")
+    absolute = bool(bp.get("absolute-snapping", False))
+    offset = bp.get("position-relative-to-grid") or {}
+    return {"snap": size, "absolute_snap": absolute,
+            "snap_offset": (int(offset.get("x", 0)), int(offset.get("y", 0))) if absolute else (0, 0)}
+
+
 def parse_blueprint_dict(
     bp: Dict[str, Any],
     version: Tuple[int, int] = (2, 0),
@@ -325,6 +361,7 @@ def parse_blueprint_dict(
     """
     legacy = version[0] < 2
     entities: List[IREntity] = []
+    placed: List[Tuple[str, int, Tuple[Tuple[str, str], ...], Dict[str, Any], float, float]] = []
     wired = _circuit_wired(bp)
     for raw in bp.get("entities") or []:
         name = str(raw.get("name", ""))
@@ -348,7 +385,18 @@ def parse_blueprint_dict(
 
         pos = raw.get("position") or {}
         _, _, cdx, cdy = _geometry(name, direction)
-        tx, ty = float(pos.get("x", 0.0)) - cdx, float(pos.get("y", 0.0)) - cdy
+        placed.append((name, direction, extras, pos, float(pos.get("x", 0.0)) - cdx, float(pos.get("y", 0.0)) - cdy))
+
+    # Strings older than 1.0 often place the whole blueprint half a tile off the grid; a shift shared
+    # by every entity is only a different origin, so it is removed (mixed offsets stay an error).
+    shift = (0.0, 0.0)
+    if version < (1, 0) and placed:
+        fractions = {(round(tx % 1, 6), round(ty % 1, 6)) for _, _, _, _, tx, ty in placed}
+        if len(fractions) == 1 and set(next(iter(fractions))) <= {0.0, 0.5}:
+            shift = next(iter(fractions))
+
+    for name, direction, extras, pos, tx, ty in placed:
+        tx, ty = tx - shift[0], ty - shift[1]
         if abs(tx - round(tx)) > 1e-6 or abs(ty - round(ty)) > 1e-6:
             if not snap_off_grid:
                 raise BlueprintIRError(f"'{name}' at {pos} is off the tile grid")
@@ -357,7 +405,8 @@ def parse_blueprint_dict(
             tx, ty = math.floor(tx + 0.5 + 1e-9), math.floor(ty + 0.5 + 1e-9)
         entities.append(IREntity(name, int(round(tx)), int(round(ty)), direction, extras))
 
-    ir = IRBlueprint(entities=entities, label=_clean_text(bp.get("label")), version=version, book_path=book_path)
+    ir = IRBlueprint(entities=entities, label=_clean_text(bp.get("label")), version=version, book_path=book_path,
+                     **_snap_fields(bp))
     if normalize:
         ir = normalized(ir)
     if check_collisions:
@@ -395,11 +444,14 @@ def normalized(ir: IRBlueprint) -> IRBlueprint:
         return ir
     min_x = min(e.x for e in ir.entities)
     min_y = min(e.y for e in ir.entities)
+    if ir.snap:  # keep entities where they are relative to the grid cells: shift by whole cells only
+        min_x -= min_x % ir.snap[0]
+        min_y -= min_y % ir.snap[1]
     shifted = sorted(
         (IREntity(e.name, e.x - min_x, e.y - min_y, e.direction, e.extras) for e in ir.entities),
         key=lambda e: (e.y, e.x, e.name),
     )
-    return IRBlueprint(shifted, ir.label, ir.version, ir.book_path)
+    return ir.with_entities(shifted)
 
 
 def rotated(ir: IRBlueprint, quarter_turns: int) -> IRBlueprint:
@@ -418,7 +470,10 @@ def rotated(ir: IRBlueprint, quarter_turns: int) -> IRBlueprint:
                 direction = (direction + 4) % 16
         _, _, ndx, ndy = _geometry(e.name, direction)
         out.append(IREntity(e.name, int(round(cx - ndx)), int(round(cy - ndy)), direction, e.extras))
-    return normalized(IRBlueprint(out, ir.label, ir.version, ir.book_path))
+    if ir.absolute_snap:
+        raise BlueprintIRError("absolute-snapped blueprints are tied to the world grid and are not rotated")
+    snap = (ir.snap[1], ir.snap[0]) if ir.snap and k % 2 else ir.snap
+    return normalized(ir.with_entities(out, snap))
 
 
 # --- Facts --------------------------------------------------------------------------------
@@ -462,6 +517,9 @@ def extract_facts(ir: IRBlueprint) -> Dict[str, Any]:
                             for sid in (e.extras_dict.get("signals") or "").split(";") if sid}
                            | {e.extras_dict["icon"].split(":", 1)[1] for e in ir.entities if "icon" in e.extras_dict})
     return {
+        "snap": list(ir.snap) if ir.snap else None,
+        "absolute_snapping": ir.absolute_snap,
+        "snap_offset": list(ir.snap_offset) if ir.absolute_snap else None,
         "label_signals": label_signals[:12],
         "entity_counts": dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))),
         "type_counts": dict(sorted(by_type.items(), key=lambda kv: (-kv[1], kv[0]))),

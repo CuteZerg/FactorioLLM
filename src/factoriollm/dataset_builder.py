@@ -34,6 +34,7 @@ def main():
     p.add_argument("--verify", choices=["sandbox", "local"], default="sandbox")
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--rebuild", action="store_true")
+    p.add_argument("--dry-run", action="store_true", help="Only parse, lift and count; no sandbox, no DB writes")
 
     p = sub.add_parser("prompts", help="Generate grounded prompts with Gemini (free-tier friendly)")
     p.add_argument("--model", default=None)
@@ -53,7 +54,7 @@ def main():
     elif args.stage == "canonical":
         asyncio.run(build_canonical(
             min_favorites=args.min_favorites, limit=args.limit, verify=args.verify,
-            workers=args.workers, rebuild=args.rebuild,
+            workers=args.workers, rebuild=args.rebuild, dry_run=args.dry_run,
         ))
     elif args.stage == "prompts":
         asyncio.run(generate_prompts(args.model, args.batch_size, args.rpm, args.max_requests, args.limit))

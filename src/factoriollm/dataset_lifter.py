@@ -74,6 +74,18 @@ def _direction_arg(e: IREntity) -> str:
     return f", direction=Direction.{direction_name(e.direction).upper()}" if e.directional and e.direction else ""
 
 
+def _snap_lines(ir: IRBlueprint) -> List[str]:
+    """Grid snapping: copies of a tileable blueprint line up on this grid when placed in game."""
+    if not ir.snap:
+        return []
+    lines = [f"bp.snapping_grid_size = {tuple(ir.snap)}"]
+    if ir.absolute_snap:  # tied to the world grid (city blocks); relative snapping is the default
+        lines.append("bp.absolute_snapping = True")
+        if ir.snap_offset != (0, 0):
+            lines.append(f"bp.position_relative_to_grid = {tuple(ir.snap_offset)}")
+    return lines
+
+
 def _label_call(e: IREntity) -> str:
     """add_signal_label / add_display_panel call for a constant combinator or display panel."""
     extras = e.extras_dict
@@ -267,7 +279,7 @@ def lift_ir_to_code(ir: IRBlueprint, use_macros: bool = True) -> str:
         header.append(f"from draftsman_helpers import {', '.join(h for h in HELPER_NAMES if h in helpers)}")
     width, height = ir.size
     return "\n".join(
-        header + ["", f"bp = Blueprint()  # {width}x{height} tiles", ""] + lines + ["print(bp.to_string())"]
+        header + ["", f"bp = Blueprint()  # {width}x{height} tiles"] + _snap_lines(ir) + [""] + lines + ["print(bp.to_string())"]
     ) + "\n"
 
 
@@ -293,7 +305,7 @@ def ir_equivalent(expected: IRBlueprint, blueprint_string: str) -> bool:
         actual = parse_blueprint_string(blueprint_string, allowed=None)
     except Exception:
         return False
-    return actual.canonical_set() == expected.canonical_set()
+    return actual.canonical_set() == expected.canonical_set() and actual.snap_key() == expected.snap_key()
 
 
 def lift_and_verify_locally(ir: IRBlueprint) -> Optional[str]:

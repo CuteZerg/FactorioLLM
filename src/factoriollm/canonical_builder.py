@@ -33,6 +33,15 @@ from factoriollm.sandbox import DockerSandbox
 
 TOKENIZER_PATH = Path("factorio_lora_model/tokenizer.json")
 
+# Children taken from one blueprint book, by the book's favorites: popular books are where players
+# keep their canonical designs, so they are not truncated.
+BOOK_CHILD_LIMITS = ((100, None), (10, 50), (0, 25))
+MIN_VERSION = (0, 15)  # older strings are converted by the IR (renames, 8 -> 16 directions)
+
+
+def book_child_limit(favorites: int) -> Optional[int]:
+    return next(limit for threshold, limit in BOOK_CHILD_LIMITS if (favorites or 0) >= threshold)
+
 
 @dataclass
 class Candidate:
@@ -69,7 +78,6 @@ def collect_candidates(
     min_entities: int,
     max_entities: int,
     max_code_tokens: int,
-    max_per_book: int,
     stats: Counter,
 ) -> List[Candidate]:
     """Parses, filters, lifts and dedupes all blueprints of the given DB rows."""
@@ -83,11 +91,12 @@ def collect_candidates(
             stats["decode_error"] += 1
             continue
 
+        limit = book_child_limit(row["favorites"])
         for n, (book_index, bp, version) in enumerate(iter_blueprints(data)):
-            if n >= max_per_book:
+            if limit is not None and n >= limit:
                 stats["book_cap"] += 1
                 break
-            if version < (1, 0):
+            if version != (0, 0) and version < MIN_VERSION:  # (0, 0): string without a version field
                 stats["old_version"] += 1
                 continue
             n_entities = len(bp.get("entities") or [])
@@ -98,7 +107,9 @@ def collect_candidates(
                 ir = parse_blueprint_dict(bp, version=version, book_path=book_index)
             except BlueprintIRError as e:
                 msg = str(e)
-                stats["not_allowed" if "not allowed" in msg else "unknown_entity" if "unknown entity" in msg else "invalid_geometry"] += 1
+                stats["not_allowed" if "not allowed" in msg else "unknown_entity" if "unknown entity" in msg
+                      else "unknown_recipe" if "unknown recipe" in msg else "circuit_logic" if "circuit-wired" in msg
+                      else "label_signal" if "label signal" in msg else "invalid_geometry"] += 1
                 continue
 
             code = lift_ir_to_code(ir)
@@ -186,19 +197,19 @@ async def build_canonical(
     min_entities: int = 4,
     max_entities: int = 500,
     max_code_tokens: int = 3600,
-    max_per_book: int = 25,
     limit: Optional[int] = None,
     verify: str = "sandbox",
     batch_size: int = 150,
     workers: int = 4,
     rebuild: bool = False,
     chunk_rows: int = 500,
+    dry_run: bool = False,
 ) -> Counter:
     pool = await get_pool()
     async with pool.acquire() as conn:
         done_keys = set() if rebuild else {r["blueprint_key"] for r in await conn.fetch("SELECT DISTINCT blueprint_key FROM canonical_blueprints")}
         rows = await conn.fetch(
-            "SELECT key, title, blueprint_string FROM blueprints WHERE favorites >= $1 ORDER BY favorites DESC, key",
+            "SELECT key, title, favorites, blueprint_string FROM blueprints WHERE favorites >= $1 ORDER BY favorites DESC, key",
             min_favorites,
         )
     rows = [r for r in rows if r["key"] not in done_keys]
@@ -213,8 +224,11 @@ async def build_canonical(
         chunk = rows[chunk_start:chunk_start + chunk_rows]
         print(f"[*] Rows {chunk_start + 1}-{chunk_start + len(chunk)} of {len(rows)}")
         candidates = await asyncio.to_thread(
-            collect_candidates, chunk, count_tokens, min_entities, max_entities, max_code_tokens, max_per_book, stats
+            collect_candidates, chunk, count_tokens, min_entities, max_entities, max_code_tokens, stats
         )
+        if dry_run:  # statistics only: no sandbox, nothing stored
+            final.update(c.status for c in candidates)
+            continue
         # Codes stored by earlier chunks / runs count as duplicates too.
         async with pool.acquire() as conn:
             stored = {r["code_hash"] for r in await conn.fetch("SELECT code_hash FROM canonical_blueprints WHERE status = 'ok'")}
@@ -231,7 +245,7 @@ async def build_canonical(
 
     print("\n[*] Canonical build summary")
     print(f"    Skipped before lifting: {dict((k, v) for k, v in stats.items() if k not in ('pending', 'duplicate', 'too_long'))}")
-    print(f"    Stored by status:       {dict(final)}")
+    print(f"    {'Would store' if dry_run else 'Stored'} by status: {dict(final)}")
     return final
 
 
@@ -240,7 +254,7 @@ def main():
     parser.add_argument("--min-favorites", type=int, default=2)
     parser.add_argument("--max-entities", type=int, default=500)
     parser.add_argument("--max-code-tokens", type=int, default=3600)
-    parser.add_argument("--max-per-book", type=int, default=25)
+    parser.add_argument("--dry-run", action="store_true", help="Only parse, lift and count; no sandbox, no DB writes")
     parser.add_argument("--limit", type=int, default=None, help="Max blueprint rows (books count as one row)")
     parser.add_argument("--verify", choices=["sandbox", "local"], default="sandbox")
     parser.add_argument("--workers", type=int, default=4, help="Parallel sandbox containers")
@@ -251,7 +265,7 @@ def main():
         min_favorites=args.min_favorites,
         max_entities=args.max_entities,
         max_code_tokens=args.max_code_tokens,
-        max_per_book=args.max_per_book,
+        dry_run=args.dry_run,
         limit=args.limit,
         verify=args.verify,
         workers=args.workers,

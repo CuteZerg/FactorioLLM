@@ -18,7 +18,7 @@ import re
 import statistics
 from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from factoriollm.blueprint_ir import IRBlueprint, IREntity, rotated
 from factoriollm.canonical_builder import make_token_counter
@@ -63,8 +63,13 @@ def rotate_direction_words(prompt: str, k: int) -> str:
     return _RU_PATTERN.sub(_ru, out)
 
 
-def ir_from_json(data: List[list]) -> IRBlueprint:
-    return IRBlueprint([IREntity(n, x, y, d, tuple(sorted(extras.items()))) for n, x, y, d, extras in data])
+def ir_from_json(data: List[list], facts: Optional[Dict] = None) -> IRBlueprint:
+    """IR from canonical_blueprints.ir; grid snapping comes from the stored facts."""
+    facts = facts or {}
+    snap = tuple(facts["snap"]) if facts.get("snap") else None
+    return IRBlueprint([IREntity(n, x, y, d, tuple(sorted(extras.items()))) for n, x, y, d, extras in data],
+                       snap=snap, absolute_snap=bool(facts.get("absolute_snapping")),
+                       snap_offset=tuple(facts.get("snap_offset") or (0, 0)))
 
 
 def build_record(prompt: str, code: str, meta: Dict) -> Dict:
@@ -113,11 +118,12 @@ async def export_dataset_to_jsonl(
             stats["dropped_count_conflict"] += 1
             continue
         lang = prompt_language(prompt)
-        k = int(_stable_fraction(f"{r['id']}|{prompt}") * 4) % 4 if rotate else 0
+        facts = json.loads(r["facts"])
+        k = int(_stable_fraction(f"{r['id']}|{prompt}") * 4) % 4 if rotate and not facts.get("absolute_snapping") else 0
         if k:
             key = (r["id"], k)
             if key not in rotated_cache:
-                rotated_cache[key] = lift_and_verify_locally(rotated(ir_from_json(json.loads(r["ir"])), k)) or ""
+                rotated_cache[key] = lift_and_verify_locally(rotated(ir_from_json(json.loads(r["ir"]), facts), k)) or ""
             if rotated_cache[key]:
                 prompt, code = rotate_direction_words(prompt, k), rotated_cache[key]
                 stats["rotated"] += 1
