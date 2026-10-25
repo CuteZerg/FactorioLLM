@@ -16,6 +16,7 @@ import sys
 from typing import Dict, List, Optional, Set, Tuple
 
 from factoriollm.blueprint_ir import (
+    ANNOTATION_ENTITIES,
     IRBlueprint,
     IREntity,
     direction_name,
@@ -25,7 +26,8 @@ from factoriollm.blueprint_ir import (
 from factoriollm.blueprint_ir import _prototype  # prototype lookup for underground reach
 
 
-HELPER_NAMES = ("add_belt_line", "add_underground_pair", "add_entity_row", "add_power_poles")
+HELPER_NAMES = ("add_belt_line", "add_underground_pair", "add_entity_row", "add_power_poles",
+                "add_signal_label", "add_display_panel")
 
 MIN_RUN = 3          # minimal belt line / entity row length worth a macro
 MIN_LOOP_GROUP = 3   # minimal number of same-kind calls worth a for-loop
@@ -70,6 +72,29 @@ def _tile(x: int, y: int) -> str:
 
 def _direction_arg(e: IREntity) -> str:
     return f", direction=Direction.{direction_name(e.direction).upper()}" if e.directional and e.direction else ""
+
+
+def _label_call(e: IREntity) -> str:
+    """add_signal_label / add_display_panel call for a constant combinator or display panel."""
+    extras = e.extras_dict
+    dir_kw = f", direction={direction_name(e.direction)!r}" if e.directional and e.direction else ""
+    if e.name == "constant-combinator":
+        signals = []
+        for part in filter(None, (extras.get("signals") or "").split(";")):
+            sid, count = part.rsplit("=", 1)
+            kind, name = sid.split(":", 1)
+            if kind == "item":
+                signals.append(repr(name) if count == "1" else f"({name!r}, {count})")
+            else:
+                signals.append(f"({name!r}, {count}, {kind!r})")
+        return f"add_signal_label(bp, {_tile(e.x, e.y)}, signals=[{', '.join(signals)}]{dir_kw})"
+    args = ""
+    if extras.get("text"):
+        args += f", text={extras['text']!r}"
+    if extras.get("icon"):
+        kind, name = extras["icon"].split(":", 1)
+        args += f", icon={name!r}" if kind == "item" else f", icon=({name!r}, {kind!r})"
+    return f"add_display_panel(bp, {_tile(e.x, e.y)}{args}{dir_kw})"
 
 
 def _extract_underground_pairs(ents: List[IREntity], used: Set[int]) -> List[Tuple[IREntity, IREntity]]:
@@ -148,6 +173,8 @@ def lift_ir_to_code(ir: IRBlueprint, use_macros: bool = True) -> str:
     lines: List[str] = []
     helpers: Set[str] = set()
 
+    labels = [i for i, e in enumerate(ents) if e.name in ANNOTATION_ENTITIES]
+    used.update(labels)  # labels carry signals / text: never folded into rows or loops
     pairs = _extract_underground_pairs(ents, used) if use_macros else []
     belts = _extract_belt_lines(ents, used) if use_macros else []
     rows = _extract_rows(ents, used) if use_macros else []
@@ -224,6 +251,13 @@ def lift_ir_to_code(ir: IRBlueprint, use_macros: bool = True) -> str:
             else:
                 for e in group:
                     lines.append(f"bp.entities.append({name!r}, tile_position={_tile(e.x, e.y)}{tail})")
+        lines.append("")
+
+    if labels:
+        lines.append("# Labels")
+        for i in sorted(labels, key=lambda k: (ents[k].y, ents[k].x)):
+            lines.append(_label_call(ents[i]))
+            helpers.add("add_signal_label" if ents[i].name == "constant-combinator" else "add_display_panel")
         lines.append("")
 
     header = ["from draftsman.blueprintable import Blueprint"]

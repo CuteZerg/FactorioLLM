@@ -51,7 +51,15 @@ VANILLA_ENTITIES = frozenset({
     "lab", "beacon", "radar", "small-lamp", "roboport", "rocket-silo",
     "stone-wall", "gate", "gun-turret", "laser-turret", "flamethrower-turret", "artillery-turret",
     "land-mine",
+    "constant-combinator", "display-panel",
 })
+
+# Players mark what a belt or block carries with unwired constant combinators and display panels.
+# They are kept as labels (signals / text / icon); wired to anything, they are circuit logic,
+# which the IR cannot express, and the blueprint is rejected.
+ANNOTATION_ENTITIES = frozenset({"constant-combinator", "display-panel"})
+LABEL_SIGNAL_TYPES = frozenset({"item", "fluid", "virtual", "entity", "recipe"})
+MAX_LABEL_SIGNALS = 40
 
 # Vanilla, but excluded for now: the decompiler does not emit wires / combinator conditions /
 # train schedules, so these blueprints would teach prompts that the code cannot fulfil.
@@ -60,8 +68,8 @@ RAIL_AND_CIRCUIT_ENTITIES = frozenset({
     "legacy-straight-rail", "legacy-curved-rail",
     "rail-signal", "rail-chain-signal", "train-stop",
     "locomotive", "cargo-wagon", "fluid-wagon", "artillery-wagon",
-    "arithmetic-combinator", "decider-combinator", "constant-combinator", "selector-combinator",
-    "power-switch", "programmable-speaker", "display-panel",
+    "arithmetic-combinator", "decider-combinator", "selector-combinator",
+    "power-switch", "programmable-speaker",
 })
 
 # Factorio 1.x -> 2.0 prototype renames (official migrations).
@@ -80,7 +88,7 @@ LEGACY_RENAMES = {
 
 # Entity attributes carried into the IR (and into generated code). Everything else
 # (modules, wires, inserter filters, quality, tags) is dropped.
-EXTRA_KEYS = ("recipe", "io_type", "input_priority", "output_priority", "filter")
+EXTRA_KEYS = ("recipe", "io_type", "input_priority", "output_priority", "filter", "signals", "text", "icon")
 
 # Types whose direction is cosmetic: never emitted, never rotated.
 _NON_DIRECTIONAL_TYPES = frozenset({"furnace"})
@@ -230,8 +238,43 @@ def _clean_text(value: Any) -> str:
     return " ".join(text.split())[:200]
 
 
-def _convert_extras(raw: Dict[str, Any]) -> Tuple[Tuple[str, str], ...]:
+def _signal_id(signal: Dict[str, Any]) -> str:
+    """'type:name' of a label signal; Space Age signal types and quality levels are rejected."""
+    kind = str(signal.get("type") or "item")
+    name = str(signal.get("name") or "")
+    if kind not in LABEL_SIGNAL_TYPES or signal.get("quality") not in (None, "normal"):
+        raise BlueprintIRError(f"unsupported label signal {kind}:{name}")
+    return f"{kind}:{name}"
+
+
+def _label_signals(raw: Dict[str, Any]) -> str:
+    """Constant combinator signals as 'type:name=count;...' (1.x filters or 2.0 sections)."""
+    behavior = raw.get("control_behavior") or {}
+    found: List[Tuple[int, int, str, int]] = []
+    for f in behavior.get("filters") or []:  # 1.x
+        if isinstance(f, dict) and isinstance(f.get("signal"), dict) and f["signal"].get("name"):
+            found.append((0, int(f.get("index", 0)), _signal_id(f["signal"]), int(f.get("count", 0))))
+    for section in (behavior.get("sections") or {}).get("sections") or []:  # 2.0
+        for f in section.get("filters") or []:
+            if isinstance(f, dict) and f.get("name"):
+                found.append((int(section.get("index", 0)), int(f.get("index", 0)), _signal_id(f), int(f.get("count", 0))))
+    if len(found) > MAX_LABEL_SIGNALS:
+        raise BlueprintIRError(f"constant combinator with {len(found)} signals")
+    return ";".join(f"{sid}={count}" for _, _, sid, count in sorted(found))
+
+
+def _convert_extras(raw: Dict[str, Any], name: str = "") -> Tuple[Tuple[str, str], ...]:
     extras: Dict[str, str] = {}
+    if name == "constant-combinator":
+        signals = _label_signals(raw)
+        if signals:
+            extras["signals"] = signals
+    elif name == "display-panel":
+        text = _clean_text(raw.get("text"))[:80]
+        if text:
+            extras["text"] = text
+        if isinstance(raw.get("icon"), dict) and raw["icon"].get("name"):
+            extras["icon"] = _signal_id(raw["icon"])
     if raw.get("recipe"):
         extras["recipe"] = str(raw["recipe"])
     if raw.get("type") == "output":  # "input" is the default and is omitted on export
@@ -245,9 +288,23 @@ def _convert_extras(raw: Dict[str, Any]) -> Tuple[Tuple[str, str], ...]:
     if flt:
         extras["filter"] = str(flt)
     for key, value in extras.items():
-        if not all(ch.isalnum() or ch in "-_" for ch in value):
+        allowed = "-_:;=" if key in ("signals", "icon") else "-_"
+        if key != "text" and not all(ch.isalnum() or ch in allowed for ch in value):  # text: free, emitted via repr
             raise BlueprintIRError(f"suspicious value for {key}: {value!r}")
     return tuple(sorted(extras.items()))
+
+
+def _circuit_wired(bp: Dict[str, Any]) -> set:
+    """entity_numbers with a red/green circuit wire (2.0 'wires' or 1.x 'connections')."""
+    wired = set()
+    for w in bp.get("wires") or []:
+        if isinstance(w, (list, tuple)) and len(w) == 4 and w[1] in (1, 2, 3, 4) and w[3] in (1, 2, 3, 4):
+            wired.update((w[0], w[2]))
+    for raw in bp.get("entities") or []:
+        for point in (raw.get("connections") or {}).values():
+            if isinstance(point, dict) and (point.get("red") or point.get("green")):
+                wired.add(raw.get("entity_number"))
+    return wired
 
 
 def parse_blueprint_dict(
@@ -268,6 +325,7 @@ def parse_blueprint_dict(
     """
     legacy = version[0] < 2
     entities: List[IREntity] = []
+    wired = _circuit_wired(bp)
     for raw in bp.get("entities") or []:
         name = str(raw.get("name", ""))
         if legacy:
@@ -276,13 +334,15 @@ def parse_blueprint_dict(
             raise BlueprintIRError(f"unknown entity '{name}'")
         if allowed is not None and name not in allowed:
             raise BlueprintIRError(f"entity '{name}' not allowed")
+        if name in ANNOTATION_ENTITIES and raw.get("entity_number") in wired:
+            raise BlueprintIRError(f"circuit-wired '{name}' (circuit logic) is not supported")
 
         direction = int(raw.get("direction", 0) or 0)
         if legacy:
             direction *= 2  # 1.x used 8 directions, 2.0 uses 16
         if direction % 4 != 0:
             raise BlueprintIRError(f"non-cardinal direction {direction} on '{name}'")
-        extras = _convert_extras(raw)
+        extras = _convert_extras(raw, name)
         if not is_directional(name, dict(extras).get("recipe")):
             direction = 0
 
@@ -398,7 +458,11 @@ def extract_facts(ir: IRBlueprint) -> Dict[str, Any]:
         by_type[t] = by_type.get(t, 0) + n
 
     width, height = ir.size
+    label_signals = sorted({sid.split("=")[0].split(":", 1)[1] for e in ir.entities
+                            for sid in (e.extras_dict.get("signals") or "").split(";") if sid}
+                           | {e.extras_dict["icon"].split(":", 1)[1] for e in ir.entities if "icon" in e.extras_dict})
     return {
+        "label_signals": label_signals[:12],
         "entity_counts": dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))),
         "type_counts": dict(sorted(by_type.items(), key=lambda kv: (-kv[1], kv[0]))),
         "recipes": recipes,
