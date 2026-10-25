@@ -201,6 +201,10 @@ def run_eval(adapter: Optional[str], sets: str = "all", limit: Optional[int] = N
              retries: int = 1) -> Dict[str, Any]:
     """retries=1 measures the model alone; retries>1 runs the full agentic loop (sandbox + validator feedback)."""
     from factoriollm.inference import FactorioInference, extract_python_code
+    from factoriollm.sandbox import DockerSandbox
+
+    sandbox = DockerSandbox()  # snapshots helpers.py now, so later edits do not leak into this run
+    sandbox.ensure_image()  # fail before spending GPU time, not after generation
 
     cases: List[EvalCase] = []
     if sets in ("A", "all"):
@@ -217,7 +221,7 @@ def run_eval(adapter: Optional[str], sets: str = "all", limit: Optional[int] = N
     agent = None
     if retries > 1:
         from factoriollm.agentic_loop import AgenticBlueprintGenerator
-        agent = AgenticBlueprintGenerator(inference=infer, max_retries=retries)
+        agent = AgenticBlueprintGenerator(inference=infer, sandbox=sandbox, max_retries=retries)
 
     codes, stats = [], []
     for i, case in enumerate(cases, 1):
@@ -235,15 +239,32 @@ def run_eval(adapter: Optional[str], sets: str = "all", limit: Optional[int] = N
         stats.append((tokens, seconds, attempts, first_ok))
         print(f"    [{i}/{len(cases)}] {case.id}: {tokens} tokens, {seconds:.1f}s, attempts={attempts}")
 
-    return _execute_score_and_save(infer.model_path, sets, cases, codes, stats, extra={"retries": retries})
+    partial = save_generations(infer.model_path, sets, cases, codes, stats)
+    report = _execute_score_and_save(infer.model_path, sets, cases, codes, stats, extra={"retries": retries},
+                                     sandbox=sandbox)
+    partial.unlink(missing_ok=True)
+    return report
+
+
+def save_generations(adapter: str, sets: str, cases: List[EvalCase], codes: List[str], stats: List[tuple]) -> Path:
+    """Writes the raw generations in a --rescore compatible form, so a sandbox failure does not lose GPU work."""
+    rows = [{"id": c.id, "set": c.set, "code": code, "gen_tokens": t, "gen_seconds": round(s, 2),
+             "attempts": a, "valid_first_attempt": f}
+            for c, code, (t, s, a, f) in zip(cases, codes, stats)]
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    out = OUTPUT_DIR / f"{Path(adapter).name}-{datetime.now():%Y%m%d-%H%M%S}.partial.json"
+    out.write_text(json.dumps({"adapter": adapter, "sets": sets, "results": rows}, ensure_ascii=False, indent=1),
+                   encoding="utf-8")
+    print(f"[*] Generations saved: {out} (rescore with --rescore if execution fails)")
+    return out
 
 
 def _execute_score_and_save(adapter: str, sets: str, cases: List[EvalCase], codes: List[str], stats: List[tuple],
-                            extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                            extra: Optional[Dict[str, Any]] = None, sandbox: Any = None) -> Dict[str, Any]:
     """Runs the generated codes in the sandbox, scores them and writes the JSON report."""
     from factoriollm.sandbox import DockerSandbox
 
-    executions = DockerSandbox().execute_batch(codes, per_script_timeout=20)
+    executions = (sandbox or DockerSandbox()).execute_batch(codes, per_script_timeout=20)
     results = []
     for case, code, exec_result, (tokens, seconds, *loop) in zip(cases, codes, executions, stats):
         report = safe_validate(exec_result.blueprint_string) if exec_result.success else None

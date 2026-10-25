@@ -173,6 +173,8 @@ class DockerSandbox:
         self.cpu_limit = cpu_limit
         self.pids_limit = pids_limit
         self.max_output_bytes = max_output_bytes
+        # Snapshot of helpers.py: editing it during a long eval must not change what the eval runs.
+        self.preamble = COMPATIBILITY_SHIM + "\n" + get_helpers_shim() + "\n"
 
         if dockerfile_path is None:
             # Default to docker/Dockerfile.sandbox relative to project root
@@ -254,9 +256,8 @@ class DockerSandbox:
             "python", "-",
         ]
 
-    @staticmethod
-    def _preamble() -> str:
-        return COMPATIBILITY_SHIM + "\n" + get_helpers_shim() + "\n"
+    def _preamble(self) -> str:
+        return self.preamble
 
     def _run_container(self, script: str, timeout: float, max_output: int) -> tuple[Optional[int], str, str, bool]:
         """Runs a script in a fresh container. Returns (returncode, stdout, stderr, timed_out)."""

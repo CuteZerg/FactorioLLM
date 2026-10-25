@@ -56,6 +56,27 @@ def write_status(status: dict) -> None:
     tmp.replace(STATUS_FILE)
 
 
+def docker_running() -> bool:
+    try:
+        return subprocess.run(["docker", "info"], capture_output=True, timeout=60).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def ensure_docker() -> bool:
+    """Docker Desktop's WSL VM can stop overnight; eval steps need the sandbox, so try to bring it back."""
+    if docker_running():
+        return True
+    for cmd in (["docker", "desktop", "start"], ["docker", "desktop", "restart"]):
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=300)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if docker_running():
+            return True
+    return False
+
+
 def run_pipeline() -> int:
     ABORT_FILE.unlink(missing_ok=True)
     status = {"pid": os.getpid(), "started": now(), "state": "running", "current": None, "steps": []}
@@ -70,6 +91,11 @@ def run_pipeline() -> int:
         adapter = step.get("needs_adapter")
         if adapter and not (ROOT / "adapters" / adapter / "adapter_model.safetensors").exists():
             entry.update(state="skipped", reason=f"adapters/{adapter} not found", finished=now())
+            status["steps"].append(entry)
+            write_status(status)
+            continue
+        if step["kind"] == "eval" and not ensure_docker():
+            entry.update(state="failed", reason="Docker daemon is not running", finished=now())
             status["steps"].append(entry)
             write_status(status)
             continue

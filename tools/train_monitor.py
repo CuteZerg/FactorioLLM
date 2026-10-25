@@ -229,6 +229,8 @@ def main():
         print(f"[*] Started scheduled task '{TASK_NAME}'. Log: {MONITOR_LOG}")
         return
 
+    # Under Task Scheduler stdout is a cp1251 file: emoji in log lines would crash the monitor.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     load_dotenv(ROOT / ".env")
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     tg = Telegram(token, os.getenv("TELEGRAM_CHAT_ID")) if token else None
