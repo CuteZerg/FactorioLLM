@@ -1,0 +1,317 @@
+"""
+Template miner: finds the best tileable player designs per category in the scraped corpus.
+
+For every blueprint (and every child of a blueprint book) with enough favorites:
+    raw JSON -> IR -> category by content -> template (repeating segment with head and tail, or a
+    whole cell tiled by copies) -> tiling check with several lengths -> metrics
+The best templates per category go to data/templates/catalog.json, and a readable report with
+ASCII maps to outputs/templates/catalog.md.
+
+    uv run python -m factoriollm.template_miner [--min-favorites 10] [--per-category 8]
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import math
+from collections import Counter
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from factoriollm.blueprint_ir import (
+    BlueprintIRError,
+    IRBlueprint,
+    decode_blueprint_string,
+    footprint,
+    iter_blueprints,
+    parse_blueprint_dict,
+    rotated,
+)
+from factoriollm.templates import Template, along_x, extract, extract_cell, metrics, signature, tiling_check
+
+CATALOG = Path("data/templates/catalog.json")
+REPORT = Path("outputs/templates/catalog.md")
+MAX_ENTITIES = 3000
+
+ASSEMBLERS = ("assembling-machine-1", "assembling-machine-2", "assembling-machine-3")
+FURNACES = {"stone-furnace": "smelting_stone", "steel-furnace": "smelting_steel", "electric-furnace": "smelting_electric"}
+SCIENCE = {"automation-science-pack": "science_red", "logistic-science-pack": "science_green",
+           "military-science-pack": "science_military", "chemical-science-pack": "science_blue",
+           "production-science-pack": "science_purple", "utility-science-pack": "science_yellow"}
+
+
+# Machines that make up each category; a module must consist mostly of them.
+FAMILIES = {
+    "nuclear": {"nuclear-reactor", "heat-exchanger", "steam-turbine"},
+    "steam": {"boiler", "steam-engine"},
+    "solar": {"solar-panel", "accumulator"},
+    "labs": {"lab"},
+    "mining": {"electric-mining-drill"},
+    **{cat: {name} for name, cat in FURNACES.items()},
+}
+PRODUCTION = {"nuclear-reactor", "heat-exchanger", "steam-turbine", "boiler", "steam-engine", "solar-panel",
+              "accumulator", "lab", "electric-mining-drill", "burner-mining-drill", "stone-furnace", "steel-furnace",
+              "electric-furnace", "chemical-plant", "oil-refinery", "centrifuge", *ASSEMBLERS}
+MIN_PURITY = 0.6
+
+
+def _category(names: Counter, recipes: Counter) -> Optional[str]:
+    assemblers = sum(names[a] for a in ASSEMBLERS)
+    furnaces = {k: names[k] for k in FURNACES}
+    if names["nuclear-reactor"]:
+        return "nuclear"
+    if names["boiler"] and names["steam-engine"] >= 2:
+        return "steam"
+    if names["solar-panel"] >= 4:
+        return "solar"
+    if names["lab"] >= 4:
+        return "labs"
+    if sum(furnaces.values()) >= 4:
+        return FURNACES[max(furnaces, key=furnaces.get)]
+    if names["electric-mining-drill"] >= 4:
+        return "mining"
+    if assemblers >= 2:
+        green, cable, red = recipes["electronic-circuit"], recipes["copper-cable"], recipes["advanced-circuit"]
+        if red >= 2 and red + green + cable + recipes["plastic-bar"] >= 0.6 * assemblers:
+            return "red_circuits"
+        if green and cable and green + cable >= 0.6 * assemblers:
+            return "green_circuits"
+        if recipes["iron-gear-wheel"] >= 0.5 * assemblers:
+            return "gears"
+        top, n = (recipes.most_common(1) or [(None, 0)])[0]
+        if top in SCIENCE and n >= 0.3 * assemblers:
+            return SCIENCE[top]
+    return None
+
+
+def classify(ir: IRBlueprint) -> Optional[str]:
+    """
+    Main purpose of a blueprint from its content (not from author tags). Blocks that mix several
+    purposes (whole bases, a science block with its own smelting) are skipped: the category's own
+    machines must make up at least MIN_PURITY of all production machines.
+    """
+    names = Counter(e.name for e in ir.entities)
+    recipes = Counter(e.extras_dict.get("recipe") for e in ir.entities if e.name in ASSEMBLERS)
+    category = _category(names, recipes)
+    if category is None:
+        return None
+    family = FAMILIES.get(category, set(ASSEMBLERS))
+    production = sum(n for name, n in names.items() if name in PRODUCTION)
+    own = sum(names[name] for name in family)
+    return category if production and own / production >= MIN_PURITY else None
+
+
+def main_machine(t: Template) -> str:
+    machines = t.metrics.get("machines_per_segment") or {}
+    family = FAMILIES.get(t.category, set(ASSEMBLERS))
+    own = {k: v for k, v in machines.items() if k in family} or machines
+    return max(own, key=own.get) if own else "-"
+
+
+def _belts_along_x(t: Template) -> int:
+    return sum(1 for e in t.segment if e.name.endswith("transport-belt") and e.direction in (4, 12))
+
+
+def mine_one(ir: IRBlueprint, category: str) -> Optional[Template]:
+    """
+    Best template of one blueprint: an inner repeat if there is one; otherwise the whole blueprint
+    tiled by copies along the axis where copies join cleanly (belts continue, nothing overlaps),
+    preferring the axis the belts run along.
+    """
+    for oriented in along_x(ir):
+        template = extract(oriented, category)
+        if template is not None:
+            return template
+    options = [ir] if ir.absolute_snap else [ir, rotated(ir, 1)]
+    cells = [cell for cell in (extract_cell(o, category) for o in options) if tiling_check(cell)["ok"]]
+    return max(cells, key=_belts_along_x) if cells else None
+
+
+def variant(t: Template) -> str:
+    """Coarse variant label a user can ask for: beacons or not, and the main machine tier."""
+    beaconed = (t.metrics.get("beacons_per_machine") or 0) > 0
+    return f"{'beacons' if beaconed else 'no beacons'}, {main_machine(t)}"
+
+
+def score(t: Template) -> float:
+    """Ranking: popularity (log), a bonus for 2.0 designs, density as a tie breaker."""
+    fav = t.source.get("favorites", 0) or 0
+    newer = 1.0 if t.source.get("version", [0])[0] >= 2 else 0.5 if t.source.get("version", [0])[0] >= 1 else 0.0
+    density = t.metrics.get("tiles_per_machine") or 50
+    return math.log10(fav + 1) + newer - density / 100
+
+
+def ascii_map(ir: IRBlueprint, max_w: int = 80, max_h: int = 40) -> str:
+    arrows = {0: "^", 4: ">", 8: "v", 12: "<"}
+    special = {"underground-belt": "u", "splitter": "=", "inserter": "i", "long-handed-inserter": "l",
+               "fast-inserter": "f", "bulk-inserter": "k", "burner-inserter": "n", "small-electric-pole": "p",
+               "medium-electric-pole": "P", "substation": "$", "big-electric-pole": "B", "constant-combinator": "c",
+               "small-lamp": "*", "pipe": "|", "pipe-to-ground": "!", "solar-panel": "S", "accumulator": "A",
+               "lab": "L", "boiler": "O", "steam-engine": "E", "offshore-pump": "W", "electric-mining-drill": "D",
+               "beacon": "#", "stone-furnace": "F", "steel-furnace": "F", "electric-furnace": "F"}
+    recipe_chars = {"copper-cable": "C", "electronic-circuit": "G", "advanced-circuit": "R", "iron-gear-wheel": "V"}
+    grid: Dict[tuple, str] = {}
+    for e in ir.entities:
+        base = e.name.replace("fast-", "").replace("express-", "")
+        if base == "transport-belt":
+            ch = arrows[e.direction]
+        elif e.extras_dict.get("recipe") in recipe_chars:
+            ch = recipe_chars[e.extras_dict["recipe"]]
+        else:
+            ch = special.get(base, special.get(e.name, e.name[0].upper()))
+        w, h = footprint(e.name, e.direction)
+        for dx in range(w):
+            for dy in range(h):
+                grid[(e.x + dx, e.y + dy)] = ch
+    xs = [t[0] for t in grid]
+    ys = [t[1] for t in grid]
+    rows = []
+    for y in range(min(ys), min(max(ys), min(ys) + max_h - 1) + 1):
+        rows.append("".join(grid.get((x, y), ".") for x in range(min(xs), min(max(xs), min(xs) + max_w - 1) + 1)))
+    return "\n".join(rows)
+
+
+async def _load(min_favorites: int) -> List[Any]:
+    from factoriollm.database import get_connection
+    conn = await get_connection()
+    rows = await conn.fetch("SELECT key, title, favorites, raw_data->'tags' AS tags, blueprint_string FROM blueprints "
+                            "WHERE favorites >= $1 ORDER BY favorites DESC", min_favorites)
+    await conn.close()
+    return rows
+
+
+def _vanilla(tags: Optional[str]) -> bool:
+    for tag in json.loads(tags or "[]"):
+        if tag.startswith("/mods/") and tag != "/mods/vanilla/":
+            return False
+        if tag.startswith("/planets/") and tag != "/planets/nauvis/":
+            return False
+    return True
+
+
+def mine(min_favorites: int = 10, per_category: int = 8) -> Dict[str, List[Template]]:
+    rows = asyncio.run(_load(min_favorites))
+    stats: Counter = Counter()
+    found: Dict[str, List[Template]] = {}
+    for row in rows:
+        if not _vanilla(row["tags"]):
+            stats["modded"] += 1
+            continue
+        try:
+            items = list(iter_blueprints(decode_blueprint_string(row["blueprint_string"])))
+        except BlueprintIRError:
+            stats["decode_error"] += 1
+            continue
+        for path, bp, version in items:
+            if len(bp.get("entities") or []) > MAX_ENTITIES:
+                stats["too_large"] += 1
+                continue
+            try:
+                ir = parse_blueprint_dict(bp, version=version, book_path=path)
+            except BlueprintIRError:
+                stats["not_parsed"] += 1
+                continue
+            category = classify(ir)
+            if category is None:
+                continue
+            stats[f"candidates {category}"] += 1
+            try:
+                template = mine_one(ir, category)
+            except BlueprintIRError:
+                template = None
+            if template is None:
+                stats["no_template"] += 1
+                continue
+            check = tiling_check(template)
+            if not check["ok"]:
+                stats["tiling_failed"] += 1
+                continue
+            template.source = {"key": row["key"], "book_path": path, "label": ir.label, "title": row["title"],
+                               "favorites": row["favorites"], "version": list(version)}
+            template.metrics = {**metrics(template), "kind": "segment" if template.head or template.repeats > 1 or template.tail else "cell",
+                                "source_warnings": check["source_warnings"]}
+            found.setdefault(category, []).append(template)
+    best: Dict[str, List[Template]] = {}
+    for cat, ts in sorted(found.items()):
+        unique: Dict[Any, Template] = {}
+        for t in sorted(ts, key=score, reverse=True):  # identical segments from sibling blueprints: keep the best
+            unique.setdefault(signature(t), t)
+        by_variant: Dict[str, List[Template]] = {}
+        for t in unique.values():
+            by_variant.setdefault(variant(t), []).append(t)
+        best[cat] = [t for vs in by_variant.values() for t in vs[:3]][:per_category * 2]
+        best[cat].sort(key=lambda t: (variant(t), -score(t)))
+    print(f"[*] {dict(stats)}")
+    return best
+
+
+CATEGORY_NAMES = {
+    "smelting_stone": "Плавка в каменных печах", "smelting_steel": "Плавка в стальных печах",
+    "smelting_electric": "Плавка в электропечах", "mining": "Добыча (электробуры)", "steam": "Паровая энергетика",
+    "solar": "Солнечные поля", "nuclear": "Атомная энергетика", "labs": "Лаборатории",
+    "green_circuits": "Зелёные схемы", "red_circuits": "Красные схемы", "gears": "Шестерни",
+    "science_red": "Красная наука", "science_green": "Зелёная наука", "science_military": "Военная наука",
+    "science_blue": "Синяя наука", "science_purple": "Фиолетовая наука", "science_yellow": "Жёлтая наука",
+}
+
+
+def default_template(ts: List[Template]) -> Template:
+    """Default for requests without details: the best-ranked design without beacons (beacons are late game)."""
+    plain = [t for t in ts if not (t.metrics.get("beacons_per_machine") or 0)]
+    return max(plain or ts, key=score)
+
+
+def _describe(t: Template) -> str:
+    m, s = t.metrics, t.source
+    kind = (f"повторяемый сегмент {m['segment_size'][0]}×{m['segment_size'][1]} (в оригинале {t.repeats} шт.), "
+            f"голова {m['head_entities']} и хвост {m['tail_entities']} сущностей" if m["kind"] == "segment"
+            else f"целая ячейка {m['segment_size'][0]}×{m['segment_size'][1]}, тайлится копиями с шагом {t.period}")
+    label = (s.get("label") or s.get("title") or "").replace("|", "/")
+    return (f"«{label}» из «{s.get('title', '')}» — {s['favorites']}★, версия {'.'.join(map(str, s['version']))}; {kind}; "
+            f"машин на сегмент: {m['machines_per_segment']}; тайлов на машину: {m['tiles_per_machine']}; "
+            f"ленты: {m['belt_tier'] or '—'}; источник: `{s['key']}` / `{s['book_path'] or '-'}`")
+
+
+def write_outputs(best: Dict[str, List[Template]]) -> None:
+    CATALOG.parent.mkdir(parents=True, exist_ok=True)
+    REPORT.parent.mkdir(parents=True, exist_ok=True)
+    CATALOG.write_text(json.dumps({cat: [t.to_json() for t in ts] for cat, ts in best.items()}, ensure_ascii=False),
+                       encoding="utf-8")
+    lines = ["# Каталог шаблонов из чертежей игроков", "",
+             "Сгенерировано `template_miner.py`. Для каждой категории — шаблон по умолчанию (лучший по рейтингу "
+             "вариант без маяков: популярность, бонус за версию 2.0, плотность) и альтернативы по вариантам. "
+             "Все шаблоны проверены: сборки из 1, 2 и 5 сегментов проходят валидатор без новых ошибок и предупреждений.", ""]
+    for cat, ts in best.items():
+        top = default_template(ts)
+        lines += [f"## {CATEGORY_NAMES.get(cat, cat)}", "", f"**По умолчанию ({variant(top)}).** {_describe(top)}", "",
+                  "```", ascii_map(top.build(max(2, top.repeats) if top.metrics['kind'] == 'segment' else 1)), "```", ""]
+        others: Dict[str, Template] = {}
+        for t in sorted(ts, key=score, reverse=True):
+            if t is not top:
+                others.setdefault(variant(t), t)
+        if others:
+            lines += ["Альтернативы:", ""]
+            lines += [f"- *{v}*: {_describe(t)}" for v, t in sorted(others.items())]
+            lines.append("")
+    lines += ["## Обозначения на картах", "",
+              "`^>v<` ленты, `u` подземка, `=` сплиттер, `i` манипулятор, `l` длинный, `f` быстрый, `k` bulk, "
+              "`n` угольный, `p`/`P`/`$`/`B` малый/средний столб, подстанция, большой столб, `F` печь, `C`/`G`/`R`/`V` "
+              "сборщик кабеля/зелёных/красных схем/шестерён, прочие сборщики — первая буква имени, `L` лаборатория, "
+              "`D` бур, `S`/`A` панель/аккумулятор, `O` котёл, `E` паровой двигатель, `W` насос, `#` маяк, "
+              "`c` метка-комбинатор, `*` лампа, `|`/`!` труба/подземная труба.", ""]
+    REPORT.write_text("\n".join(lines), encoding="utf-8")
+    print(f"[*] Catalog: {CATALOG}; report: {REPORT}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Mine tileable layout templates from popular blueprints")
+    parser.add_argument("--min-favorites", type=int, default=10)
+    parser.add_argument("--per-category", type=int, default=8)
+    args = parser.parse_args()
+    write_outputs(mine(args.min_favorites, args.per_category))
+
+
+if __name__ == "__main__":
+    main()

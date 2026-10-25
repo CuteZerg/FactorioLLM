@@ -230,10 +230,13 @@ async def build_canonical(
             final.update(c.status for c in candidates)
             continue
         # Codes stored by earlier chunks / runs count as duplicates too.
+        # A rebuilt row matching its own earlier version is not a duplicate.
         async with pool.acquire() as conn:
-            stored = {r["code_hash"] for r in await conn.fetch("SELECT code_hash FROM canonical_blueprints WHERE status = 'ok'")}
+            stored: Dict[str, set] = {}
+            for r in await conn.fetch("SELECT code_hash, blueprint_key, book_index FROM canonical_blueprints WHERE status = 'ok'"):
+                stored.setdefault(r["code_hash"], set()).add((r["blueprint_key"], r["book_index"]))
         for c in candidates:
-            if c.status == "pending" and c.code_hash in stored:
+            if c.status == "pending" and stored.get(c.code_hash, set()) - {(c.blueprint_key, c.book_index)}:
                 c.status, c.error = "duplicate", "same code stored earlier"
 
         print(f"    verifying {sum(c.status == 'pending' for c in candidates)} candidates ({verify})...")
