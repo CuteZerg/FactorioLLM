@@ -2,10 +2,13 @@
 Template miner: finds the best tileable player designs per category in the scraped corpus.
 
 For every blueprint (and every child of a blueprint book) with enough favorites:
-    raw JSON -> IR -> category by content -> template (repeating segment with head and tail, or a
-    whole cell tiled by copies) -> tiling check with several lengths -> metrics
+    raw JSON -> IR -> category by content -> the design must work on its own (flow simulator) ->
+    cut of the author's surroundings (by flow; the cut must keep it working) -> template (repeating
+    segment with head and tail, or a whole cell tiled by copies) -> tiling check with several
+    lengths -> builds must work too -> metrics
 The best templates per category go to data/templates/catalog.json, and a readable report with
-ASCII maps to outputs/templates/catalog.md.
+ASCII maps to outputs/templates/catalog.md. Rejected designs are counted by reason, and a few per
+reason go to a second book (outputs/templates/rejects_book.txt) to check the reasons in game.
 
     uv run python -m factoriollm.template_miner [--min-favorites 10] [--per-category 8]
 """
@@ -16,10 +19,9 @@ import argparse
 import asyncio
 import json
 import math
-import re
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from factoriollm.blueprint_ir import (
     BlueprintIRError,
@@ -31,16 +33,20 @@ from factoriollm.blueprint_ir import (
     parse_blueprint_dict,
     rotated,
 )
-from factoriollm.game_data import final_products, places_entity
+from factoriollm.flow_sim import FlowResult, solve
+from factoriollm.game_data import final_products, places_entity, recipe
 from factoriollm.templates import (
+    CROP_STEPS,
+    DEFENSE,
     Template,
     add_port_labels,
     along_x,
     extract,
     extract_cell,
+    has_weaving,
     main_belt,
     metrics,
-    has_weaving,
+    normalize_modules,
     prepare,
     repair_power,
     signature,
@@ -50,6 +56,8 @@ from factoriollm.templates import (
 CATALOG = Path("data/templates/catalog.json")
 STATS = Path("data/templates/miner_stats.json")
 REPORT = Path("outputs/templates/catalog.md")
+REJECTS_BOOK = Path("outputs/templates/rejects_book.txt")
+REJECTS_PER_REASON = 5
 MAX_ENTITIES = 3000
 
 ASSEMBLERS = ("assembling-machine-1", "assembling-machine-2", "assembling-machine-3")
@@ -59,16 +67,18 @@ SCIENCE = {"automation-science-pack": "science_red", "logistic-science-pack": "s
            "production-science-pack": "science_purple", "utility-science-pack": "science_yellow"}
 # Machines with a recipe in the blueprint (furnaces pick theirs from the input).
 RECIPE_MACHINES = {*ASSEMBLERS, "chemical-plant", "oil-refinery", "centrifuge"}
-# Single final product -> category.
+# Single final product -> category. Products that need a layout of their own: circuits (direct
+# insertion, lane tricks), plastic, science. Every other product goes to a family by the shape of
+# its recipe (see recipe_family): gears, pipes, rods are instances of "1 solid input".
 PRODUCT_CATEGORIES = {"electronic-circuit": "green_circuits", "advanced-circuit": "red_circuits",
-                      "processing-unit": "blue_circuits", "iron-gear-wheel": "gears", "plastic-bar": "plastic",
-                      **SCIENCE}
+                      "processing-unit": "blue_circuits", "plastic-bar": "plastic", **SCIENCE}
 MULTI_MAX_PRODUCTS = 3  # more final products than this is a mall: no tileable segment, not mined
 FLUID_ENTITIES = {"offshore-pump", "pump", "pipe", "pipe-to-ground", "storage-tank"}
 
 
 # Machines that make up each category; a module must consist mostly of them.
 FAMILIES = {
+    "defense": set(DEFENSE),
     "nuclear": {"nuclear-reactor", "heat-exchanger", "steam-turbine"},
     "steam": {"boiler", "steam-engine"},
     "solar": {"solar-panel", "accumulator"},
@@ -82,12 +92,10 @@ PRODUCTION = {"nuclear-reactor", "heat-exchanger", "steam-turbine", "boiler", "s
 MIN_PURITY = 0.6
 # Power and mining: share of the blueprint's footprint taken by the category's own entities
 # (a pump station with a few panels is not a solar field).
-AREA_PURITY = {"nuclear": 0.4, "steam": 0.5, "solar": 0.5, "mining": 0.5}
+AREA_PURITY = {"nuclear": 0.4, "steam": 0.5, "solar": 0.5, "mining": 0.5, "defense": 0.5}
 AREA_FAMILIES = {**FAMILIES, "mining": {"electric-mining-drill", "beacon"}}  # beaconed mining is still mining
-# "steel furnace" / "стальные печи" name the furnace, not steel smelting
-FURNACE_WORDS = re.compile(r"steel[\s_-]*furnaces?|стальн\w*", re.IGNORECASE)
-STEEL_WORDS = re.compile(r"\bsteel\b|\bстал[ьи]\b", re.IGNORECASE)
-ORES = {"iron-ore", "copper-ore", "stone"}
+FAMILY_CATEGORIES = ("assembly_1in", "assembly_2in", "assembly_3in", "assembly_fluid", "chemistry", "oil")
+TURRET_KINDS = {"gun-turret": "gun", "laser-turret": "laser", "flamethrower-turret": "flame", "artillery-turret": "artillery"}
 
 
 def products(ir: IRBlueprint) -> List[str]:
@@ -110,24 +118,37 @@ def area_share(ir: IRBlueprint, family: set) -> float:
     return areas[True] / max(areas[True] + areas[False], 1)
 
 
-def smelting_input(ir: IRBlueprint, text: str = "") -> str:
+def recipe_family(product: str) -> Optional[str]:
     """
-    'steel' for a column that smelts iron plates into steel, 'ore' for ore / stone smelting. Furnaces
-    carry no recipe, so this comes from the author's labels and the blueprint name.
+    Family of a single-product block by the shape of the product's recipe: chemistry (chemical
+    plants) and oil (refineries) by their machines, else assembly_<n>in by the number of solid
+    ingredients (1-3) or assembly_fluid with a fluid ingredient.
     """
-    signals = {part.split("=")[0].split(":", 1)[1] for e in ir.entities
-               for part in (e.extras_dict.get("signals") or "").split(";") if part}
-    signals |= {e.extras_dict["icon"].split(":", 1)[1] for e in ir.entities if "icon" in e.extras_dict}
-    text = FURNACE_WORDS.sub(" ", f"{text} {' '.join(e.extras_dict.get('text', '') for e in ir.entities)}")
-    # an 'iron-plate' label alone is no hint (ore columns label their output with it); a steel label
-    # next to ore labels marks a mixed bus smelter that is mostly ore smelting
-    if STEEL_WORDS.search(text) or ("steel-plate" in signals and not signals & ORES):
-        return "steel"
-    return "ore"
+    for name in (product, *(n for n in _producers(product))):
+        r = recipe(name)
+        if r is None:
+            continue
+        if r.category in ("chemistry", "chemistry-or-cryogenics"):
+            return "chemistry"
+        if r.category == "oil-processing":
+            return "oil"
+        if r.fluids & set(r.ingredients):
+            return "assembly_fluid"
+        solid = len(set(r.ingredients) - r.fluids)
+        return f"assembly_{min(max(solid, 1), 3)}in"
+    return None
+
+
+def _producers(product: str) -> List[str]:
+    from factoriollm.base_game import RECIPES
+    return [name for name, r in RECIPES.items() if product in r["results"]]
 
 
 def _category(names: Counter, ir: IRBlueprint) -> Optional[str]:
     furnaces = {k: names[k] for k in FURNACES}
+    turrets = sum(n for name, n in names.items() if name in DEFENSE and name.endswith("turret"))
+    if (turrets or names["stone-wall"] >= 8) and area_share(ir, DEFENSE) >= AREA_PURITY["defense"]             and area_share(ir, PRODUCTION) <= 0.1:  # not a production block behind its walls
+        return "defense"
     if names["nuclear-reactor"]:
         return "nuclear"
     if names["boiler"] and names["steam-engine"] >= 2:
@@ -143,7 +164,7 @@ def _category(names: Counter, ir: IRBlueprint) -> Optional[str]:
     if sum(names[m] for m in RECIPE_MACHINES) >= 2:
         final = products(ir)
         if len(final) == 1:
-            return PRODUCT_CATEGORIES.get(final[0])
+            return PRODUCT_CATEGORIES.get(final[0]) or recipe_family(final[0])
         if len(final) >= 2 and not is_mall(final):
             return "multi"
     return None
@@ -160,8 +181,8 @@ def classify(ir: IRBlueprint) -> Optional[str]:
     """
     names = Counter(e.name for e in ir.entities)
     category = _category(names, ir)
-    if category is None:
-        return None
+    if category is None or category == "defense":
+        return category
     family = FAMILIES.get(category, RECIPE_MACHINES)
     if category in AREA_PURITY and area_share(ir, AREA_FAMILIES[category]) < AREA_PURITY[category]:
         return None
@@ -230,13 +251,35 @@ def traits(t: Template) -> Dict[str, Any]:
     else:
         poles = "inline" if pole_rows <= inserter_rows else "own row"
     recipes = {e.extras_dict.get("recipe") for e in t.segment + t.head + t.tail} - {None}
+    if t.category == "defense":
+        return defense_traits(t)
+    main_recipe = Counter(e.extras_dict.get("recipe") for e in machines if e.extras_dict.get("recipe")).most_common(1)
     return {
+        "recipe": main_recipe[0][0] if main_recipe else None,
         "pitch": "tight" if machines and max(widths.values()) >= t.period else "gaps",
         "poles": poles,
         "machine_modules": _modules(machines),
         "beacon_modules": _modules([e for e in t.segment if e.name == "beacon"]),
         "chain": len(recipes) > 1,
         "weaving": has_weaving(t.build(3).entities),
+        "lamps": bool(t.metrics.get("lamps")),
+    }
+
+
+def defense_traits(t: Template) -> Dict[str, Any]:
+    """Defence variants: turret kinds, wall thickness (rows of wall), gates, ammunition by belt or by hand."""
+    from factoriollm.flow_sim import Layout
+
+    kinds = sorted({TURRET_KINDS[e.name] for e in t.segment if e.name in TURRET_KINDS})
+    L = Layout(t.build(2))
+    fed = any(dst[0] == "entity" and L.ents[dst[1]].name == "gun-turret" for _, dst in L.links)
+    return {
+        "turrets": "+".join(kinds) if kinds else "walls only",
+        # thickness: walls in a column across the line, the most common count
+        "wall_rows": Counter(Counter(e.x for e in t.segment if e.name == "stone-wall").values()).most_common(1)[0][0]
+        if any(e.name == "stone-wall" for e in t.segment) else 0,
+        "gates": any(e.name == "gate" for e in t.segment),
+        "ammo": ("belt" if fed else "by hand / robots") if "gun" in kinds else None,
         "lamps": bool(t.metrics.get("lamps")),
     }
 
@@ -248,9 +291,16 @@ def variant(t: Template) -> str:
     makes, machine pitch, pole placement, chains, belt weaving and lamps.
     """
     tr = t.metrics.get("traits") or {}
+    if t.category == "defense":
+        parts = [f"turrets {tr.get('turrets')}", f"wall {tr.get('wall_rows')} rows"]
+        parts += ["gates"] if tr.get("gates") else []
+        parts += [f"ammo {tr['ammo']}"] if tr.get("ammo") else []
+        return ", ".join(parts)
     beaconed = (t.metrics.get("beacons_per_machine") or 0) > 0
     parts = [f"beacons {tr['beacon_modules']}" if beaconed and tr.get("beacon_modules")
              else "beacons" if beaconed else "no beacons", main_machine(t)]
+    if t.category in FAMILY_CATEGORIES and tr.get("recipe"):
+        parts.append(tr["recipe"])
     if tr.get("machine_modules"):
         parts.append(tr["machine_modules"])
     if t.metrics.get("input"):
@@ -362,9 +412,95 @@ def _vanilla(tags: Optional[str]) -> bool:
     return True
 
 
-def mine(min_favorites: int = 10, per_category: int = 8) -> Dict[str, List[Template]]:
+SMELT_CHOICES = ("iron-ore", "iron-plate", "copper-ore", "stone")
+SIMPLE_QUOTA = 3  # simple designs kept per category besides the best-ranked ones
+SIMPLE_MACHINES = {"assembling-machine-1", "assembling-machine-2", "stone-furnace", "steel-furnace"}
+
+
+def author_hints(ir: IRBlueprint) -> Dict[Tuple[int, int], set]:
+    """What the author's labels name (combinator signals, display panel icons), by label tile."""
+    out: Dict[Tuple[int, int], set] = {}
+    for e in ir.entities:
+        ex = e.extras_dict
+        names = {part.split("=")[0].split(":", 1)[1] for part in (ex.get("signals") or "").split(";")
+                 if part.startswith(("item:", "fluid:"))}
+        if ex.get("icon", "").startswith(("item:", "fluid:")):
+            names.add(ex["icon"].split(":", 1)[1])
+        if names:
+            out[(e.x, e.y)] = names
+    return out
+
+
+def run_flow(ir: IRBlueprint, hints: Optional[Dict] = None, first: str = "iron-ore") -> Tuple[FlowResult, str]:
+    """The flow simulator's verdict; designs with furnaces are tried with each smelting input in turn."""
+    furnaces = any(entity_type(e.name) == "furnace" for e in ir.entities)
+    choices = [first] + [s for s in SMELT_CHOICES if s != first] if furnaces else [first]
+    found: Optional[Tuple[FlowResult, str]] = None
+    for smelt in choices:
+        result = solve(ir, smelt=smelt, hints=hints)
+        if result.ok:
+            return result, smelt
+        found = found or (result, smelt)
+    return found
+
+
+def reason(result: FlowResult) -> str:
+    """Why a design does not work: the search ran out, or its most common problem."""
+    if result.status == "inputs_ambiguous":
+        return "inputs_ambiguous"
+    kinds = Counter(p.kind for p in result.problems)
+    return kinds.most_common(1)[0][0] if kinds else result.status
+
+
+def furnace_input(result: FlowResult) -> str:
+    """'steel' (iron plates come in), 'ore_to_steel' (ore in, steel out: furnace -> furnace) or 'ore'."""
+    inputs = {v for v in result.inputs.values() if v}
+    outputs = {x for p in result.ports if p.role == "output" for x in p.items}
+    if "iron-plate" in inputs:
+        return "steel"
+    return "ore_to_steel" if "steel-plate" in outputs else "ore"
+
+
+def _parse_reason(message: str) -> str:
+    for key in ("legacy recipe", "quality", "label signal", "not allowed", "unknown entity", "base game", "circuit-wired"):
+        if key in message:
+            return key.replace(" ", "_")
+    return "other"
+
+
+class Rejects:
+    """A few rejected designs per reason (reservoir sample), for the in-game rejects book."""
+
+    def __init__(self, per_reason: int = REJECTS_PER_REASON, seed: int = 7):
+        import random
+        self.per_reason, self.random = per_reason, random.Random(seed)
+        self.seen: Counter = Counter()
+        self.kept: Dict[str, List[Tuple[str, IRBlueprint, FlowResult]]] = {}
+
+    def add(self, why: str, name: str, ir: IRBlueprint, result: FlowResult) -> None:
+        self.seen[why] += 1
+        bucket = self.kept.setdefault(why, [])
+        if len(bucket) < self.per_reason:
+            bucket.append((name, ir, result))
+        else:
+            k = self.random.randrange(self.seen[why])
+            if k < self.per_reason:
+                bucket[k] = (name, ir, result)
+
+
+def is_simple(t: Template) -> bool:
+    """No beacons, no machine modules, no belt weaving, early machines (AM1/AM2, stone / steel furnaces)."""
+    tr = t.metrics.get("traits") or {}
+    machine = main_machine(t)
+    early = machine in SIMPLE_MACHINES or not (machine.startswith("assembling") or machine.endswith("furnace"))
+    return (not (t.metrics.get("beacons_per_machine") or 0) and not tr.get("machine_modules")
+            and not tr.get("weaving") and early)
+
+
+def mine(min_favorites: int = 10, per_category: int = 8) -> Tuple[Dict[str, List[Template]], Rejects]:
     rows = asyncio.run(_load(min_favorites))
     stats: Counter = Counter()
+    rejects = Rejects()
     found: Dict[str, List[Template]] = {}
     for row in rows:
         if not _vanilla(row["tags"]):
@@ -381,8 +517,8 @@ def mine(min_favorites: int = 10, per_category: int = 8) -> Dict[str, List[Templ
                 continue
             try:
                 ir = parse_blueprint_dict(bp, version=version, book_path=path)
-            except BlueprintIRError:
-                stats["not_parsed"] += 1
+            except BlueprintIRError as e:
+                stats[f"not_parsed: {_parse_reason(str(e))}"] += 1
                 continue
             category = classify(ir)
             if category is None:
@@ -390,44 +526,16 @@ def mine(min_favorites: int = 10, per_category: int = 8) -> Dict[str, List[Templ
                     stats["mall"] += 1
                 continue
             stats[f"candidates {category}"] += 1
-            try:
-                template = mine_one(prepare(ir), category)
-            except BlueprintIRError:
-                template = None
+            name = (ir.label or row["title"] or "").strip()
+            template = _mine_design(ir, category, name, stats, rejects)
             if template is None:
-                stats["no_template"] += 1
-                continue
-            template.belt = main_belt(template.head + template.segment + template.tail)
-            try:
-                check = tiling_check(template)
-                if not check["ok"] and check["power_only"]:
-                    repaired = repair_power(template)
-                    if repaired is not None and tiling_check(repaired)["ok"]:
-                        template, check = repaired, tiling_check(repaired)
-                        stats["power_repaired"] += 1
-            except ValueError:  # BlueprintIRError is handled above; this is retier
-                stats["belt_tier_failed"] += 1
-                continue
-            if not check["ok"] and check["power_only"]:
-                stats["power_failed"] += 1
-                continue
-            if not check["ok"]:
-                stats["tiling_failed"] += 1
-                continue
-            if sanity(template):
-                stats["not_a_working_module"] += 1
-                continue
-            if draftsman_overlaps(template):
-                stats["collision_boxes_overlap"] += 1
                 continue
             template.source = {"key": row["key"], "book_path": path, "label": ir.label, "title": row["title"],
                                "favorites": row["favorites"], "version": list(version)}
-            template.metrics = {**metrics(template), "kind": "segment" if template.head or template.repeats > 1 or template.tail else "cell",
-                                "source_warnings": check["source_warnings"]}
+            template.metrics.update(metrics(template))
+            template.metrics["kind"] = "segment" if template.head or template.repeats > 1 or template.tail else "cell"
             if category == "multi":
                 template.metrics["products"] = products(ir)
-            if category.startswith("smelting_"):
-                template.metrics["input"] = smelting_input(ir, ir.label if path else f"{ir.label} {row['title']}")
             template.metrics["traits"] = traits(template)
             found.setdefault(category, []).append(template)
     best: Dict[str, List[Template]] = {}
@@ -438,12 +546,80 @@ def mine(min_favorites: int = 10, per_category: int = 8) -> Dict[str, List[Templ
         by_variant: Dict[str, List[Template]] = {}
         for t in unique.values():
             by_variant.setdefault(variant(t), []).append(t)
-        best[cat] = [t for vs in by_variant.values() for t in vs[:3]][:per_category * 2]
-        best[cat].sort(key=lambda t: (variant(t), -score(t)))
+        chosen = [t for vs in by_variant.values() for t in vs[:3]][:per_category * 2]
+        # simple early designs lose on popularity; keep a few anyway
+        chosen += [t for t in unique.values() if is_simple(t) and all(t is not c for c in chosen)][:SIMPLE_QUOTA]
+        best[cat] = sorted(chosen, key=lambda t: (variant(t), -score(t)))
+    stats.update({f"rejected: {why}": n for why, n in rejects.seen.items()})
     print(f"[*] {dict(stats)}")
     STATS.parent.mkdir(parents=True, exist_ok=True)
     STATS.write_text(json.dumps(dict(stats), ensure_ascii=False, indent=1), encoding="utf-8")
-    return best
+    return best, rejects
+
+
+def _mine_design(ir: IRBlueprint, category: str, name: str, stats: Counter, rejects: Rejects) -> Optional[Template]:
+    """
+    One candidate design: it must work as the author built it (without radars, labels and, unless
+    it is defence, walls and turrets); the cut of the surroundings must keep it working (gentler cuts
+    otherwise); the template's builds must work as well. Rejections are counted by reason.
+    """
+    defense = category == "defense"
+    hints = author_hints(ir)
+    full = prepare(ir, margin=None, keep_defense=defense)
+    source_flow, smelt = run_flow(full, hints)
+    if not source_flow.ok:
+        rejects.add(f"author: {reason(source_flow)}", name, full, source_flow)
+        return None
+    cut = full
+    for step, (margin, taps) in enumerate(CROP_STEPS):
+        candidate = prepare(ir, margin, defense, taps) if margin is not None else full
+        if margin is None or run_flow(candidate, hints, smelt)[0].ok:
+            cut = candidate
+            stats[f"crop step {step}"] += 1
+            break
+    try:
+        template = mine_one(cut, category)
+    except BlueprintIRError:
+        template = None
+    if template is None:
+        stats["no_template"] += 1
+        return None
+    template.belt = main_belt(template.head + template.segment + template.tail)
+    try:
+        check = tiling_check(template)
+        if not check["ok"] and check["power_only"]:
+            repaired = repair_power(template)
+            if repaired is not None and tiling_check(repaired)["ok"]:
+                template, check = repaired, tiling_check(repaired)
+                stats["power_repaired"] += 1
+    except ValueError:  # BlueprintIRError is handled above; this is retier
+        stats["belt_tier_failed"] += 1
+        return None
+    if not check["ok"]:
+        stats["power_failed" if check["power_only"] else "tiling_failed"] += 1
+        return None
+    if sanity(template):
+        stats["not_a_working_module"] += 1
+        return None
+    if draftsman_overlaps(template):
+        stats["collision_boxes_overlap"] += 1
+        return None
+    template = normalize_modules(template)
+    segment = template.head or template.repeats > 1 or template.tail
+    if category == "defense" and not segment:
+        stats["defense_not_a_straight_wall"] += 1  # an outpost or a perimeter, not a piece of wall to repeat
+        return None
+    build_flow = None
+    for n in (1, 2) if segment else (1,):
+        build = template.build(n)
+        build_flow, smelt = run_flow(build, first=smelt)
+        if not build_flow.ok:
+            rejects.add(f"template: {reason(build_flow)}", name, build, build_flow)
+            return None
+    template.metrics = {"source_warnings": check["source_warnings"], "smelt": smelt}
+    if category.startswith("smelting_"):
+        template.metrics["input"] = furnace_input(build_flow)
+    return template
 
 
 def load_catalog(path: Path = CATALOG) -> Dict[str, List[Template]]:
@@ -457,7 +633,10 @@ CATEGORY_NAMES = {
     "smelting_electric": "Плавка в электропечах", "mining": "Добыча (электробуры)", "steam": "Паровая энергетика",
     "solar": "Солнечные поля", "nuclear": "Атомная энергетика", "labs": "Лаборатории",
     "green_circuits": "Зелёные схемы", "red_circuits": "Красные схемы", "blue_circuits": "Синие схемы",
-    "gears": "Шестерни", "plastic": "Пластик", "multi": "Мульти-блоки (несколько продуктов)",
+    "plastic": "Пластик", "multi": "Мульти-блоки (несколько продуктов)",
+    "assembly_1in": "Сборщики: 1 твёрдый вход", "assembly_2in": "Сборщики: 2 входа", "assembly_3in": "Сборщики: 3 входа",
+    "assembly_fluid": "Сборщики: вход с жидкостью", "chemistry": "Химия (химзаводы)", "oil": "Нефтепереработка",
+    "defense": "Оборона (отрезки стены)",
     "science_red": "Красная наука", "science_green": "Зелёная наука", "science_military": "Военная наука",
     "science_blue": "Синяя наука", "science_purple": "Фиолетовая наука", "science_yellow": "Жёлтая наука",
 }
@@ -479,6 +658,7 @@ def default_template(ts: List[Template]) -> Template:
     for prefer in (lambda t: not (t.metrics.get("beacons_per_machine") or 0),
                    lambda t: not (t.metrics.get("traits") or {}).get("machine_modules"),
                    lambda t: t.metrics.get("input") in (None, "ore"),
+                   is_simple,
                    lambda t: t.metrics.get("belt_tier")):  # brings its own belts, not a city-block cell
         plain = [t for t in plain if prefer(t)] or plain
 
@@ -533,11 +713,14 @@ def write_outputs(best: Dict[str, List[Template]], previous: Optional[Dict[str, 
              "Сгенерировано `template_miner.py`. Для каждой категории — шаблон по умолчанию и альтернативы по вариантам. "
              "Умолчание: среди вариантов без маяков — не больше чем на 15% хуже самого плотного по тайлам на машину, "
              "из них лучший по рейтингу (популярность, бонус за версию 2.0).", "",
-             "Как готовятся шаблоны: категория — по конечному продукту (моллы исключены); окружение автора обрезано "
-             "(врезки в шину, радары, авторские метки); все ленты одного уровня, пары подземок и переплетение сохраняются; "
+             "Как готовятся шаблоны: категория — по конечному продукту (моллы исключены; промежуточные продукты — "
+             "семейства по форме рецепта); чертёж должен работать сам по себе (симулятор потока: каждая машина получает "
+             "ингредиенты, продукт уходит, нет засоров и висячих манипуляторов); окружение автора обрезано по потоку "
+             "(врезки в шину, радары, авторские метки, оборона), обрезка не должна ломать работу; все ленты одного уровня, "
+             "пары подземок и переплетение сохраняются; модули одинаковые у машин одного вида (исключения — по рецепту); "
              "лампы — необязательный слой; сетка привязки своя (период × высота сегмента). Проверка: сборки из 1, 2 и 5 "
-             "сегментов без ошибок валидатора и без новых предупреждений, питание строгое (без островов столбов и "
-             "незапитанных машин, даже если так было у автора; при необходимости столбы сегмента расставлены заново).", ""]
+             "сегментов без ошибок валидатора и без новых предупреждений, питание строгое, сборки из 1 и 2 сегментов "
+             "работают по симулятору. Метки входов и выходов — из симулятора, по полосам.", ""]
     if previous:
         lines += _changes(best, previous)
     for cat, ts in best.items():
@@ -580,8 +763,8 @@ def blueprint_string(ir: IRBlueprint, label: str) -> str:
 
 
 def labelled(t: Template, ir: IRBlueprint) -> IRBlueprint:
-    """The build with input / output labels from recipe data (furnaces: iron ore or, for steel, iron plates)."""
-    return add_port_labels(ir, smelt="iron-plate" if t.metrics.get("input") == "steel" else "iron-ore")
+    """The build with input / output labels from the flow simulator (furnaces: the smelting input found when mining)."""
+    return add_port_labels(ir, smelt=t.metrics.get("smelt") or "iron-ore")
 
 
 def write_book(best: Dict[str, List[Template]], path: Path = Path("outputs/templates/catalog_book.txt")) -> None:
@@ -601,10 +784,10 @@ def write_book(best: Dict[str, List[Template]], path: Path = Path("outputs/templ
         for t in [top] + [t for t in sorted(ts, key=score, reverse=True) if t is not top]:
             segments = 3 if t.metrics["kind"] == "segment" else 1
             name = (t.source.get("label") or t.source.get("title") or "").strip()
-            label = f"{'DEFAULT ' if t is top else ''}{variant(t)} | {name}"
+            label = f"{name[:40]} | {'DEFAULT ' if t is top else ''}{variant(t)}"  # the name first: labels are cut at 100
             builds = [(label, lambda t=t, n=segments: labelled(t, t.build(n, lamps=True)))]
             if t is top:
-                builds.append((f"SEGMENT {t.snap[0]}x{t.snap[1]} | {name}", t.build_segment))
+                builds.append((f"{name[:40]} | SEGMENT {t.snap[0]}x{t.snap[1]}", t.build_segment))
             for text, build in builds:
                 try:
                     sub.blueprints.append(get_blueprintable_from_string(blueprint_string(build(), text)))
@@ -617,6 +800,44 @@ def write_book(best: Dict[str, List[Template]], path: Path = Path("outputs/templ
     print(f"[*] Blueprint book: {path}")
 
 
+def write_rejects_book(rejects: Rejects, path: Path = REJECTS_BOOK) -> None:
+    """
+    A few rejected designs per reason, to check in game that the reasons are fair. Each blueprint is
+    labelled with the reason and the first problem; up to three problem spots carry a red X signal.
+    """
+    from draftsman.blueprintable import BlueprintBook, get_blueprintable_from_string
+
+    from factoriollm.blueprint_ir import IREntity
+    from factoriollm.helpers import game_string
+
+    book = BlueprintBook()
+    book.label = "FactorioLLM rejected designs"
+    for why, kept in sorted(rejects.kept.items()):
+        sub = BlueprintBook()
+        sub.label = f"{why} ({rejects.seen[why]})"
+        for name, ir, result in kept:
+            used = {(e.x + dx, e.y + dy) for e in ir.entities for dx in range(footprint(e.name, e.direction)[0])
+                    for dy in range(footprint(e.name, e.direction)[1])}
+            marks = []
+            for p in result.problems[:3]:
+                x, y = p.position
+                spot = next(((x + dx, y + dy) for dx, dy in ((-1, 0), (0, -1), (1, 0), (0, 1), (-1, -1), (2, 0), (0, 2))
+                             if (x + dx, y + dy) not in used), None)
+                if spot:
+                    used.add(spot)
+                    marks.append(IREntity("constant-combinator", spot[0], spot[1], 0, (("signals", "virtual:signal-X=1"),)))
+            first = result.problems[0].message if result.problems else result.status
+            try:
+                text = f"{name[:30]} | {why}: {first}"
+                sub.blueprints.append(get_blueprintable_from_string(blueprint_string(ir.with_entities(ir.entities + marks), text)))
+            except Exception as e:
+                print(f"    [!] reject {why}: {name[:40]}: {type(e).__name__}: {e}")
+        book.blueprints.append(sub)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(game_string(book), encoding="utf-8")
+    print(f"[*] Rejects book: {path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Mine tileable layout templates from popular blueprints")
     parser.add_argument("--min-favorites", type=int, default=10)
@@ -627,10 +848,16 @@ def main():
                         help="Catalog to compare with (default: the catalog being replaced)")
     args = parser.parse_args()
     previous = load_catalog(args.previous) if args.previous else ({} if args.report_only else load_catalog())
-    best = load_catalog() if args.report_only else mine(args.min_favorites, args.per_category)
+    rejects = None
+    if args.report_only:
+        best = load_catalog()
+    else:
+        best, rejects = mine(args.min_favorites, args.per_category)
     stats = json.loads(STATS.read_text(encoding="utf-8")) if STATS.exists() else None
     write_outputs(best, previous, stats)
     write_book(best)
+    if rejects is not None:
+        write_rejects_book(rejects)
 
 
 if __name__ == "__main__":

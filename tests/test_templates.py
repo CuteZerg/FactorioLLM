@@ -186,10 +186,11 @@ class TestSelfContained(unittest.TestCase):
         self.assertTrue(has_weaving(weave))
         self.assertFalse(has_weaving([ug("underground-belt", 0), ug("underground-belt", 4, True)]))
 
-    def test_furnace_labels_come_from_the_input_parameter(self):
+    def test_furnace_labels_follow_the_lanes(self):
+        # iron plates (steel) and coal on the two lanes of the input belt: one label per lane, on its side
         ir = add_port_labels(furnace_row(3), smelt="iron-plate")
-        labels = [e.extras_dict["signals"] for e in ir.entities if e.name == "constant-combinator"]
-        self.assertEqual(labels, ["item:coal=1;item:iron-plate=1"])
+        labels = sorted(e.extras_dict["signals"] for e in ir.entities if e.name == "constant-combinator")
+        self.assertEqual(labels, ["item:coal=1", "item:iron-plate=1"])
         inside = add_port_labels(furnace_row(3), inside_only=True)
         self.assertTrue(all(e.x >= 0 and e.y >= 0 for e in inside.entities))
 

@@ -20,7 +20,7 @@ import itertools
 import math
 from collections import Counter
 from dataclasses import dataclass, field, replace
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 
 from factoriollm.blueprint_ir import IRBlueprint, IREntity, _prototype, entity_type, footprint, normalized, rotated
 from factoriollm.game_data import SMELTING, recipe
@@ -36,16 +36,19 @@ MACHINE_TYPES = frozenset({
 DECOR = frozenset({"small-lamp", "constant-combinator", "display-panel"})
 LAMP = "small-lamp"
 AUTHOR_ONLY = frozenset({"radar", "constant-combinator", "display-panel"})
+# The author's defence around a production block: removed (defence is a layer of its own, `defense` category).
+DEFENSE = frozenset({"stone-wall", "gate", "gun-turret", "laser-turret", "flamethrower-turret", "artillery-turret",
+                     "land-mine"})
+PIPE_LIKE = frozenset({"pipe", "pipe-to-ground", "storage-tank", "pump"})
 MIN_RUN_COVERAGE = 0.4  # the repeating part must hold at least this share of the entities
-# Belts further than this from the machines are the author's surroundings (bus taps, mains):
-# inserter reach (2 tiles for long-handed) plus a belt row, or a lane-loading junction in front.
-CROP_MARGIN = 4
+# Belt and pipe tiles kept in front of an input / behind an output once the author's surroundings
+# (bus taps, mains, long feeds) are cut.
+CROP_MARGIN = 2
 BELT_TIERS = (("transport-belt", "underground-belt", "splitter"),
               ("fast-transport-belt", "fast-underground-belt", "fast-splitter"),
               ("express-transport-belt", "express-underground-belt", "express-splitter"))
 _TIER = {name: (tier, kind) for tier, names in enumerate(BELT_TIERS) for kind, name in enumerate(names)}
 _DIRS = {0: (0, -1), 4: (1, 0), 8: (0, 1), 12: (-1, 0)}
-MAX_PORT_LABELS = 12
 # Validator categories that are never allowed in a template, whatever the source had.
 POWER_CATEGORIES = frozenset({"pole_islands", "unpowered", "no_poles"})
 
@@ -145,6 +148,10 @@ class Template:
     belt: Optional[str] = None  # belt tier every build is brought to (see retier)
     # optional lamp layer in the coordinates of head / segment / tail
     lamps: Dict[str, List[IREntity]] = field(default_factory=lambda: {"head": [], "segment": [], "tail": []})
+    # modules per machine (or beacon) type, e.g. {"beacon": "speed-module-3=2"}, and per recipe where the
+    # author used other modules for some products ("" = no modules); see normalize_modules
+    modules: Dict[str, str] = field(default_factory=dict)
+    modules_by_recipe: Dict[str, str] = field(default_factory=dict)
 
     def _place(self, parts: Dict[str, List[IREntity]], segments: int) -> List[IREntity]:
         ents = list(parts["head"])
@@ -154,16 +161,22 @@ class Template:
         ents += [IREntity(e.name, e.x + shift, e.y, e.direction, e.extras) for e in parts["tail"]]
         return list(dict.fromkeys(ents))  # overlapping copies may share identical entities
 
-    def build(self, segments: int, lamps: bool = False, belt: Optional[str] = None) -> IRBlueprint:
+    def build(self, segments: int, lamps: bool = False, belt: Optional[str] = None,
+              modules: Optional[Dict[str, str]] = None, modules_by_recipe: Optional[Dict[str, str]] = None) -> IRBlueprint:
         """
         The design with `segments` periods (head and tail kept), at the template's belt tier or at
-        `belt`, optionally with the author's lamps (only on free tiles that a pole reaches).
+        `belt`, optionally with the author's lamps (only on free tiles that a pole reaches). Modules:
+        `modules` per machine type ({"assembling-machine-3": "productivity-module-3=4"}, "" for none)
+        and `modules_by_recipe` override the template's own, every machine of a kind alike.
         """
         if segments < 1:
             raise ValueError("a template needs at least one segment")
         ents = self._place({"head": self.head, "segment": self.segment, "tail": self.tail}, segments)
         if belt or self.belt:
             ents = retier(ents, belt or self.belt)
+        if modules or modules_by_recipe:
+            ents = _set_modules(ents, {**self.modules, **(modules or {})},
+                                {**self.modules_by_recipe, **(modules_by_recipe or {})})
         if lamps:
             taken = {t for e in ents for t in _tiles(e)}
             free = [e for e in self._place(self.lamps, segments) if (e.x, e.y) not in taken]
@@ -183,7 +196,8 @@ class Template:
         return {"category": self.category, "period": self.period, "repeats": self.repeats,
                 "snap": list(self.snap) if self.snap else None, "source": self.source, "metrics": self.metrics,
                 "belt": self.belt, "head": pack(self.head), "segment": pack(self.segment), "tail": pack(self.tail),
-                "lamps": {part: pack(ents) for part, ents in self.lamps.items()}}
+                "lamps": {part: pack(ents) for part, ents in self.lamps.items()},
+                "modules": self.modules, "modules_by_recipe": self.modules_by_recipe}
 
     @staticmethod
     def from_json(data: Dict[str, Any]) -> "Template":
@@ -193,7 +207,53 @@ class Template:
         return Template(data["category"], data["period"], unpack(data["head"]), unpack(data["segment"]),
                         unpack(data["tail"]), data["repeats"], tuple(data["snap"]) if data.get("snap") else None,
                         data.get("source") or {}, data.get("metrics") or {}, belt=data.get("belt"),
-                        lamps={"head": [], "segment": [], "tail": [], **lamps})
+                        lamps={"head": [], "segment": [], "tail": [], **lamps},
+                        modules=data.get("modules") or {}, modules_by_recipe=data.get("modules_by_recipe") or {})
+
+
+def _set_modules(ents: List[IREntity], by_type: Dict[str, str], by_recipe: Dict[str, str]) -> List[IREntity]:
+    """Entities with module slots get the modules of their recipe, else of their type (unlisted ones keep theirs)."""
+    out = []
+    for e in ents:
+        ex = e.extras_dict
+        r = ex.get("recipe")
+        if not (_prototype(e.name) or {}).get("module_slots") or (r not in by_recipe and e.name not in by_type):
+            out.append(e)
+            continue
+        want = by_recipe[r] if r in by_recipe else by_type[e.name]
+        ex = {k: v for k, v in ex.items() if k != "modules"}
+        if want:
+            ex["modules"] = want
+        out.append(IREntity(e.name, e.x, e.y, e.direction, tuple(sorted(ex.items()))))
+    return out
+
+
+def normalize_modules(t: Template) -> Template:
+    """
+    The same modules for every machine of a kind: the most common set per machine type (and for
+    beacons), with per-recipe exceptions where the author chose other modules for some products
+    (productivity on gears, speed on circuits). Odd machines (3 labs of 152 without modules) follow
+    their group.
+    """
+    groups: Dict[Tuple[str, Optional[str]], Counter] = {}
+    for e in t.head + t.segment + t.tail:
+        if (_prototype(e.name) or {}).get("module_slots"):
+            groups.setdefault((e.name, e.extras_dict.get("recipe")), Counter())[e.extras_dict.get("modules", "")] += 1
+    if not groups:
+        return t
+    by_type: Dict[str, Counter] = {}
+    for (name, _), counts in groups.items():
+        by_type.setdefault(name, Counter()).update(counts)
+    modules = {name: counts.most_common(1)[0][0] for name, counts in by_type.items()}
+    by_recipe = {}
+    for (name, r), counts in groups.items():
+        top = counts.most_common(1)[0][0]
+        if r and top != modules[name]:
+            by_recipe[r] = top
+    fixed = replace(t, modules=modules, modules_by_recipe=by_recipe)
+    for part in ("head", "segment", "tail"):
+        setattr(fixed, part, _set_modules(getattr(t, part), modules, by_recipe))
+    return fixed
 
 
 def _tiles(e: IREntity) -> List[Tuple[int, int]]:
@@ -241,7 +301,38 @@ def extract(ir: IRBlueprint, category: str, period: Optional[int] = None) -> Opt
     rebuilt = template.build(len(run)).canonical_set()
     if not kept.canonical_set() <= rebuilt or any(not _is_belt(e) for e in rebuilt - kept.canonical_set()):
         return None  # the cut must rebuild the source; only belt tiles closing a line may be added
+    if _joins_lines(list(kept.entities), list(rebuilt)):
+        return None  # an added belt tile would join two lines of the source (an input into an output)
     return template
+
+
+def _belt_lines(ents: List[IREntity]) -> Dict[IREntity, int]:
+    """Belt-like entity -> id of its line (connected belts, undergrounds and splitters, any direction)."""
+    tiles = {t: i for i, e in enumerate(ents) for t in _tiles(e)}
+    belts, edges = _belt_graph(ents, tiles)
+    parent = {i: i for i in belts}
+
+    def root(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i, out in edges.items():
+        for j in out:
+            parent[root(i)] = root(j)
+    return {ents[i]: root(i) for i in belts}
+
+
+def _joins_lines(source: List[IREntity], rebuilt: List[IREntity]) -> bool:
+    """Whether one belt line of the rebuilt design holds belts of two different lines of the source."""
+    before = _belt_lines(source)
+    seen: Dict[int, int] = {}
+    for e, line in _belt_lines(rebuilt).items():
+        if e in before:
+            if seen.setdefault(line, before[e]) != before[e]:
+                return True
+    return False
 
 
 def extract_cell(ir: IRBlueprint, category: str) -> Template:
@@ -542,27 +633,113 @@ def _underground_clusters(ents: List[IREntity]) -> List[List[Tuple[int, ...]]]:
     return clusters
 
 
-def prepare(ir: IRBlueprint) -> IRBlueprint:
+def prepare(ir: IRBlueprint, margin: Optional[int] = CROP_MARGIN, keep_defense: bool = False,
+            cut_taps: bool = True) -> IRBlueprint:
     """
-    A self-contained copy of a player's design: no radars or author labels (new labels come from
-    the recipes, see add_port_labels), and no belts more than CROP_MARGIN tiles away from the
-    machines (bus taps and mains differ per base). An underground whose partner is cut goes too.
-    Lamps stay; templates keep them as an optional layer.
+    A self-contained copy of a player's design. Radars and author labels go (new labels come from the
+    flow simulator, see add_port_labels), and so does the author's defence (unless the design is
+    defence). Belts and pipes are cut by flow, not by a rectangle (see _trim_tails); margin=None keeps
+    them all. Lamps stay; templates keep them as an optional layer. See CROP_STEPS for gentler cuts.
     """
-    ents = [e for e in ir.entities if e.name not in AUTHOR_ONLY]
-    machines = [e for e in ents if entity_type(e.name) in MACHINE_TYPES]
-    if machines:
-        x0 = min(e.x for e in machines) - CROP_MARGIN
-        y0 = min(e.y for e in machines) - CROP_MARGIN
-        x1 = max(e.x + footprint(e.name, e.direction)[0] for e in machines) + CROP_MARGIN
-        y1 = max(e.y + footprint(e.name, e.direction)[1] for e in machines) + CROP_MARGIN
-        pairs = underground_pairs(ents)
-        near = [e.name not in _TIER or any(x0 <= x < x1 and y0 <= y < y1 for x, y in _tiles(e)) for e in ents]
-        for i, j in pairs.items():
-            if near[i] != near[j]:
-                near[i] = near[j] = False
-        ents = [e for e, keep in zip(ents, near) if keep]
+    ents = [e for e in ir.entities if e.name not in AUTHOR_ONLY and (keep_defense or e.name not in DEFENSE)]
+    if margin is not None and ents:
+        ents = _trim_tails(ents, margin, cut_taps)
     return ir.with_entities(ents)
+
+
+def _prune(nodes: Set[int], adj: Dict[int, Set[int]], core: Set[int], margin: int, no_tail: Set[int]) -> Set[int]:
+    """
+    Removes the leaves of the graph that are not core, again and again: what remains is the core and
+    every path between core nodes. Then up to `margin` steps of each cut-off tail come back, but not
+    through `no_tail` nodes (splitters of bus taps).
+    """
+    kept = set(nodes)
+    leaves = [n for n in kept if n not in core and len(adj.get(n, set()) & kept) <= 1]
+    while leaves:
+        n = leaves.pop()
+        if n not in kept:
+            continue
+        kept.discard(n)
+        for m in adj.get(n, set()) & kept:
+            if m not in core and len(adj.get(m, set()) & kept) <= 1:
+                leaves.append(m)
+    frontier = set(kept)
+    for _ in range(margin):
+        grow = {m for n in frontier for m in adj.get(n, set()) if m in nodes and m not in kept and m not in no_tail}
+        kept |= grow
+        frontier = grow
+    return kept
+
+
+# From the strictest cut to none: (margin, cut splitters on feeds). The miner takes the first cut
+# under which a working design still works (an input manifold of splitters looks like a bus tap).
+CROP_STEPS = ((CROP_MARGIN, True), (CROP_MARGIN, False), (4, False), (None, False))
+
+
+def _trim_tails(ents: List[IREntity], margin: int, cut_taps: bool = True) -> List[IREntity]:
+    """
+    Cuts the author's surroundings by flow: belt lines and pipes keep what lies between the places
+    inserters, drills and machines use, plus `margin` tiles of each feed or exit. Turns, undergrounds,
+    splitters and side-loads inside the design stay; a splitter on a cut-off feed (a bus tap) goes.
+    Undergrounds whose partner was cut go with it, then inserters and chests left with nothing to work on.
+    """
+    from factoriollm.flow_sim import Layout
+
+    L = Layout(IRBlueprint(ents))
+    belt_adj: Dict[int, Set[int]] = {}
+    for (i, _), outs in L.edges.items():
+        for (j, _), _ in outs:
+            belt_adj.setdefault(i, set()).add(j)
+            belt_adj.setdefault(j, set()).add(i)
+    for i, j in underground_pairs(ents).items():
+        belt_adj.setdefault(i, set()).add(j)
+        belt_adj.setdefault(j, set()).add(i)
+    core = {src[1] for src, _ in L.links if src[0] == "belt"} | {dst[1][0] for _, dst in L.links if dst[0] == "lane"}         | {ref[0] for _, (kind, ref) in L.drills if kind == "lane"}
+    splitters = {i for i in L.belts if L.types[i] == "splitter"}
+    keep_belts = _prune(set(L.belts), belt_adj, core, margin, splitters if cut_taps else set())
+
+    pipes = {i for i, e in enumerate(ents) if e.name in PIPE_LIKE}
+    pipe_adj: Dict[int, Set[int]] = {}
+    pipe_core: Set[int] = set()
+    for a, b in L.pipe_links:
+        if a in pipes and b in pipes:
+            pipe_adj.setdefault(a, set()).add(b)
+            pipe_adj.setdefault(b, set()).add(a)
+        elif a in pipes or b in pipes:
+            pipe_core.add(a if a in pipes else b)
+    keep_pipes = _prune(pipes, pipe_adj, pipe_core, margin, set())
+
+    removed = (set(L.belts) - keep_belts) | (pipes - keep_pipes)
+    # an underground (belt or pipe) without its partner
+    pairs = dict(underground_pairs(ents))
+    pairs.update({j: i for i, j in list(pairs.items())})
+    for a, b in L.pipe_links:
+        if ents[a].name == ents[b].name == "pipe-to-ground" and abs(ents[a].x - ents[b].x) + abs(ents[a].y - ents[b].y) > 1:
+            pairs[a], pairs[b] = b, a
+    changed = True
+    while changed:
+        changed = False
+        for i, j in pairs.items():
+            if i not in removed and j in removed:
+                removed.add(i)
+                changed = True
+        # inserters that worked on something removed; chests nobody serves any more
+        for k, (src, dst) in zip(L.inserters, L.links):
+            if k in removed:
+                continue
+            touched = [ref if kind in ("belt", "entity") else ref[0] if kind == "lane" else None
+                       for kind, ref in (src, dst)]
+            if any(t is not None and t in removed for t in touched):
+                removed.add(k)
+                changed = True
+        for j, t in enumerate(L.types):
+            if t in ("container", "logistic-container") and j not in removed:
+                users = [k for k, (src, dst) in zip(L.inserters, L.links)
+                         if src == ("entity", j) or dst == ("entity", j)]
+                if users and all(k in removed for k in users):
+                    removed.add(j)
+                    changed = True
+    return [e for i, e in enumerate(ents) if i not in removed]
 
 
 def _belt_graph(ents: List[IREntity], tiles: Dict[Tuple[int, int], int]) -> Tuple[List[int], Dict[int, Set[int]]]:
@@ -595,99 +772,91 @@ def _target_tile(e: IREntity, key: str) -> Optional[Tuple[int, int]]:
 
 
 def add_port_labels(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal", resource: str = "iron-ore",
-                    inside_only: bool = False) -> IRBlueprint:
+                    inside_only: bool = False, flow: Any = None) -> IRBlueprint:
     """
-    Labels every input and output belt of a design with a constant combinator showing what it
-    carries, from recipe data rather than from the author:
-    - an input line (inserters only take from it) is labelled at its start with the ingredients of
-      the machines it feeds, minus what the design makes itself (cable inside a circuit block);
-    - an output line (machines put items on it) is labelled at its end with what is put on it
-      and not taken off again inside.
-    Furnaces have no recipe: they get `smelt` (ore, stone or iron plates for steel) and, if they
-    burn fuel, `fuel`; drills put `resource` on their belt. Labels go next to the line end, behind
-    a start or in front of an end first; with inside_only the bounding box is not left.
+    Labels every port of a design with a constant combinator showing what goes in or comes out,
+    from the flow simulator (see flow_sim.solve; `smelt`, `fuel`, `resource` are its preferences),
+    not from the author:
+    - an input belt gets one label at its start with its item; with a different item on each lane,
+      one label per lane on that lane's side (one label with both items if there is no room);
+    - a mixed belt (one lane in, the other out) gets the input label at its start and the output
+      label at its end, each on its lane's side;
+    - an output belt gets a label in front of its end with what leaves on it;
+    - a chest filled from outside and an open pipe end get a label next to them (fluid signals).
+    Labels go behind a start / in front of an end first, then to the sides; with inside_only the
+    bounding box is not left.
     """
+    from factoriollm.flow_sim import solve
+
     ents = list(ir.entities)
-    tiles = {t: i for i, e in enumerate(ents) for t in _tiles(e)}
-    made = {p for e in ents if recipe(e.extras_dict.get("recipe") or "") for p in recipe(e.extras_dict["recipe"]).results}
-    if any(entity_type(e.name) == "furnace" for e in ents) and smelt in SMELTING:
-        made.add(SMELTING[smelt])
-
-    def burner(e: IREntity) -> bool:
-        return ((_prototype(e.name) or {}).get("energy_source") or {}).get("type") == "burner"
-
-    def takes(e: IREntity) -> Set[str]:  # what a machine fed by an inserter takes
-        r = recipe(e.extras_dict.get("recipe") or "")
-        if r:
-            solid = set(r.ingredients) - r.fluids
-            return solid - made or solid
-        etype = entity_type(e.name)
-        if etype == "furnace":
-            return {smelt} | ({fuel} if burner(e) else set())
-        return {fuel} if burner(e) and etype in ("boiler", "mining-drill") else set()
-
-    def gives(e: IREntity) -> Set[str]:  # what a machine puts out
-        r = recipe(e.extras_dict.get("recipe") or "")
-        if r:
-            return set(r.results) - r.fluids
-        etype = entity_type(e.name)
-        if etype == "furnace":
-            return {SMELTING[smelt]} if smelt in SMELTING else set()
-        return {resource} if etype == "mining-drill" else set()
-
-    belts, edges = _belt_graph(ents, tiles)
-    parent = {i: i for i in belts}
-
-    def root(i: int) -> int:
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
-
-    for i, out in edges.items():
-        for j in out:
-            parent[root(i)] = root(j)
-    taken: Dict[int, Set[str]] = {}
-    put: Dict[int, Set[str]] = {}
-    for e in ents:
-        etype = entity_type(e.name)
-        if etype == "inserter":
-            src, dst = (tiles.get(t) for t in (_target_tile(e, "pickup_position"), _target_tile(e, "insert_position")))
-            if src in parent and dst is not None and dst not in parent:
-                taken.setdefault(root(src), set()).update(takes(ents[dst]))
-            if dst in parent and src is not None and src not in parent:
-                put.setdefault(root(dst), set()).update(gives(ents[src]))
-        elif etype == "mining-drill":
-            dst = tiles.get(_target_tile(e, "vector_to_place_result"))
-            if dst in parent:
-                put.setdefault(root(dst), set()).update(gives(e))
-    incoming = {j for out in edges.values() for j in out}
-    xs, ys = [t[0] for t in tiles], [t[1] for t in tiles]
+    flow = flow or solve(ir, smelt=smelt, fuel=fuel, resource=resource)
+    used = {t for e in ents for t in _tiles(e)}
+    xs, ys = [t[0] for t in used], [t[1] for t in used]
     labels: List[IREntity] = []
-    used = set(tiles)
 
-    def place(i: int, items: Set[str], start: bool) -> None:
-        e = ents[i]
-        dx, dy = _DIRS[e.direction]
-        x, y = e.x, e.y
-        s = -1 if start else 1  # behind a line start, in front of a line end first
-        ring = [(x + s * dx, y + s * dy), (x - dy, y + dx), (x + dy, y - dx),
-                (x + s * dx - dy, y + s * dy + dx), (x + s * dx + dy, y + s * dy - dx)]
+    def free(t: Tuple[int, int]) -> bool:
+        return t not in used and (not inside_only or (min(xs) <= t[0] <= max(xs) and min(ys) <= t[1] <= max(ys)))
+
+    def put(ring: List[Tuple[int, int]], signals: List[str]) -> bool:
         for t in ring:
-            if t in used or (inside_only and not (min(xs) <= t[0] <= max(xs) and min(ys) <= t[1] <= max(ys))):
-                continue
-            used.add(t)
-            labels.append(IREntity("constant-combinator", t[0], t[1], 0,
-                                   (("signals", ";".join(f"item:{item}=1" for item in sorted(items))),)))
-            return
+            if free(t):
+                used.add(t)
+                labels.append(IREntity("constant-combinator", t[0], t[1], 0, (("signals", ";".join(
+                    f"{s}=1" for s in sorted(signals))),)))
+                return True
+        return False
 
-    for i in sorted(belts, key=lambda k: (ents[k].y, ents[k].x)):
-        if len(labels) >= MAX_PORT_LABELS:
-            break
-        c = root(i)
-        out_items = put.get(c, set()) - taken.get(c, set())
-        if c in put and not edges[i] and out_items:
-            place(i, out_items, start=False)
-        elif c not in put and i not in incoming and taken.get(c):
-            place(i, taken[c], start=True)
+    def belt_ring(e: IREntity, start: bool, lane: Optional[int]) -> List[Tuple[int, int]]:
+        dx, dy = _DIRS[e.direction]
+        lx, ly = dy, -dx  # left of the direction of travel
+        tiles = _tiles(e)
+        s = -1 if start else 1
+        # the end tile of a 2-wide splitter: either of its tiles; ring around the first
+        x, y = tiles[0] if lane is None or lane < 2 else tiles[-1]
+        behind = (x + s * dx, y + s * dy)
+        if lane is None:
+            return [behind, (x + lx, y + ly), (x - lx, y - ly), (behind[0] + lx, behind[1] + ly),
+                    (behind[0] - lx, behind[1] - ly)]
+        side = 1 if lane % 2 == 0 else -1  # lane 0 is on the left
+        return [(x + side * lx, y + side * ly), (behind[0] + side * lx, behind[1] + side * ly)]
+
+    def label_belt(i: int, by_lane: Dict[int, Set[str]], start: bool, mixed: bool) -> None:
+        """One label for the belt, or one per lane on its side when lanes differ or the other lane goes the other way."""
+        e = ents[i]
+        items = set().union(*by_lane.values())
+        whole = belt_ring(e, start, None)
+        if not mixed and len({frozenset(v) for v in by_lane.values()}) == 1:
+            put(whole, [f"item:{x}" for x in items])
+            return
+        placed = all(put(belt_ring(e, start, lane), [f"item:{x}" for x in v]) for lane, v in sorted(by_lane.items()))
+        if not placed:  # no room on the sides: one label with everything
+            put(whole, [f"item:{x}" for x in items])
+
+    inputs: Dict[int, Dict[int, Set[str]]] = {}
+    outputs: Dict[int, Dict[int, Set[str]]] = {}
+    for p in flow.ports:
+        if p.kind == "lane":
+            (inputs if p.role == "input" else outputs).setdefault(p.entity, {}).setdefault(p.lane, set()).update(p.items)
+        elif p.kind == "chest":
+            e = ents[p.entity]
+            put([(e.x + dx, e.y + dy) for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1))], [f"item:{x}" for x in p.items])
+    for i, by_lane in sorted(inputs.items(), key=lambda kv: (ents[kv[0]].y, ents[kv[0]].x)):
+        label_belt(i, by_lane, True, mixed=i in outputs)
+    for i, by_lane in sorted(outputs.items(), key=lambda kv: (ents[kv[0]].y, ents[kv[0]].x)):
+        label_belt(i, by_lane, False, mixed=i in inputs)
+    done_fluid: Set[Tuple[str, FrozenSet[str]]] = set()
+    for p in flow.ports:
+        if p.kind != "fluid":
+            continue
+        key = (p.role, p.items)
+        e = ents[p.entity]
+        ox, oy = p.tile
+        dx, dy = _DIRS[p.direction]
+        inside = (ox - dx, oy - dy)
+        ring = [(inside[0] + dy, inside[1] - dx), (inside[0] - dy, inside[1] + dx),
+                (ox + dy, oy - dx), (ox - dy, oy + dx)]
+        if key in done_fluid and len(flow.ports) > 40:
+            continue  # very large designs: one label per fluid and role is enough
+        done_fluid.add(key)
+        put(ring, [f"fluid:{x}" for x in p.items])
     return ir.with_entities(ents + labels)

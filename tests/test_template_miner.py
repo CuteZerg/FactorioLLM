@@ -3,8 +3,18 @@ import warnings
 
 from factoriollm.blueprint_ir import IRBlueprint, IREntity
 from factoriollm.game_data import final_products, recipe
-from factoriollm.template_miner import classify, default_template, is_mall, products, smelting_input
-from factoriollm.templates import Template
+from factoriollm.flow_sim import FlowResult, Port
+from factoriollm.template_miner import (
+    Rejects,
+    author_hints,
+    classify,
+    default_template,
+    furnace_input,
+    is_mall,
+    products,
+    recipe_family,
+)
+from factoriollm.templates import Template, normalize_modules
 
 
 def assemblers(*recipes, y=0):
@@ -92,19 +102,65 @@ class TestDefault(unittest.TestCase):
         self.assertIs(default_template([steel]), steel)  # a preference never empties the choice
 
 
-class TestSmeltingInput(unittest.TestCase):
-    def test_steel_from_labels_and_names(self):
-        self.assertEqual(smelting_input(IRBlueprint(furnaces() + [label(0, "steel-plate")])), "steel")
-        self.assertEqual(smelting_input(IRBlueprint(furnaces()), "Steel smelting 12"), "steel")
-        self.assertEqual(smelting_input(IRBlueprint(furnaces()), "Плавка стали"), "steel")
+class TestFamiliesAndDefense(unittest.TestCase):
+    def setUp(self):
+        warnings.simplefilter("ignore")
 
-    def test_ore_by_default_and_furnace_names_are_no_hint(self):
-        self.assertEqual(smelting_input(IRBlueprint(furnaces()), "Iron smelting, steel furnaces"), "ore")
-        self.assertEqual(smelting_input(IRBlueprint(furnaces()), "Стальные печи: железо"), "ore")
-        self.assertEqual(smelting_input(IRBlueprint(furnaces()), "Остальное"), "ore")
-        self.assertEqual(smelting_input(IRBlueprint(furnaces() + [label(0, "iron-plate")])), "ore")
-        # a bus smelter labelled with ore and steel is mostly ore smelting
-        self.assertEqual(smelting_input(IRBlueprint(furnaces() + [label(0, "iron-ore"), label(2, "steel-plate")])), "ore")
+    def test_gears_are_a_one_input_family(self):
+        self.assertEqual(classify(IRBlueprint(assemblers(*["iron-gear-wheel"] * 4))), "assembly_1in")
+        self.assertEqual(recipe_family("engine-unit"), "assembly_3in")
+        self.assertEqual(recipe_family("electric-engine-unit"), "assembly_fluid")
+        self.assertEqual(recipe_family("sulfur"), "chemistry")
+
+    def test_wall_with_turrets_is_defense(self):
+        wall = [IREntity("stone-wall", x, y) for x in range(20) for y in (0, 1)]
+        turrets = [IREntity("laser-turret", 4 * i, 3) for i in range(5)]
+        self.assertEqual(classify(IRBlueprint(wall + turrets)), "defense")
+
+
+class TestSmeltingInput(unittest.TestCase):
+    def flow(self, inputs, outputs):
+        port = Port("lane", "output", 0, 0, frozenset(outputs), (0, 0))
+        return FlowResult([], {}, {}, frozenset(), [port], inputs={("lane", 0, 0): x for x in inputs})
+
+    def test_what_the_simulator_found(self):
+        self.assertEqual(furnace_input(self.flow(["iron-plate"], ["steel-plate"])), "steel")
+        self.assertEqual(furnace_input(self.flow(["iron-ore"], ["steel-plate"])), "ore_to_steel")
+        self.assertEqual(furnace_input(self.flow(["iron-ore"], ["iron-plate"])), "ore")
+
+
+class TestMinerParts(unittest.TestCase):
+    def test_author_hints(self):
+        hints = author_hints(IRBlueprint([label(3, "coal", "iron-ore")]))
+        self.assertEqual(hints, {(3, 10): {"coal", "iron-ore"}})
+
+    def test_modules_follow_the_group(self):
+        def lab(x, modules):
+            return IREntity("lab", 3 * x, 0, 0, (("modules", modules),) if modules else ())
+        labs = [lab(i, "speed-module-3=2") for i in range(5)] + [lab(5, "")]
+        t = normalize_modules(Template("labs", 18, [], labs, [], 1))
+        self.assertEqual({e.extras_dict.get("modules") for e in t.segment}, {"speed-module-3=2"})
+        self.assertEqual(t.modules, {"lab": "speed-module-3=2"})
+        build = t.build(1, modules={"lab": "productivity-module-3=2"})
+        self.assertEqual({e.extras_dict.get("modules") for e in build.entities}, {"productivity-module-3=2"})
+
+    def test_modules_per_recipe_stay(self):
+        def am(x, r, modules):
+            return IREntity("assembling-machine-3", 3 * x, 0, 0, (("modules", modules), ("recipe", r)))
+        ents = [am(i, "iron-gear-wheel", "productivity-module-3=4") for i in range(3)] + \
+            [am(3 + i, "electronic-circuit", "speed-module-3=4") for i in range(4)]
+        t = normalize_modules(Template("multi", 21, [], ents, [], 1))
+        self.assertEqual(t.modules, {"assembling-machine-3": "speed-module-3=4"})
+        self.assertEqual(t.modules_by_recipe, {"iron-gear-wheel": "productivity-module-3=4"})
+        self.assertEqual(Template.from_json(t.to_json()).modules_by_recipe, t.modules_by_recipe)
+
+    def test_rejects_keep_a_few_per_reason(self):
+        rejects = Rejects(per_reason=2)
+        empty = FlowResult([], {}, {}, frozenset(), [])
+        for i in range(10):
+            rejects.add("clog", f"design {i}", IRBlueprint([]), empty)
+        self.assertEqual(rejects.seen["clog"], 10)
+        self.assertEqual(len(rejects.kept["clog"]), 2)
 
 
 if __name__ == "__main__":

@@ -448,6 +448,7 @@ class Layout:
         for b, inside, d, ug, dist in conns:
             at.setdefault((inside, d, ug), []).append(b)
         self.open_ends: List[Tuple[int, Tile, int]] = []  # (box, free tile, direction)
+        self.pipe_links: List[Tuple[int, int]] = []        # entities joined by a fluid connection
         for b, inside, d, ug, dist in conns:
             dx, dy = _vec(d)
             if ug:
@@ -455,6 +456,7 @@ class Layout:
                     hit = at.get(((inside[0] + k * dx, inside[1] + k * dy), (d + 8) % 16, True))
                     if hit:
                         parent[root(b)] = root(hit[0])
+                        self.pipe_links.append((self.boxes[b][0], self.boxes[hit[0]][0]))
                         break
                 else:  # an underground pipe without a partner brings fluid from outside
                     self.open_ends.append((b, (inside[0] + dx, inside[1] + dy), d))
@@ -464,6 +466,7 @@ class Layout:
             if hit:
                 for h in hit:
                     parent[root(b)] = root(h)
+                    self.pipe_links.append((self.boxes[b][0], self.boxes[h][0]))
             elif nbr not in self.tiles:
                 self.open_ends.append((b, nbr, d))
         self.network = [root(b) for b in range(len(self.boxes))]
