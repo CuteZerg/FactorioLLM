@@ -571,12 +571,12 @@ def blueprint_string(ir: IRBlueprint, label: str) -> str:
     from draftsman.blueprintable import Blueprint
 
     from factoriollm.dataset_lifter import lift_ir_to_code, run_trusted_script
-    from factoriollm.helpers import connect_power
+    from factoriollm.helpers import connect_power, game_string
 
     bp = Blueprint.from_string(run_trusted_script(lift_ir_to_code(ir)))
     bp.label = label[:100]
     connect_power(bp)
-    return bp.to_string()
+    return game_string(bp)
 
 
 def labelled(t: Template, ir: IRBlueprint) -> IRBlueprint:
@@ -611,8 +611,9 @@ def write_book(best: Dict[str, List[Template]], path: Path = Path("outputs/templ
                 except Exception as e:  # a template that cannot be rebuilt is reported, not hidden
                     print(f"    [!] {cat}: {name[:40]}: {type(e).__name__}: {e}")
         book.blueprints.append(sub)
+    from factoriollm.helpers import game_string
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(book.to_string(), encoding="utf-8")
+    path.write_text(game_string(book), encoding="utf-8")
     print(f"[*] Blueprint book: {path}")
 
 

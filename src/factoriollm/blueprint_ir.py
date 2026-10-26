@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-from factoriollm.vanilla_recipes import VANILLA_RECIPES
+from factoriollm.base_game import FLUIDS, ITEMS, RECIPE_CHANGES, RECIPES, VIRTUAL_SIGNALS
 
 warnings.filterwarnings("ignore", module="draftsman")
 
@@ -98,10 +98,6 @@ MODULE_ITEMS = frozenset(f"{kind}-module{suffix}" for kind in ("speed", "product
                          for suffix in ("", "-2", "-3"))
 # Logistic chests whose request (or storage) filters are kept.
 REQUEST_ENTITIES = frozenset({"requester-chest", "buffer-chest", "storage-chest"})
-# Base-game items that no recipe produces.
-RAW_ITEMS = frozenset({"iron-ore", "copper-ore", "stone", "coal", "uranium-ore", "wood", "raw-fish",
-                       "depleted-uranium-fuel-cell", "space-science-pack",
-                       "blueprint", "blueprint-book", "deconstruction-planner", "upgrade-planner"})
 
 # Types whose direction is cosmetic: never emitted, never rotated.
 _NON_DIRECTIONAL_TYPES = frozenset({"furnace"})
@@ -285,21 +281,30 @@ LEGACY_SIGNAL_RENAMES = {
 }
 
 
-@lru_cache(maxsize=None)
-def _signal_exists(name: str) -> bool:
-    from draftsman.data import signals
-    return name in signals.raw
+def _signal_exists(kind: str, name: str) -> bool:
+    """Whether a signal exists in the base game (draftsman's signal list includes Space Age)."""
+    if kind == "item":
+        return name in ITEMS
+    if kind == "fluid":
+        return name in FLUIDS
+    if kind == "virtual":
+        return name in VIRTUAL_SIGNALS
+    if kind == "recipe":
+        return name in RECIPES
+    if kind == "entity":
+        return name in VANILLA_ENTITIES or name in RAIL_AND_CIRCUIT_ENTITIES or name in ITEMS
+    return False
 
 
 def _signal_id(signal: Dict[str, Any]) -> str:
     """
     'type:name' of a label signal. Names from older versions are migrated; Space Age signal types,
-    quality levels and names unknown in 2.0 are rejected.
+    quality levels and names unknown in the 2.0 base game are rejected.
     """
     kind = str(signal.get("type") or "item")
     name = str(signal.get("name") or "")
     name = LEGACY_SIGNAL_RENAMES.get(name, LEGACY_RENAMES.get(name, name))
-    if kind not in LABEL_SIGNAL_TYPES or signal.get("quality") not in (None, "normal") or not _signal_exists(name):
+    if kind not in LABEL_SIGNAL_TYPES or signal.get("quality") not in (None, "normal")             or not _signal_exists(kind, name):
         raise BlueprintIRError(f"unsupported label signal {kind}:{name}")
     return f"{kind}:{name}"
 
@@ -320,17 +325,8 @@ def _label_signals(raw: Dict[str, Any]) -> str:
     return ";".join(f"{sid}={count}" for _, _, sid, count in sorted(found))
 
 
-@lru_cache(maxsize=None)
 def _base_game_item(name: str) -> bool:
-    """Whether an item exists in the base game: a product of a base-game recipe or a raw item."""
-    if name in RAW_ITEMS:
-        return True
-    from draftsman.data import recipes
-    for recipe in VANILLA_RECIPES:
-        data = recipes.raw.get(recipe) or {}
-        if any(isinstance(r, dict) and r.get("name") == name for r in data.get("results") or []):
-            return True
-    return False
+    return name in ITEMS
 
 
 @lru_cache(maxsize=None)
@@ -451,7 +447,7 @@ def _convert_extras(raw: Dict[str, Any], name: str = "") -> Tuple[Tuple[str, str
         extras["recipe"] = str(raw["recipe"])
         if not _recipe_exists(extras["recipe"]):  # e.g. recipes removed or renamed since 0.x / 1.x
             raise BlueprintIRError(f"unknown recipe '{extras['recipe']}'")
-        if extras["recipe"] not in VANILLA_RECIPES:  # draftsman data includes Space Age
+        if extras["recipe"] not in RECIPES:  # draftsman data includes Space Age
             raise BlueprintIRError(f"recipe '{extras['recipe']}' is not in the base game")
     if raw.get("type") == "output":  # "input" is the default and is omitted on export
         extras["io_type"] = "output"
@@ -460,10 +456,13 @@ def _convert_extras(raw: Dict[str, Any], name: str = "") -> Tuple[Tuple[str, str
             extras[key] = raw[key]
     flt = raw.get("filter")
     if isinstance(flt, dict):
+        # 2.0 with the quality mod writes {name, quality, comparator}; a filter by quality alone is DLC.
+        if flt.get("quality") not in (None, "normal") or not flt.get("name") and flt.get("quality"):
+            raise BlueprintIRError(f"quality filter {flt}")
         flt = flt.get("name")
     if flt:
         flt = LEGACY_SIGNAL_RENAMES.get(str(flt), LEGACY_RENAMES.get(str(flt), str(flt)))
-        if not _signal_exists(flt):  # an item name from an older version or a mod
+        if not _base_game_item(flt):  # an item name from an older version, Space Age or a mod
             raise BlueprintIRError(f"unknown filter item '{flt}'")
         extras["filter"] = flt
     for key, value in extras.items():
@@ -531,6 +530,8 @@ def parse_blueprint_dict(
             raise BlueprintIRError("offshore pump from a pre-2.0 blueprint: its shape changed in 2.0")
         if name in ANNOTATION_ENTITIES and raw.get("entity_number") in wired:
             raise BlueprintIRError(f"circuit-wired '{name}' (circuit logic) is not supported")
+        if raw.get("quality") not in (None, "normal"):  # ratios are designed for other machine speeds
+            raise BlueprintIRError(f"'{name}' of quality '{raw['quality']}' is not in the base game")
 
         direction = int(raw.get("direction", 0) or 0)
         if legacy:
@@ -538,6 +539,9 @@ def parse_blueprint_dict(
         if direction % 4 != 0:
             raise BlueprintIRError(f"non-cardinal direction {direction} on '{name}'")
         extras = _convert_extras(raw, name)
+        recipe = dict(extras).get("recipe")
+        if recipe and recipe in RECIPE_CHANGES.get(f"{version[0]}.{version[1]}", ()):
+            raise BlueprintIRError(f"legacy recipe '{recipe}': other ingredients in {version[0]}.{version[1]}")
         if not is_directional(name, dict(extras).get("recipe")):
             direction = 0
 

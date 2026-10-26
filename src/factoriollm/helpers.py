@@ -298,6 +298,28 @@ def add_display_panel(
     _PlacementGuard(bp).append(ent)
 
 
+def game_string(bp: Any, version: Any = None) -> str:
+    """
+    Blueprint string as the base game (no quality mod) exports it: draftsman writes a splitter filter
+    as {'type': 'item', 'name': ...}, the game writes {'name': ...}. The sandbox uses it for
+    Blueprint.to_string().
+    """
+    from draftsman.utils import JSON_to_string
+
+    def fix(node: Dict[str, Any]) -> None:
+        for ent in (node.get("blueprint") or {}).get("entities") or []:
+            flt = ent.get("filter")
+            if isinstance(flt, dict) and flt.get("name") and flt.get("type", "item") == "item" \
+                    and flt.get("quality", "normal") == "normal":
+                ent["filter"] = {"name": flt["name"]}
+        for child in (node.get("blueprint_book") or {}).get("blueprints") or []:
+            fix(child)
+
+    data = bp.to_dict(version=version) if version is not None else bp.to_dict()
+    fix(data)
+    return JSON_to_string(data)
+
+
 def connect_power(bp: Any, max_wires: int = 5) -> int:
     """
     Replaces all copper wires with a minimal wire network like the one a player builds: the

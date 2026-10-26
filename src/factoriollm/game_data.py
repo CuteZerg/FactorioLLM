@@ -1,9 +1,9 @@
 """
 Base-game data layer: recipes with amounts, item / fluid kinds and crafting times.
 
-Built from draftsman's prototype data (which includes Space Age) filtered to the Factorio 2.0 base
-game by `VANILLA_RECIPES`. draftsman's own `get_recipe_ingredients` is not used: it returns names
-only, without amounts and without telling items from fluids.
+Built from `base_game.py`, which tools/extract_game_data.py generates from the base mod of
+wube/factorio-data (draftsman's own data includes Space Age: there the personal roboport MK2 needs
+superconductors).
 
 Furnaces have no recipe in a blueprint: a furnace smelts whatever is put into it. `SMELTING` maps
 each smelting input to its product.
@@ -15,11 +15,10 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Dict, FrozenSet, Iterable, Optional, Set
 
-from factoriollm.vanilla_recipes import VANILLA_RECIPES
+from factoriollm.base_game import FLUIDS, ITEMS, RECIPES
 
 # Smelting input -> product. Steel takes iron plates (5 per steel, 16 s); everything else takes ore or stone.
 SMELTING = {"iron-ore": "iron-plate", "copper-ore": "copper-plate", "stone": "stone-brick", "iron-plate": "steel-plate"}
-DEFAULT_CRAFTING_TIME = 0.5  # draftsman leaves energy_required empty when the game default applies
 
 
 @dataclass(frozen=True)
@@ -32,32 +31,22 @@ class Recipe:
     category: str
 
 
-def _amount(part: dict) -> float:
-    amount = part.get("amount")
-    if amount is None:  # ranged results
-        amount = (part.get("amount_min", 0) + part.get("amount_max", 0)) / 2
-    return float(amount) * float(part.get("probability", 1))
-
-
 @lru_cache(maxsize=None)
 def recipe(name: str) -> Optional[Recipe]:
     """A base-game recipe, or None for recipes outside the base game."""
-    if name not in VANILLA_RECIPES:
-        return None
-    from draftsman.data import recipes
-    data = recipes.raw.get(name)
+    data = RECIPES.get(name)
     if data is None:
         return None
-    ingredients = [p for p in data.get("ingredients") or [] if isinstance(p, dict)]
-    results = [p for p in data.get("results") or [] if isinstance(p, dict)]
-    return Recipe(
-        name=name,
-        ingredients={p["name"]: _amount(p) for p in ingredients},
-        results={p["name"]: _amount(p) for p in results},
-        fluids=frozenset(p["name"] for p in ingredients + results if p.get("type") == "fluid"),
-        time=float(data.get("energy_required") or DEFAULT_CRAFTING_TIME),
-        category=str(data.get("category") or "crafting"),
-    )
+    return Recipe(name=name, ingredients=dict(data["ingredients"]), results=dict(data["results"]),
+                  fluids=frozenset(data["fluids"]), time=float(data["time"]), category=data["category"])
+
+
+def is_item(name: str) -> bool:
+    return name in ITEMS
+
+
+def is_fluid(name: str) -> bool:
+    return name in FLUIDS
 
 
 @lru_cache(maxsize=None)

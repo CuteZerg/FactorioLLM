@@ -127,7 +127,7 @@ draftsman's collision check, and writes:
 ```bash
 uv run python -m factoriollm.template_miner --min-favorites 10
 uv run python tools/extract_balancers.py          # balancer templates (Raynquist's book first) -> helpers.py
-uv run python tools/extract_vanilla_recipes.py    # base-game recipe list from wube/factorio-data
+uv run python tools/extract_game_data.py         # base-game recipes, items, signals, recipe history
 ```
 
 ## Training and evaluation

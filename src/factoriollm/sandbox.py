@@ -104,6 +104,8 @@ if hasattr(_dh_mod, "connect_power"):
             _dh_mod.connect_power(self)
         except Exception as _exc:  # never break an otherwise valid script
             print("[connect_power failed: %s]" % _exc, file=_sys.stderr)
+        if hasattr(_dh_mod, "game_string"):
+            return _dh_mod.game_string(self, *args, **kwargs)
         return _original_to_string(self, *args, **kwargs)
 
     _Blueprint.to_string = _wired_to_string
