@@ -110,6 +110,20 @@ def _center(e: IREntity) -> Tuple[float, float]:
 
 # --- Validation ---------------------------------------------------------------------------
 
+def _occupied_tiles(e: IREntity) -> List[Tuple[int, int]]:
+    w, h = footprint(e.name, e.direction)
+    return [(e.x + dx, e.y + dy) for dx in range(w) for dy in range(h)]
+
+
+def _reach_tiles(e: IREntity) -> List[Tuple[int, int]]:
+    """Tiles outside the footprint that the collision box still blocks: the 2.0 offshore pump
+    reaches about one tile in front of it (towards the water)."""
+    if e.name == "offshore-pump":
+        dx, dy = _DIRECTION_VECTORS[e.direction]
+        return [(e.x + dx, e.y + dy)]
+    return []
+
+
 def validate(ir: IRBlueprint) -> ValidationReport:
     report = ValidationReport(facts=extract_facts(ir))
     ents = ir.entities
@@ -119,16 +133,18 @@ def validate(ir: IRBlueprint) -> ValidationReport:
     tiles: Dict[Tuple[int, int], int] = {}
     seen_pairs = set()
     for i, e in enumerate(ents):
-        w, h = footprint(e.name, e.direction)
-        for dx in range(w):
-            for dy in range(h):
-                tile = (e.x + dx, e.y + dy)
-                j = tiles.get(tile)
-                if j is None:
-                    tiles[tile] = i
-                elif (j, i) not in seen_pairs:
-                    seen_pairs.add((j, i))
-                    report.errors.append(Issue("collision", f"{e.name} at {(e.x, e.y)} overlaps {ents[j].name} at {(ents[j].x, ents[j].y)}", (e.x, e.y)))
+        for tile in _occupied_tiles(e):
+            j = tiles.get(tile)
+            if j is None:
+                tiles[tile] = i
+            elif (j, i) not in seen_pairs:
+                seen_pairs.add((j, i))
+                report.errors.append(Issue("collision", f"{e.name} at {(e.x, e.y)} overlaps {ents[j].name} at {(ents[j].x, ents[j].y)}", (e.x, e.y)))
+    for e in ents:
+        for tile in _reach_tiles(e):
+            j = tiles.get(tile)
+            if j is not None:
+                report.errors.append(Issue("collision", f"{e.name} at {(e.x, e.y)} reaches into {ents[j].name} at {(ents[j].x, ents[j].y)}", (e.x, e.y)))
 
     min_x = min(t[0] for t in tiles)
     max_x = max(t[0] for t in tiles)

@@ -124,15 +124,68 @@ def mine_one(ir: IRBlueprint, category: str) -> Optional[Template]:
         template = extract(oriented, category)
         if template is not None:
             return template
-    options = [ir] if ir.absolute_snap else [ir, rotated(ir, 1)]
+    # world-grid placement does not matter for a template (modules set their own grid): allow rotation
+    relative = IRBlueprint(ir.entities, ir.label, ir.version, ir.book_path, ir.snap)
+    options = [relative, rotated(relative, 1)]
     cells = [cell for cell in (extract_cell(o, category) for o in options) if tiling_check(cell)["ok"]]
-    return max(cells, key=_belts_along_x) if cells else None
+    # an author's grid smaller than the blueprint marks the intended (overlapping) tiling axis
+    return max(cells, key=lambda c: (c.period < c.metrics_width, _belts_along_x(c))) if cells else None
 
 
 def variant(t: Template) -> str:
     """Coarse variant label a user can ask for: beacons or not, and the main machine tier."""
     beaconed = (t.metrics.get("beacons_per_machine") or 0) > 0
     return f"{'beacons' if beaconed else 'no beacons'}, {main_machine(t)}"
+
+
+def sanity(t: Template) -> Optional[str]:
+    """
+    Why a template is not a working module of its category (None if it is). The validator checks
+    geometry; this checks that the parts and their proportions make sense, e.g. a reactor block
+    without heat exchangers is only a piece of a power plant.
+    """
+    ir = t.build(2 if t.repeats > 1 or t.head or t.tail else 1)
+    names = Counter(e.name for e in ir.entities)
+    recipes = Counter(e.extras_dict.get("recipe") for e in ir.entities if e.name in ASSEMBLERS)
+    machines = sum(names[a] for a in ASSEMBLERS)
+    cat = t.category
+    if cat == "nuclear":
+        if names["heat-exchanger"] < 3 * names["nuclear-reactor"] or names["steam-turbine"] < 1.5 * names["heat-exchanger"]:
+            return "reactors without enough heat exchangers / turbines"
+    elif cat == "steam":
+        if not 1.5 <= names["steam-engine"] / max(names["boiler"], 1) <= 2.0:
+            return "not ~2 steam engines per boiler"
+    elif cat == "solar":
+        if names["accumulator"] and not 0.6 <= names["accumulator"] / names["solar-panel"] <= 1.2:
+            return "accumulator / panel ratio far from 0.84"
+    elif cat == "green_circuits":
+        if recipes["copper-cable"] and not 1.2 <= recipes["copper-cable"] / max(recipes["electronic-circuit"], 1) <= 1.8:
+            return "cable / circuit machines far from 3:2"
+    elif cat == "gears":
+        if recipes["iron-gear-wheel"] < 0.5 * machines:
+            return "gears are not the main product"
+    elif cat.startswith("science_"):
+        pack = next(r for r, c in SCIENCE.items() if c == cat)
+        if recipes[pack] < 0.3 * machines:
+            return "the science pack is not the main product"
+    return None
+
+
+def draftsman_overlaps(t: Template) -> bool:
+    """
+    Second collision check with draftsman's exact collision boxes (the validator works on tiles,
+    and a few entities reach outside their tiles, e.g. the offshore pump).
+    """
+    import warnings
+
+    from draftsman.warning import OverlappingObjectsWarning
+
+    from factoriollm.dataset_lifter import lift_ir_to_code, run_trusted_script
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        run_trusted_script(lift_ir_to_code(t.build(2 if t.repeats > 1 or t.head or t.tail else 1)))
+    return any(issubclass(w.category, OverlappingObjectsWarning) for w in caught)
 
 
 def score(t: Template) -> float:
@@ -228,6 +281,12 @@ def mine(min_favorites: int = 10, per_category: int = 8) -> Dict[str, List[Templ
             if not check["ok"]:
                 stats["tiling_failed"] += 1
                 continue
+            if sanity(template):
+                stats["not_a_working_module"] += 1
+                continue
+            if draftsman_overlaps(template):
+                stats["collision_boxes_overlap"] += 1
+                continue
             template.source = {"key": row["key"], "book_path": path, "label": ir.label, "title": row["title"],
                                "favorites": row["favorites"], "version": list(version)}
             template.metrics = {**metrics(template), "kind": "segment" if template.head or template.repeats > 1 or template.tail else "cell",
@@ -305,12 +364,51 @@ def write_outputs(best: Dict[str, List[Template]]) -> None:
     print(f"[*] Catalog: {CATALOG}; report: {REPORT}")
 
 
+def blueprint_string(ir: IRBlueprint, label: str) -> str:
+    """Blueprint string of an IR built by our own lifter (trusted code), with copper wires."""
+    from draftsman.blueprintable import Blueprint
+
+    from factoriollm.dataset_lifter import lift_ir_to_code, run_trusted_script
+    from factoriollm.helpers import connect_power
+
+    bp = Blueprint.from_string(run_trusted_script(lift_ir_to_code(ir)))
+    bp.label = label[:100]
+    connect_power(bp)
+    return bp.to_string()
+
+
+def write_book(best: Dict[str, List[Template]], path: Path = Path("outputs/templates/catalog_book.txt")) -> None:
+    """One blueprint book to import in game: a sub-book per category, the default first."""
+    from draftsman.blueprintable import BlueprintBook, get_blueprintable_from_string
+
+    book = BlueprintBook()
+    book.label = "FactorioLLM templates"
+    for cat, ts in best.items():
+        top = default_template(ts)
+        sub = BlueprintBook()
+        sub.label = CATEGORY_NAMES.get(cat, cat)
+        for t in [top] + [t for t in sorted(ts, key=score, reverse=True) if t is not top]:
+            segments = 3 if t.metrics["kind"] == "segment" else 1
+            name = (t.source.get("label") or t.source.get("title") or "").strip()
+            label = f"{'DEFAULT ' if t is top else ''}{variant(t)} | {name}"
+            try:
+                sub.blueprints.append(get_blueprintable_from_string(blueprint_string(t.build(segments), label)))
+            except Exception as e:  # a template that cannot be rebuilt is reported, not hidden
+                print(f"    [!] {cat}: {name[:40]}: {type(e).__name__}: {e}")
+        book.blueprints.append(sub)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(book.to_string(), encoding="utf-8")
+    print(f"[*] Blueprint book: {path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Mine tileable layout templates from popular blueprints")
     parser.add_argument("--min-favorites", type=int, default=10)
     parser.add_argument("--per-category", type=int, default=8)
     args = parser.parse_args()
-    write_outputs(mine(args.min_favorites, args.per_category))
+    best = mine(args.min_favorites, args.per_category)
+    write_outputs(best)
+    write_book(best)
 
 
 if __name__ == "__main__":

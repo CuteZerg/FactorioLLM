@@ -33,6 +33,13 @@ class TestValidator(unittest.TestCase):
         self.assertEqual(report.warnings, [])
         self.assertEqual(report.facts["entity_counts"]["stone-furnace"], 3)
 
+    def test_offshore_pump_blocks_the_tile_in_front(self):
+        # the 2.0 pump's collision box reaches ~1 tile towards the water (north when facing north)
+        blocked = validate(IRBlueprint([IREntity("offshore-pump", 0, 1, 0), IREntity("pipe", 0, 0)]))
+        self.assertEqual([i.category for i in blocked.errors], ["collision"])
+        behind = validate(IRBlueprint([IREntity("offshore-pump", 0, 0, 0), IREntity("pipe", 0, 1)]))
+        self.assertEqual(behind.errors, [])
+
     def test_collision_is_error(self):
         errors, _ = categories(validate(bp(IREntity("stone-furnace", 0, 0), IREntity("transport-belt", 1, 1, 4))))
         self.assertIn("collision", errors)

@@ -124,6 +124,7 @@ class Template:
     snap: Optional[Tuple[int, int]] = None
     source: Dict[str, Any] = field(default_factory=dict)
     metrics: Dict[str, Any] = field(default_factory=dict)
+    metrics_width: int = 0  # width of a whole-cell design (its copies are placed `period` apart)
 
     def build(self, segments: int) -> IRBlueprint:
         """The design with `segments` periods (head and tail kept)."""
@@ -185,7 +186,9 @@ def extract_cell(ir: IRBlueprint, category: str) -> Template:
     ir = normalized(ir)
     width = ir.size[0]
     pitch = ir.snap[0] if ir.snap and ir.snap[0] <= width else width
-    return Template(category, pitch, [], sorted(ir.entities, key=lambda e: (e.y, e.x, e.name)), [], 1, ir.snap)
+    template = Template(category, pitch, [], sorted(ir.entities, key=lambda e: (e.y, e.x, e.name)), [], 1, ir.snap)
+    template.metrics_width = width
+    return template
 
 
 def along_x(ir: IRBlueprint) -> List[IRBlueprint]:

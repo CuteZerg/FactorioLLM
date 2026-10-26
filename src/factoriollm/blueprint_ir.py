@@ -24,6 +24,8 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+from factoriollm.vanilla_recipes import VANILLA_RECIPES
+
 warnings.filterwarnings("ignore", module="draftsman")
 
 # Hard caps for decoding untrusted blueprint strings (zip-bomb protection).
@@ -257,11 +259,25 @@ def _clean_text(value: Any) -> str:
     return " ".join(text.split())[:200]
 
 
+# Item / signal renames of 2.0 that are not entity renames.
+LEGACY_SIGNAL_RENAMES = {"used-up-uranium-fuel-cell": "depleted-uranium-fuel-cell"}
+
+
+@lru_cache(maxsize=None)
+def _signal_exists(name: str) -> bool:
+    from draftsman.data import signals
+    return name in signals.raw
+
+
 def _signal_id(signal: Dict[str, Any]) -> str:
-    """'type:name' of a label signal; Space Age signal types and quality levels are rejected."""
+    """
+    'type:name' of a label signal. Names from older versions are migrated; Space Age signal types,
+    quality levels and names unknown in 2.0 are rejected.
+    """
     kind = str(signal.get("type") or "item")
     name = str(signal.get("name") or "")
-    if kind not in LABEL_SIGNAL_TYPES or signal.get("quality") not in (None, "normal"):
+    name = LEGACY_SIGNAL_RENAMES.get(name, LEGACY_RENAMES.get(name, name))
+    if kind not in LABEL_SIGNAL_TYPES or signal.get("quality") not in (None, "normal") or not _signal_exists(name):
         raise BlueprintIRError(f"unsupported label signal {kind}:{name}")
     return f"{kind}:{name}"
 
@@ -300,6 +316,8 @@ def _convert_extras(raw: Dict[str, Any], name: str = "") -> Tuple[Tuple[str, str
         extras["recipe"] = str(raw["recipe"])
         if not _recipe_exists(extras["recipe"]):  # e.g. recipes removed or renamed since 0.x / 1.x
             raise BlueprintIRError(f"unknown recipe '{extras['recipe']}'")
+        if extras["recipe"] not in VANILLA_RECIPES:  # draftsman data includes Space Age
+            raise BlueprintIRError(f"recipe '{extras['recipe']}' is not in the base game")
     if raw.get("type") == "output":  # "input" is the default and is omitted on export
         extras["io_type"] = "output"
     for key in ("input_priority", "output_priority"):
@@ -309,7 +327,10 @@ def _convert_extras(raw: Dict[str, Any], name: str = "") -> Tuple[Tuple[str, str
     if isinstance(flt, dict):
         flt = flt.get("name")
     if flt:
-        extras["filter"] = str(flt)
+        flt = LEGACY_SIGNAL_RENAMES.get(str(flt), LEGACY_RENAMES.get(str(flt), str(flt)))
+        if not _signal_exists(flt):  # an item name from an older version or a mod
+            raise BlueprintIRError(f"unknown filter item '{flt}'")
+        extras["filter"] = flt
     for key, value in extras.items():
         allowed = "-_:;=" if key in ("signals", "icon") else "-_"
         if key != "text" and not all(ch.isalnum() or ch in allowed for ch in value):  # text: free, emitted via repr
@@ -371,6 +392,8 @@ def parse_blueprint_dict(
             raise BlueprintIRError(f"unknown entity '{name}'")
         if allowed is not None and name not in allowed:
             raise BlueprintIRError(f"entity '{name}' not allowed")
+        if name == "offshore-pump" and legacy:
+            raise BlueprintIRError("offshore pump from a pre-2.0 blueprint: its shape changed in 2.0")
         if name in ANNOTATION_ENTITIES and raw.get("entity_number") in wired:
             raise BlueprintIRError(f"circuit-wired '{name}' (circuit logic) is not supported")
 
