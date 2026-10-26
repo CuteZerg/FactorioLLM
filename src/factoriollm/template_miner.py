@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import json
 import math
+import re
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -29,6 +30,7 @@ from factoriollm.blueprint_ir import (
     parse_blueprint_dict,
     rotated,
 )
+from factoriollm.game_data import final_products, places_entity
 from factoriollm.templates import Template, along_x, extract, extract_cell, metrics, signature, tiling_check
 
 CATALOG = Path("data/templates/catalog.json")
@@ -40,6 +42,14 @@ FURNACES = {"stone-furnace": "smelting_stone", "steel-furnace": "smelting_steel"
 SCIENCE = {"automation-science-pack": "science_red", "logistic-science-pack": "science_green",
            "military-science-pack": "science_military", "chemical-science-pack": "science_blue",
            "production-science-pack": "science_purple", "utility-science-pack": "science_yellow"}
+# Machines with a recipe in the blueprint (furnaces pick theirs from the input).
+RECIPE_MACHINES = {*ASSEMBLERS, "chemical-plant", "oil-refinery", "centrifuge"}
+# Single final product -> category.
+PRODUCT_CATEGORIES = {"electronic-circuit": "green_circuits", "advanced-circuit": "red_circuits",
+                      "processing-unit": "blue_circuits", "iron-gear-wheel": "gears", "plastic-bar": "plastic",
+                      **SCIENCE}
+MULTI_MAX_PRODUCTS = 3  # more final products than this is a mall: no tileable segment, not mined
+FLUID_ENTITIES = {"offshore-pump", "pump", "pipe", "pipe-to-ground", "storage-tank"}
 
 
 # Machines that make up each category; a module must consist mostly of them.
@@ -53,18 +63,61 @@ FAMILIES = {
 }
 PRODUCTION = {"nuclear-reactor", "heat-exchanger", "steam-turbine", "boiler", "steam-engine", "solar-panel",
               "accumulator", "lab", "electric-mining-drill", "burner-mining-drill", "stone-furnace", "steel-furnace",
-              "electric-furnace", "chemical-plant", "oil-refinery", "centrifuge", *ASSEMBLERS}
+              "electric-furnace", *RECIPE_MACHINES}
 MIN_PURITY = 0.6
+# Power and mining: share of the blueprint's footprint taken by the category's own entities
+# (a pump station with a few panels is not a solar field).
+AREA_PURITY = {"nuclear": 0.4, "steam": 0.5, "solar": 0.5, "mining": 0.5}
+AREA_FAMILIES = {**FAMILIES, "mining": {"electric-mining-drill", "beacon"}}  # beaconed mining is still mining
+# "steel furnace" / "стальные печи" name the furnace, not steel smelting
+FURNACE_WORDS = re.compile(r"steel[\s_-]*furnaces?|стальн\w*", re.IGNORECASE)
+STEEL_WORDS = re.compile(r"\bsteel\b|\bстал[ьи]\b", re.IGNORECASE)
+ORES = {"iron-ore", "copper-ore", "stone"}
 
 
-def _category(names: Counter, recipes: Counter) -> Optional[str]:
-    assemblers = sum(names[a] for a in ASSEMBLERS)
+def products(ir: IRBlueprint) -> List[str]:
+    """Final products of the blueprint's recipe machines (what leaves the block), sorted."""
+    return sorted(final_products(e.extras_dict["recipe"] for e in ir.entities
+                                 if e.name in RECIPE_MACHINES and e.extras_dict.get("recipe")))
+
+
+def is_mall(final: List[str]) -> bool:
+    """Many products, or several buildings (a belt or robot mall), make a mall rather than a production block."""
+    return len(final) > MULTI_MAX_PRODUCTS or sum(map(places_entity, final)) >= 2
+
+
+def area_share(ir: IRBlueprint, family: set) -> float:
+    """Share of the summed entity footprint taken by entities of the family."""
+    areas = Counter()
+    for e in ir.entities:
+        w, h = footprint(e.name, e.direction)
+        areas[e.name in family] += w * h
+    return areas[True] / max(areas[True] + areas[False], 1)
+
+
+def smelting_input(ir: IRBlueprint, text: str = "") -> str:
+    """
+    'steel' for a column that smelts iron plates into steel, 'ore' for ore / stone smelting. Furnaces
+    carry no recipe, so this comes from the author's labels and the blueprint name.
+    """
+    signals = {part.split("=")[0].split(":", 1)[1] for e in ir.entities
+               for part in (e.extras_dict.get("signals") or "").split(";") if part}
+    signals |= {e.extras_dict["icon"].split(":", 1)[1] for e in ir.entities if "icon" in e.extras_dict}
+    text = FURNACE_WORDS.sub(" ", f"{text} {' '.join(e.extras_dict.get('text', '') for e in ir.entities)}")
+    # an 'iron-plate' label alone is no hint (ore columns label their output with it); a steel label
+    # next to ore labels marks a mixed bus smelter that is mostly ore smelting
+    if STEEL_WORDS.search(text) or ("steel-plate" in signals and not signals & ORES):
+        return "steel"
+    return "ore"
+
+
+def _category(names: Counter, ir: IRBlueprint) -> Optional[str]:
     furnaces = {k: names[k] for k in FURNACES}
     if names["nuclear-reactor"]:
         return "nuclear"
     if names["boiler"] and names["steam-engine"] >= 2:
         return "steam"
-    if names["solar-panel"] >= 4:
+    if names["solar-panel"] >= 4 and not any(names[n] for n in FLUID_ENTITIES):  # panels powering a pump station
         return "solar"
     if names["lab"] >= 4:
         return "labs"
@@ -72,32 +125,31 @@ def _category(names: Counter, recipes: Counter) -> Optional[str]:
         return FURNACES[max(furnaces, key=furnaces.get)]
     if names["electric-mining-drill"] >= 4:
         return "mining"
-    if assemblers >= 2:
-        green, cable, red = recipes["electronic-circuit"], recipes["copper-cable"], recipes["advanced-circuit"]
-        if red >= 2 and red + green + cable + recipes["plastic-bar"] >= 0.6 * assemblers:
-            return "red_circuits"
-        if green and cable and green + cable >= 0.6 * assemblers:
-            return "green_circuits"
-        if recipes["iron-gear-wheel"] >= 0.5 * assemblers:
-            return "gears"
-        top, n = (recipes.most_common(1) or [(None, 0)])[0]
-        if top in SCIENCE and n >= 0.3 * assemblers:
-            return SCIENCE[top]
+    if sum(names[m] for m in RECIPE_MACHINES) >= 2:
+        final = products(ir)
+        if len(final) == 1:
+            return PRODUCT_CATEGORIES.get(final[0])
+        if len(final) >= 2 and not is_mall(final):
+            return "multi"
     return None
 
 
 def classify(ir: IRBlueprint) -> Optional[str]:
     """
-    Main purpose of a blueprint from its content (not from author tags). Blocks that mix several
-    purposes (whole bases, a science block with its own smelting) are skipped: the category's own
-    machines must make up at least MIN_PURITY of all production machines.
+    Main purpose of a blueprint from what it delivers (not from author tags):
+    - power and mining by their machines, with most of the footprint taken by them;
+    - production blocks by their final products (recipe graph): one product gives its category,
+      2-3 products a 'multi' block, more is a mall and is not mined;
+    - blocks that mix purposes (a science block with its own smelting) are skipped: the category's
+      own machines must make up at least MIN_PURITY of all production machines.
     """
     names = Counter(e.name for e in ir.entities)
-    recipes = Counter(e.extras_dict.get("recipe") for e in ir.entities if e.name in ASSEMBLERS)
-    category = _category(names, recipes)
+    category = _category(names, ir)
     if category is None:
         return None
-    family = FAMILIES.get(category, set(ASSEMBLERS))
+    family = FAMILIES.get(category, RECIPE_MACHINES)
+    if category in AREA_PURITY and area_share(ir, AREA_FAMILIES[category]) < AREA_PURITY[category]:
+        return None
     production = sum(n for name, n in names.items() if name in PRODUCTION)
     own = sum(names[name] for name in family)
     return category if production and own / production >= MIN_PURITY else None
@@ -133,9 +185,17 @@ def mine_one(ir: IRBlueprint, category: str) -> Optional[Template]:
 
 
 def variant(t: Template) -> str:
-    """Coarse variant label a user can ask for: beacons or not, and the main machine tier."""
+    """
+    Coarse variant label a user can ask for: beacons or not, the main machine tier, and what a
+    furnace column smelts (ore or steel) or which products a multi-product block makes.
+    """
     beaconed = (t.metrics.get("beacons_per_machine") or 0) > 0
-    return f"{'beacons' if beaconed else 'no beacons'}, {main_machine(t)}"
+    parts = ["beacons" if beaconed else "no beacons", main_machine(t)]
+    if t.metrics.get("input"):
+        parts.append(t.metrics["input"])
+    if t.metrics.get("products"):
+        parts.append(" + ".join(t.metrics["products"]))
+    return ", ".join(parts)
 
 
 def sanity(t: Template) -> Optional[str]:
@@ -147,7 +207,6 @@ def sanity(t: Template) -> Optional[str]:
     ir = t.build(2 if t.repeats > 1 or t.head or t.tail else 1)
     names = Counter(e.name for e in ir.entities)
     recipes = Counter(e.extras_dict.get("recipe") for e in ir.entities if e.name in ASSEMBLERS)
-    machines = sum(names[a] for a in ASSEMBLERS)
     cat = t.category
     if cat == "nuclear":
         if names["heat-exchanger"] < 3 * names["nuclear-reactor"] or names["steam-turbine"] < 1.5 * names["heat-exchanger"]:
@@ -161,13 +220,7 @@ def sanity(t: Template) -> Optional[str]:
     elif cat == "green_circuits":
         if recipes["copper-cable"] and not 1.2 <= recipes["copper-cable"] / max(recipes["electronic-circuit"], 1) <= 1.8:
             return "cable / circuit machines far from 3:2"
-    elif cat == "gears":
-        if recipes["iron-gear-wheel"] < 0.5 * machines:
-            return "gears are not the main product"
-    elif cat.startswith("science_"):
-        pack = next(r for r, c in SCIENCE.items() if c == cat)
-        if recipes[pack] < 0.3 * machines:
-            return "the science pack is not the main product"
+    # production categories come from the recipe graph: the product is right by construction
     return None
 
 
@@ -268,6 +321,8 @@ def mine(min_favorites: int = 10, per_category: int = 8) -> Dict[str, List[Templ
                 continue
             category = classify(ir)
             if category is None:
+                if is_mall(products(ir)):
+                    stats["mall"] += 1
                 continue
             stats[f"candidates {category}"] += 1
             try:
@@ -291,6 +346,10 @@ def mine(min_favorites: int = 10, per_category: int = 8) -> Dict[str, List[Templ
                                "favorites": row["favorites"], "version": list(version)}
             template.metrics = {**metrics(template), "kind": "segment" if template.head or template.repeats > 1 or template.tail else "cell",
                                 "source_warnings": check["source_warnings"]}
+            if category == "multi":
+                template.metrics["products"] = products(ir)
+            if category.startswith("smelting_"):
+                template.metrics["input"] = smelting_input(ir, ir.label if path else f"{ir.label} {row['title']}")
             found.setdefault(category, []).append(template)
     best: Dict[str, List[Template]] = {}
     for cat, ts in sorted(found.items()):
@@ -310,7 +369,8 @@ CATEGORY_NAMES = {
     "smelting_stone": "Плавка в каменных печах", "smelting_steel": "Плавка в стальных печах",
     "smelting_electric": "Плавка в электропечах", "mining": "Добыча (электробуры)", "steam": "Паровая энергетика",
     "solar": "Солнечные поля", "nuclear": "Атомная энергетика", "labs": "Лаборатории",
-    "green_circuits": "Зелёные схемы", "red_circuits": "Красные схемы", "gears": "Шестерни",
+    "green_circuits": "Зелёные схемы", "red_circuits": "Красные схемы", "blue_circuits": "Синие схемы",
+    "gears": "Шестерни", "plastic": "Пластик", "multi": "Мульти-блоки (несколько продуктов)",
     "science_red": "Красная наука", "science_green": "Зелёная наука", "science_military": "Военная наука",
     "science_blue": "Синяя наука", "science_purple": "Фиолетовая наука", "science_yellow": "Жёлтая наука",
 }
