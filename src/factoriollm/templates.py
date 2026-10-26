@@ -157,7 +157,7 @@ class Template:
     def build(self, segments: int, lamps: bool = False, belt: Optional[str] = None) -> IRBlueprint:
         """
         The design with `segments` periods (head and tail kept), at the template's belt tier or at
-        `belt`, optionally with the author's lamps (only on tiles left free).
+        `belt`, optionally with the author's lamps (only on free tiles that a pole reaches).
         """
         if segments < 1:
             raise ValueError("a template needs at least one segment")
@@ -166,7 +166,9 @@ class Template:
             ents = retier(ents, belt or self.belt)
         if lamps:
             taken = {t for e in ents for t in _tiles(e)}
-            ents += [e for e in self._place(self.lamps, segments) if (e.x, e.y) not in taken]
+            free = [e for e in self._place(self.lamps, segments) if (e.x, e.y) not in taken]
+            dark = set(_uncovered(ents + free)) - set(_uncovered(ents))  # lamps no pole reaches
+            ents += [e for k, e in enumerate(free) if len(ents) + k not in dark]
         return normalized(IRBlueprint(ents))
 
     def build_segment(self, belt: Optional[str] = None) -> IRBlueprint:

@@ -83,6 +83,13 @@ class TestDefault(unittest.TestCase):
                             metrics={"tiles_per_machine": tiles, "beacons_per_machine": beacons})
         sparse, dense, popular_dense, beaconed = t(20, 100000), t(10, 10), t(11, 1000), t(5, 10**6, beacons=1)
         self.assertIs(default_template([sparse, dense, popular_dense, beaconed]), popular_dense)
+        moduled = t(8, 10**5)
+        moduled.metrics["traits"] = {"machine_modules": "productivity-3=4"}
+        self.assertIs(default_template([dense, moduled]), dense)
+        steel, ore = t(8, 10**5), t(12, 10)
+        steel.metrics["input"], ore.metrics["input"] = "steel", "ore"
+        self.assertIs(default_template([steel, ore]), ore)
+        self.assertIs(default_template([steel]), steel)  # a preference never empties the choice
 
 
 class TestSmeltingInput(unittest.TestCase):

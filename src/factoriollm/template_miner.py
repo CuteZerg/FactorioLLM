@@ -468,11 +468,19 @@ DENSITY_SLACK = 1.15  # a default may use up to 15% more tiles per machine than 
 
 def default_template(ts: List[Template]) -> Template:
     """
-    Default for requests without details: among designs without beacons (beacons are late game),
-    those within DENSITY_SLACK of the densest by tiles per machine; among them the best-ranked
-    (popularity, 2.0 bonus). Popularity alone picked layouts that waste rows on poles.
+    Default for requests without details: designs without beacons, then without machine modules
+    (both late game), for furnaces ore smelting rather than steel, and with belts of their own (a
+    city-block cell takes its items from outside); each preference applies only if some design
+    meets it. Among those, the ones within DENSITY_SLACK of the densest by tiles per
+    machine, and of them the best-ranked (popularity, 2.0 bonus). Popularity alone picked layouts
+    that waste rows on poles.
     """
-    plain = [t for t in ts if not (t.metrics.get("beacons_per_machine") or 0)] or ts
+    plain = ts
+    for prefer in (lambda t: not (t.metrics.get("beacons_per_machine") or 0),
+                   lambda t: not (t.metrics.get("traits") or {}).get("machine_modules"),
+                   lambda t: t.metrics.get("input") in (None, "ore"),
+                   lambda t: t.metrics.get("belt_tier")):  # brings its own belts, not a city-block cell
+        plain = [t for t in plain if prefer(t)] or plain
 
     def tiles(t: Template) -> float:
         return t.metrics.get("tiles_per_machine") or math.inf
@@ -501,9 +509,15 @@ def _changes(best: Dict[str, List[Template]], previous: Dict[str, List[Template]
     """'Before -> after' table per category: template counts and the default design."""
     lines = ["## Что изменилось по сравнению с прошлым каталогом", "",
              "| Категория | Шаблонов было | Стало | Умолчание было | Умолчание стало |", "| --- | --- | --- | --- | --- |"]
+    def old_default(ts: List[Template]) -> Template:
+        if all("traits" in t.metrics for t in ts):
+            return default_template(ts)
+        # a catalog from before variant traits: the rule of that time (best-ranked without beacons)
+        return max([t for t in ts if not (t.metrics.get("beacons_per_machine") or 0)] or ts, key=score)
+
     for cat in sorted(set(best) | set(previous), key=lambda c: CATEGORY_NAMES.get(c, c)):
         old, new = previous.get(cat, []), best.get(cat, [])
-        before = f"«{_name(default_template(old))}»" if old else "—"
+        before = f"«{_name(old_default(old))}»" if old else "—"
         after = f"«{_name(default_template(new))}»" if new else "—"
         lines.append(f"| {CATEGORY_NAMES.get(cat, cat)} | {len(old)} | {len(new)} | {before} | {after} |")
     return lines + [""]
