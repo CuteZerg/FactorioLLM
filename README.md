@@ -1,144 +1,183 @@
 # FactorioLLM: Text-to-Blueprint Generator
 
-![Factorio](https://img.shields.io/badge/Game-Factorio-orange)
+![Factorio](https://img.shields.io/badge/Game-Factorio_2.0-orange)
 ![Machine Learning](https://img.shields.io/badge/AI-Generative_NLP-blue)
 ![Python](https://img.shields.io/badge/Language-Python_3.12-yellow)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
-**FactorioLLM** is an AI-powered tool that generates functional, ready-to-use blueprints for the game Factorio based on natural language prompts. 
+**FactorioLLM** generates ready-to-use Factorio 2.0 blueprints from natural language prompts.
 
-Instead of manually placing entities or searching the web for specific layouts, you can just type: 
-> *"Create an expandable copper smelting line for 24 furnaces using red belts,"* 
+Type something like
+> *"Create an expandable copper smelting line for 24 furnaces using red belts"*
 
-...and receive a working blueprint string instantly.
+and get a blueprint string you can paste into the game.
 
 ---
 
-## How It Works (The Core Concept)
+## How it works
 
-Factorio blueprints are essentially JSON objects containing raw coordinates, compressed via `zlib` and encoded in `base64`. 
+Factorio blueprints are JSON documents with exact entity coordinates, compressed with `zlib` and encoded in
+`base64`. Language models are poor at spatial reasoning: asked for raw JSON, they produce overlapping entities,
+inserters facing the wrong way and belts that do not connect.
 
-**The Challenge:** Large Language Models (LLMs) lack spatial reasoning. Asking an LLM to output a raw JSON blueprint with exact x/y coordinates for hundreds of entities results in broken, non-functional layouts. Models do not inherently understand "tileability" or belt alignment.
+FactorioLLM therefore treats blueprint generation as a **text-to-code** task:
 
-**The Solution:** FactorioLLM uses a **Text-to-Code** approach. 
-Instead of predicting JSON coordinates, the LLM generates a **Python script** utilizing the [factorio-draftsman](https://github.com/redruin1/factorio-draftsman) library. Concepts like spacing, alignment, and ratios are naturally handled through Python `for` loops, variables, and math. The backend then safely executes this script to compile a flawless blueprint string.
-
-### The Agentic Loop Pipeline
-
-The project features an automatic self-healing loop:
+1. A locally fine-tuned model (LoRA on `Qwen2.5-Coder-7B-Instruct`, 4-bit) writes a short **Python script** that
+   uses [factorio-draftsman](https://github.com/redruin1/factorio-draftsman) plus our own helpers and
+   parametric layout modules (`smelting_column`, `mining_field`, `steam_power`, `balancer`, ...).
+2. The script runs in a locked-down **Docker sandbox** (no network, read-only file system, resource limits)
+   and prints the blueprint string. Copper wires between power poles are added automatically.
+3. A static **validator** checks the result (overlaps, inserters working with buildings that hold no items,
+   power coverage, belt ends, ...).
+4. On an error the **agentic loop** sends the traceback or the validator report back to the model, up to three
+   times.
 
 ```mermaid
 graph TD;
-    A[User Prompt] --> B(LLM: Llama-3 8B Fine-Tuned);
-    B -->|Generates Python Script| C{Draftsman API / Execution};
-    C -->|Syntax / Logic Error| B;
-    C -->|Successful Compilation| D[Draftsman Output];
-    D -->|Generates Base64| E[Ready Blueprint String];
-    E --> A;
+    A[User prompt] --> B(Fine-tuned LLM);
+    B -->|Python script| C{Docker sandbox};
+    C -->|Traceback| B;
+    C -->|Blueprint string| D{Validator};
+    D -->|Errors| B;
+    D -->|OK| E[Blueprint string for the game];
 ```
 
----
-
-## Tech Stack
-
-* **AI Models:** Fine-tuned Code-specific LLMs (`unsloth/llama-3-8b-Instruct-bnb-4bit`).
-* **Training:** `Unsloth` for 2x faster 4-bit LoRA training, Hugging Face `transformers`, `PEFT` (LoRA).
-* **Dataset Generation:** Google Gemini (`google-genai`), `factorio-draftsman`.
-* **Package Management:** `uv`
+The guiding principle: **the model decides what and how much to build; deterministic code decides where**.
+Exact geometry, power wiring and balancers come from code and from templates mined from popular player
+blueprints, not from the model's memory.
 
 ---
 
-## Getting Started
+## Tech stack
 
-*(Note: The project is currently in active development. These instructions represent the local testing setup).*
+* **Model:** `unsloth/Qwen2.5-Coder-7B-Instruct-bnb-4bit` + LoRA (Unsloth, TRL, PEFT); fits a 12 GB GPU.
+* **Blueprint construction:** `factorio-draftsman` 3.3.1 (data for Factorio 2.0.77).
+* **Data:** blueprints scraped from factorioprints.com into PostgreSQL; prompts written by Google Gemini
+  (`google-genai`) from facts computed on each blueprint.
+* **Sandbox:** Docker (`python:3.12-slim` + draftsman).
+* **UI:** Gradio web studio and a CLI.
+* **Package management:** `uv`.
+
+---
+
+## Getting started
+
+*(The project is in active development; this is the local setup.)*
 
 ### Prerequisites
-* Python 3.12+
-* `uv` package manager
-* Factorio (for testing the generated blueprints)
-* A GPU with CUDA support for training.
+
+* Python 3.12 (exactly `3.12.*`) and `uv`
+* Docker (for the sandbox)
+* PostgreSQL (for the dataset pipeline)
+* An NVIDIA GPU with CUDA for training and inference (developed on an RTX 5070, 12 GB)
+* A `.env` file with `DATABASE_URL`, `GEMINI_API_KEY` (and optionally `PROXY_URL`, `GEMINI_MODEL`, `GEMINI_RPM`,
+  `GEMINI_MAX_REQUESTS`, `TELEGRAM_BOT_TOKEN`)
 
 ### Installation
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/yourusername/FactorioLLM.git
-   cd FactorioLLM
-   ```
-
-2. Sync dependencies using `uv`:
-   ```bash
-   uv sync
-   ```
+```bash
+git clone https://github.com/CuteZerg/FactorioLLM.git
+cd FactorioLLM
+uv sync
+docker build -f docker/Dockerfile.sandbox -t factoriollm-sandbox .
+```
 
 ### Usage
 
-#### 1. Interactive Web Studio (Gradio)
-Launch the local web application:
 ```bash
-uv run python src/factoriollm/generate.py --web
-# or
-uv run python src/factoriollm/app.py
-```
-Open your browser at `http://127.0.0.1:7860`.
-
-#### 2. Terminal CLI
-Generate a blueprint directly from command line:
-```bash
-uv run python src/factoriollm/generate.py -p "Create a 4x4 belt balancer with fast transport belts"
-```
-The blueprint string will be automatically copied to your clipboard ready for in-game `Ctrl + V`.
-
-### Dataset pipeline (v4)
-
-Blueprints are parsed from their raw JSON into an integer **tile-grid IR** (`blueprint_ir.py`): every entity is
-stored by its top-left tile, 1.x blueprints are converted to 2.0 (directions, renames), and only Factorio 2.0
-vanilla entities are kept. Generated scripts use `tile_position=(x, y)` everywhere, so 1x1 and 2x2 entities share
-one grid.
-
-```bash
-uv run python src/factoriollm/init_db.py                          # create / migrate tables
-uv run python -m factoriollm.dataset_builder scrape --batch 500   # download new blueprints
-uv run python -m factoriollm.dataset_builder canonical            # IR -> macro-lifted code -> sandbox verification
-uv run python -m factoriollm.dataset_builder prompts --max-requests 50   # Gemini: grounded EN/RU prompts
-uv run python -m factoriollm.dataset_builder export               # data/dataset_v4.jsonl + eval split
+uv run python src/factoriollm/app.py                         # Gradio web studio, http://127.0.0.1:7860
+uv run python src/factoriollm/generate.py -p "4x4 balancer"  # CLI; the string is copied to the clipboard
 ```
 
-The `prompts` stage is free-tier friendly: several blueprints per request, `--rpm` throttling, a per-run
-request budget, and a graceful stop on the daily quota; rerun it to continue. Configure `GEMINI_MODEL`,
-`GEMINI_RPM`, `GEMINI_MAX_REQUESTS` in `.env`.
-
-### Training and evaluation
-
-```bash
-# smoke test, then a pilot on one EN + one RU prompt per blueprint
-uv run python src/factoriollm/train_model.py --run-name smoke --subsample per-blueprint --max-steps 20 --eval-steps 10
-uv run python src/factoriollm/train_model.py --run-name pilot --subsample per-blueprint --epochs 1
-# evaluate an adapter (GPU + Docker) and compare two reports
-uv run python -m factoriollm.eval_suite --adapter adapters/pilot
-uv run python -m factoriollm.eval_suite --compare outputs/eval/<a>.json outputs/eval/<b>.json
-```
-
-The default base model is `unsloth/Qwen2.5-Coder-7B-Instruct-bnb-4bit` (`--base-model` to change); the loss is
-computed on the assistant's code only. Generated blueprints are checked by `validator.py`: overlapping entities and
-inserters working with buildings that hold no items are errors, other findings are categorised warnings.
+The adapter is taken from `--adapter`, `$FACTORIOLLM_ADAPTER`, the newest folder in `adapters/`, or
+`factorio_lora_model/`.
 
 ---
 
-## Project Roadmap
+## Dataset pipeline
 
-- [x] **Phase 0: Proof of Concept** - Manual validation of Draftsman code generation.
-- [x] **Phase 1: Data Engineering** - Fetching blueprints from factorioprints and decompiling them.
-- [x] **Phase 2: Synthetic Prompts** - Using Google Gemini to attach diverse human prompts to the decompiled scripts.
-- [x] **Phase 3: Fine-Tuning** - Training a LoRA adapter for Llama-3 to understand Factorio logic and Draftsman syntax (`factorio_lora_model`).
-- [x] **Phase 4: Inference & Agentic Loop** - Closed Docker sandbox execution with automatic error recovery (3 retries).
-- [x] **Phase 5: User Interface** - Interactive Gradio Web Studio and CLI runner with clipboard integration.
+Blueprints are parsed into an integer **tile-grid IR** (`blueprint_ir.py`): every entity is stored by its
+top-left tile, and 1.x (and 0.15+) strings are converted to 2.0 (renames, 8 → 16 directions, half-tile origin
+shift). Only Factorio 2.0 **base-game** entities and recipes are kept (no Space Age, no mods). Grid snapping,
+unwired label combinators / display panels and splitter settings are preserved.
+
+```bash
+uv run python src/factoriollm/init_db.py                                 # create / migrate tables
+uv run python -m factoriollm.dataset_builder scrape --batch 500          # download new blueprints
+uv run python -m factoriollm.dataset_builder canonical [--rebuild] [--dry-run]  # IR -> code -> sandbox check
+uv run python -m factoriollm.dataset_builder prompts --rpm 60 --max-requests 1000  # Gemini EN/RU prompts
+uv run python -m factoriollm.dataset_builder export                      # data/dataset_v4.jsonl + eval split
+```
+
+* `canonical` lifts each blueprint into compact code with macros and loops (`dataset_lifter.py`), runs it in the
+  sandbox and keeps it only if the rebuilt blueprint is identical. Books with 100+ favorites contribute all
+  children, books with 10+ up to 50, others up to 25.
+* `prompts` sends several blueprints per request and rejects prompts with numbers that are not in the facts.
+
+## Layout templates mined from player blueprints
+
+`template_miner.py` finds the best tileable designs per category in the scraped corpus, cuts each into
+**head + repeating segment + tail** (`templates.py`), checks that 1, 2 and 5 segments pass the validator and
+draftsman's collision check, and writes:
+
+* `data/templates/catalog.json` — the templates with provenance and density metrics;
+* `outputs/templates/catalog.md` — a readable report;
+* `outputs/templates/catalog_book.txt` — one blueprint book with all templates for checking in game.
+
+```bash
+uv run python -m factoriollm.template_miner --min-favorites 10
+uv run python tools/extract_balancers.py          # balancer templates (Raynquist's book first) -> helpers.py
+uv run python tools/extract_vanilla_recipes.py    # base-game recipe list from wube/factorio-data
+```
+
+## Training and evaluation
+
+```bash
+uv run python src/factoriollm/train_model.py --run-name smoke --subsample per-blueprint --max-steps 20 --eval-steps 10
+uv run python src/factoriollm/train_model.py --run-name pilot --subsample per-blueprint --epochs 1
+uv run python -m factoriollm.eval_suite --adapter adapters/pilot [--retries 3]
+uv run python -m factoriollm.eval_suite --compare outputs/eval/<a>.json outputs/eval/<b>.json
+uv run python tools/overnight.py --detach         # unattended pipeline (Task Scheduler) + tools/train_monitor.py
+```
+
+The loss is computed on the assistant's code only. `eval_suite` measures completeness, execution, validity,
+exact counts and belt tier on a fixed prompt set (A) and a held-out sample (B).
+
+| Adapter | Valid blueprints | Exact counts | Notes |
+| --- | --- | --- | --- |
+| `factorio_lora_model` (old data) | 0% | 1% | Llama-3, broken coordinates |
+| `pilot-qwen7b` (11k examples, 1 epoch) | 17% | 36% | |
+| `full-qwen7b-2ep` (20.5k examples, 2 epochs) | 27% (33% with 3 retries) | 42% | current best |
+
+Most remaining failures are collisions from hand-computed coordinates, which is why the next stage moves
+geometry into templates and modules.
+
+## Tests
+
+```bash
+uv run python -m unittest discover tests     # all (test_sandbox needs Docker; test_inference_eval needs a GPU)
+```
+
+---
+
+## Roadmap
+
+- [x] Scraping, tile-grid IR, sandbox, Gemini prompts, dataset v4
+- [x] Validator, evaluation suite, configurable LoRA training, unattended runs
+- [x] Parametric modules, automatic power wiring, balancer templates, grid snapping, label combinators
+- [x] Template miner over popular player blueprints and an in-game review book
+- [ ] Template fixes after the in-game review (product-based categories, modules and logistic requests,
+      self-contained templates, computed grids, strict power checks, density-first defaults)
+- [ ] Generic templates (assembler rows by number of input lanes, fluid rows, furnace lines) for any recipe
+- [ ] Modules API on top of templates; synthetic and repair examples; dataset v5; fine-tuning
+- [ ] Iterative refinement (edit a generated blueprint by instruction); mod support via game data dumps
 
 ---
 
 ## Contributing
 
-Contributions are welcome! If you love Factorio and Machine Learning, feel free to open an issue or submit a Pull Request.
+Contributions are welcome! If you love Factorio and machine learning, feel free to open an issue or a pull
+request.
 
 ## License
 
