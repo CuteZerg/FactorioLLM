@@ -3,7 +3,27 @@ import warnings
 from collections import Counter
 
 from factoriollm.blueprint_ir import IRBlueprint, IREntity
-from factoriollm.templates import Template, extract, extract_cell, find_period, metrics, tiling_check
+from factoriollm.templates import (
+    Template,
+    add_port_labels,
+    extract,
+    extract_cell,
+    find_period,
+    has_weaving,
+    main_belt,
+    metrics,
+    prepare,
+    repair_power,
+    retier,
+    tiling_check,
+    underground_pairs,
+)
+
+OUT = (("io_type", "output"),)
+
+
+def ug(name, x, output=False, y=0):
+    return IREntity(name, x, y, 4, OUT if output else ())
 
 
 def furnace_row(pairs: int, with_head: bool = True, lamp_at: int = -1) -> IRBlueprint:
@@ -75,6 +95,103 @@ class TestTemplates(unittest.TestCase):
 
     def test_no_repeat_no_template(self):
         self.assertIsNone(extract(furnace_row(1, with_head=False), "smelting_stone"))
+
+    def test_lamps_are_an_optional_layer(self):
+        t = extract(furnace_row(5, lamp_at=2), "smelting_stone")
+        self.assertEqual(Counter(e.name for e in t.build(4).entities)["small-lamp"], 0)
+        self.assertEqual(Counter(e.name for e in t.build(4, lamps=True).entities)["small-lamp"], 4)
+        again = Template.from_json(t.to_json())
+        self.assertEqual(again.build(2, lamps=True).canonical_set(), t.build(2, lamps=True).canonical_set())
+
+    def test_own_grid_instead_of_the_authors(self):
+        row = furnace_row(5)
+        t = extract(IRBlueprint(row.entities, snap=(7, 5), absolute_snap=True, snap_offset=(3, 1)), "smelting_stone")
+        self.assertEqual(t.snap, (4, 4))
+        segment = t.build_segment()
+        self.assertEqual((segment.snap, segment.absolute_snap), ((4, 4), False))
+        self.assertEqual(min(e.x for e in segment.entities), 0)
+        self.assertIsNone(t.build(3).snap)  # a finished build is not dragged
+
+
+class TestSelfContained(unittest.TestCase):
+    def setUp(self):
+        warnings.simplefilter("ignore")
+
+    def test_prepare_cuts_surroundings_and_author_parts(self):
+        row = furnace_row(4)
+        tap = [IREntity("transport-belt", 10, y, 8) for y in range(-12, 0)]  # a bus tap coming from far above
+        cut_pair = [IREntity("underground-belt", 20, 0, 0), IREntity("underground-belt", 20, -4, 0, OUT)]
+        extra = [IREntity("radar", 40, 0), IREntity("constant-combinator", 1, 1, 0, (("signals", "item:coal=1"),)),
+                 IREntity("small-lamp", 5, 1)]
+        ir = prepare(IRBlueprint(row.entities + tap + cut_pair + extra))
+        names = Counter(e.name for e in ir.entities)
+        self.assertEqual((names["radar"], names["constant-combinator"], names["small-lamp"]), (0, 0, 1))
+        self.assertEqual(names["underground-belt"], 0)  # its exit was cut, so the entrance goes too
+        self.assertEqual(min(e.y for e in ir.entities if e.name == "transport-belt"), -2)
+
+    def test_retier_brings_every_belt_to_one_tier(self):
+        ents = furnace_row(3).entities + [IREntity("fast-transport-belt", 14, 0, 4)]
+        self.assertEqual(main_belt(ents), "transport-belt")
+        names = {e.name for e in retier(ents, "express-transport-belt") if "belt" in e.name or "splitter" in e.name}
+        self.assertEqual(names, {"express-transport-belt", "express-splitter"})
+
+    def test_retier_keeps_belt_weaving(self):
+        # a red pair (span 6) over a yellow pair (span 2)
+        weave = [ug("fast-underground-belt", 0), ug("underground-belt", 2), ug("underground-belt", 4, True),
+                 ug("fast-underground-belt", 6, True)]
+        for belt in ("transport-belt", "fast-transport-belt", "express-transport-belt"):
+            out = retier(weave, belt)
+            self.assertEqual(underground_pairs(out), underground_pairs(weave), belt)
+            self.assertNotEqual(out[0].name, out[1].name, belt)  # the woven pairs differ in tier
+
+    def test_retier_handles_long_underground_chains(self):
+        # ten yellow pairs in a row on one line, plus a lone entrance: neighbours, not weaves
+        chain = [ug("underground-belt", 6 * k + d, output=d == 4) for k in range(10) for d in (0, 4)]
+        chain.append(ug("underground-belt", 60))
+        for belt in ("fast-transport-belt", "express-transport-belt"):
+            out = retier(chain, belt)
+            self.assertEqual(underground_pairs(out), underground_pairs(chain), belt)
+            self.assertEqual({e.name for e in out}, {belt.replace("transport", "underground")})
+
+    def test_retier_raises_the_tier_of_a_span_too_long(self):
+        long_pair = [ug("express-underground-belt", 0), ug("express-underground-belt", 8, True)]
+        self.assertEqual({e.name for e in retier(long_pair, "transport-belt")}, {"express-underground-belt"})
+        short = [ug("express-underground-belt", 0), ug("express-underground-belt", 3, True)]
+        self.assertEqual({e.name for e in retier(short, "transport-belt")}, {"underground-belt"})
+        with self.assertRaises(ValueError):
+            retier(short, "underground-belt")
+
+    def test_port_labels_from_recipes(self):
+        gears = [IREntity("assembling-machine-2", 3 * i, 2, 0, (("recipe", "iron-gear-wheel"),)) for i in range(2)]
+        belts = [IREntity("transport-belt", x, y, 4) for x in range(6) for y in (0, 6)]
+        inserters = [IREntity("inserter", 3 * i + 1, y, 0) for i in range(2) for y in (1, 5)]
+        ir = add_port_labels(IRBlueprint(gears + belts + inserters))
+        labels = {(e.x, e.y): e.extras_dict["signals"] for e in ir.entities if e.name == "constant-combinator"}
+        self.assertEqual(labels, {(-1, 0): "item:iron-plate=1", (6, 6): "item:iron-gear-wheel=1"})
+
+    def test_power_is_strict_and_repaired(self):
+        unpowered = IRBlueprint([e for e in furnace_row(5).entities if e.name != "small-electric-pole"])
+        t = extract(unpowered, "smelting_stone")
+        check = tiling_check(t)
+        self.assertFalse(check["ok"])
+        self.assertTrue(check["power_only"])
+        fixed = repair_power(t)
+        self.assertIsNotNone(fixed)
+        self.assertTrue(tiling_check(fixed)["ok"])
+        self.assertIn("medium-electric-pole", {e.name for e in fixed.segment})  # no pole in the design: the default
+
+    def test_weaving_is_detected(self):
+        weave = [ug("fast-underground-belt", 0), ug("underground-belt", 2), ug("underground-belt", 4, True),
+                 ug("fast-underground-belt", 6, True)]
+        self.assertTrue(has_weaving(weave))
+        self.assertFalse(has_weaving([ug("underground-belt", 0), ug("underground-belt", 4, True)]))
+
+    def test_furnace_labels_come_from_the_input_parameter(self):
+        ir = add_port_labels(furnace_row(3), smelt="iron-plate")
+        labels = [e.extras_dict["signals"] for e in ir.entities if e.name == "constant-combinator"]
+        self.assertEqual(labels, ["item:coal=1;item:iron-plate=1"])
+        inside = add_port_labels(furnace_row(3), inside_only=True)
+        self.assertTrue(all(e.x >= 0 and e.y >= 0 for e in inside.entities))
 
 
 if __name__ == "__main__":

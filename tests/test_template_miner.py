@@ -3,7 +3,8 @@ import warnings
 
 from factoriollm.blueprint_ir import IRBlueprint, IREntity
 from factoriollm.game_data import final_products, recipe
-from factoriollm.template_miner import classify, is_mall, products, smelting_input
+from factoriollm.template_miner import classify, default_template, is_mall, products, smelting_input
+from factoriollm.templates import Template
 
 
 def assemblers(*recipes, y=0):
@@ -73,6 +74,15 @@ class TestClassify(unittest.TestCase):
         self.assertEqual(self.classify(engines), "steam")
         walls = [IREntity("stone-wall", x, 20 + y) for x in range(20) for y in range(5)]
         self.assertIsNone(self.classify(engines + walls))
+
+
+class TestDefault(unittest.TestCase):
+    def test_density_first_then_popularity(self):
+        def t(tiles, favorites, beacons=0):
+            return Template("labs", 4, [], [], [], 1, source={"favorites": favorites, "version": [2, 0]},
+                            metrics={"tiles_per_machine": tiles, "beacons_per_machine": beacons})
+        sparse, dense, popular_dense, beaconed = t(20, 100000), t(10, 10), t(11, 1000), t(5, 10**6, beacons=1)
+        self.assertIs(default_template([sparse, dense, popular_dense, beaconed]), popular_dense)
 
 
 class TestSmeltingInput(unittest.TestCase):

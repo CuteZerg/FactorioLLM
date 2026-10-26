@@ -25,15 +25,30 @@ from factoriollm.blueprint_ir import (
     BlueprintIRError,
     IRBlueprint,
     decode_blueprint_string,
+    entity_type,
     footprint,
     iter_blueprints,
     parse_blueprint_dict,
     rotated,
 )
 from factoriollm.game_data import final_products, places_entity
-from factoriollm.templates import Template, along_x, extract, extract_cell, metrics, signature, tiling_check
+from factoriollm.templates import (
+    Template,
+    add_port_labels,
+    along_x,
+    extract,
+    extract_cell,
+    main_belt,
+    metrics,
+    has_weaving,
+    prepare,
+    repair_power,
+    signature,
+    tiling_check,
+)
 
 CATALOG = Path("data/templates/catalog.json")
+STATS = Path("data/templates/miner_stats.json")
 REPORT = Path("outputs/templates/catalog.md")
 MAX_ENTITIES = 3000
 
@@ -184,17 +199,67 @@ def mine_one(ir: IRBlueprint, category: str) -> Optional[Template]:
     return max(cells, key=lambda c: (c.period < c.metrics_width, _belts_along_x(c))) if cells else None
 
 
+def _modules(ents: List[Any]) -> Optional[str]:
+    """Most common module set of these entities, e.g. 'speed-module-3=2' (None without modules)."""
+    sets = Counter(e.extras_dict.get("modules") for e in ents)
+    top = sets.most_common(1)[0][0] if sets else None
+    return top.replace("-module", "") if top else None
+
+
+def traits(t: Template) -> Dict[str, Any]:
+    """
+    What tells layouts of one category apart beyond tiers, so a user can ask for them and the
+    catalog keeps them as separate variants:
+    - pitch: main machines side by side ('tight') or with gaps along the repeat;
+    - poles: in the inserter rows ('inline'), in a row of their own ('own row'), for drills
+      'between drills' when they stand among the drill pairs;
+    - machine / beacon modules, a chain of intermediate products, belt weaving, lamps.
+    """
+    main = main_machine(t)
+    machines = [e for e in t.segment if e.name == main]
+    widths: Dict[int, int] = {}
+    for e in machines:
+        widths[e.y] = widths.get(e.y, 0) + footprint(e.name, e.direction)[0]
+    pole_rows = {e.y for e in t.segment if entity_type(e.name) == "electric-pole"}
+    inserter_rows = {e.y for e in t.segment if entity_type(e.name) == "inserter"}
+    if not pole_rows:
+        poles = "none"
+    elif t.category == "mining" and machines and all(
+            min(e.y for e in machines) <= y < max(e.y + footprint(e.name, e.direction)[1] for e in machines) for y in pole_rows):
+        poles = "between drills"
+    else:
+        poles = "inline" if pole_rows <= inserter_rows else "own row"
+    recipes = {e.extras_dict.get("recipe") for e in t.segment + t.head + t.tail} - {None}
+    return {
+        "pitch": "tight" if machines and max(widths.values()) >= t.period else "gaps",
+        "poles": poles,
+        "machine_modules": _modules(machines),
+        "beacon_modules": _modules([e for e in t.segment if e.name == "beacon"]),
+        "chain": len(recipes) > 1,
+        "weaving": has_weaving(t.build(3).entities),
+        "lamps": bool(t.metrics.get("lamps")),
+    }
+
+
 def variant(t: Template) -> str:
     """
-    Coarse variant label a user can ask for: beacons or not, the main machine tier, and what a
-    furnace column smelts (ore or steel) or which products a multi-product block makes.
+    Variant label a user can ask for: beacons (and their modules) or not, the main machine tier and
+    its modules, what a furnace column smelts (ore or steel) or which products a multi-product block
+    makes, machine pitch, pole placement, chains, belt weaving and lamps.
     """
+    tr = t.metrics.get("traits") or {}
     beaconed = (t.metrics.get("beacons_per_machine") or 0) > 0
-    parts = ["beacons" if beaconed else "no beacons", main_machine(t)]
+    parts = [f"beacons {tr['beacon_modules']}" if beaconed and tr.get("beacon_modules")
+             else "beacons" if beaconed else "no beacons", main_machine(t)]
+    if tr.get("machine_modules"):
+        parts.append(tr["machine_modules"])
     if t.metrics.get("input"):
         parts.append(t.metrics["input"])
     if t.metrics.get("products"):
         parts.append(" + ".join(t.metrics["products"]))
+    if tr:
+        parts += [f"pitch {tr['pitch']}", f"poles {tr['poles']}"]
+        parts += [name for name in ("chain", "weaving", "lamps") if tr.get(name)]
     return ", ".join(parts)
 
 
@@ -326,13 +391,26 @@ def mine(min_favorites: int = 10, per_category: int = 8) -> Dict[str, List[Templ
                 continue
             stats[f"candidates {category}"] += 1
             try:
-                template = mine_one(ir, category)
+                template = mine_one(prepare(ir), category)
             except BlueprintIRError:
                 template = None
             if template is None:
                 stats["no_template"] += 1
                 continue
-            check = tiling_check(template)
+            template.belt = main_belt(template.head + template.segment + template.tail)
+            try:
+                check = tiling_check(template)
+                if not check["ok"] and check["power_only"]:
+                    repaired = repair_power(template)
+                    if repaired is not None and tiling_check(repaired)["ok"]:
+                        template, check = repaired, tiling_check(repaired)
+                        stats["power_repaired"] += 1
+            except ValueError:  # BlueprintIRError is handled above; this is retier
+                stats["belt_tier_failed"] += 1
+                continue
+            if not check["ok"] and check["power_only"]:
+                stats["power_failed"] += 1
+                continue
             if not check["ok"]:
                 stats["tiling_failed"] += 1
                 continue
@@ -350,6 +428,7 @@ def mine(min_favorites: int = 10, per_category: int = 8) -> Dict[str, List[Templ
                 template.metrics["products"] = products(ir)
             if category.startswith("smelting_"):
                 template.metrics["input"] = smelting_input(ir, ir.label if path else f"{ir.label} {row['title']}")
+            template.metrics["traits"] = traits(template)
             found.setdefault(category, []).append(template)
     best: Dict[str, List[Template]] = {}
     for cat, ts in sorted(found.items()):
@@ -362,7 +441,15 @@ def mine(min_favorites: int = 10, per_category: int = 8) -> Dict[str, List[Templ
         best[cat] = [t for vs in by_variant.values() for t in vs[:3]][:per_category * 2]
         best[cat].sort(key=lambda t: (variant(t), -score(t)))
     print(f"[*] {dict(stats)}")
+    STATS.parent.mkdir(parents=True, exist_ok=True)
+    STATS.write_text(json.dumps(dict(stats), ensure_ascii=False, indent=1), encoding="utf-8")
     return best
+
+
+def load_catalog(path: Path = CATALOG) -> Dict[str, List[Template]]:
+    if not path.exists():
+        return {}
+    return {cat: [Template.from_json(d) for d in ts] for cat, ts in json.loads(path.read_text(encoding="utf-8")).items()}
 
 
 CATEGORY_NAMES = {
@@ -376,10 +463,23 @@ CATEGORY_NAMES = {
 }
 
 
+DENSITY_SLACK = 1.15  # a default may use up to 15% more tiles per machine than the densest design
+
+
 def default_template(ts: List[Template]) -> Template:
-    """Default for requests without details: the best-ranked design without beacons (beacons are late game)."""
-    plain = [t for t in ts if not (t.metrics.get("beacons_per_machine") or 0)]
-    return max(plain or ts, key=score)
+    """
+    Default for requests without details: among designs without beacons (beacons are late game),
+    those within DENSITY_SLACK of the densest by tiles per machine; among them the best-ranked
+    (popularity, 2.0 bonus). Popularity alone picked layouts that waste rows on poles.
+    """
+    plain = [t for t in ts if not (t.metrics.get("beacons_per_machine") or 0)] or ts
+
+    def tiles(t: Template) -> float:
+        return t.metrics.get("tiles_per_machine") or math.inf
+
+    densest = min(map(tiles, plain))
+    dense = [t for t in plain if tiles(t) <= DENSITY_SLACK * densest] if densest < math.inf else plain
+    return max(dense, key=score)
 
 
 def _describe(t: Template) -> str:
@@ -393,19 +493,44 @@ def _describe(t: Template) -> str:
             f"ленты: {m['belt_tier'] or '—'}; источник: `{s['key']}` / `{s['book_path'] or '-'}`")
 
 
-def write_outputs(best: Dict[str, List[Template]]) -> None:
+def _name(t: Template) -> str:
+    return (t.source.get("label") or t.source.get("title") or "").replace("|", "/").strip()[:60]
+
+
+def _changes(best: Dict[str, List[Template]], previous: Dict[str, List[Template]]) -> List[str]:
+    """'Before -> after' table per category: template counts and the default design."""
+    lines = ["## Что изменилось по сравнению с прошлым каталогом", "",
+             "| Категория | Шаблонов было | Стало | Умолчание было | Умолчание стало |", "| --- | --- | --- | --- | --- |"]
+    for cat in sorted(set(best) | set(previous), key=lambda c: CATEGORY_NAMES.get(c, c)):
+        old, new = previous.get(cat, []), best.get(cat, [])
+        before = f"«{_name(default_template(old))}»" if old else "—"
+        after = f"«{_name(default_template(new))}»" if new else "—"
+        lines.append(f"| {CATEGORY_NAMES.get(cat, cat)} | {len(old)} | {len(new)} | {before} | {after} |")
+    return lines + [""]
+
+
+def write_outputs(best: Dict[str, List[Template]], previous: Optional[Dict[str, List[Template]]] = None,
+                  stats: Optional[Dict[str, int]] = None) -> None:
     CATALOG.parent.mkdir(parents=True, exist_ok=True)
     REPORT.parent.mkdir(parents=True, exist_ok=True)
     CATALOG.write_text(json.dumps({cat: [t.to_json() for t in ts] for cat, ts in best.items()}, ensure_ascii=False),
                        encoding="utf-8")
     lines = ["# Каталог шаблонов из чертежей игроков", "",
-             "Сгенерировано `template_miner.py`. Для каждой категории — шаблон по умолчанию (лучший по рейтингу "
-             "вариант без маяков: популярность, бонус за версию 2.0, плотность) и альтернативы по вариантам. "
-             "Все шаблоны проверены: сборки из 1, 2 и 5 сегментов проходят валидатор без новых ошибок и предупреждений.", ""]
+             "Сгенерировано `template_miner.py`. Для каждой категории — шаблон по умолчанию и альтернативы по вариантам. "
+             "Умолчание: среди вариантов без маяков — не больше чем на 15% хуже самого плотного по тайлам на машину, "
+             "из них лучший по рейтингу (популярность, бонус за версию 2.0).", "",
+             "Как готовятся шаблоны: категория — по конечному продукту (моллы исключены); окружение автора обрезано "
+             "(врезки в шину, радары, авторские метки); все ленты одного уровня, пары подземок и переплетение сохраняются; "
+             "лампы — необязательный слой; сетка привязки своя (период × высота сегмента). Проверка: сборки из 1, 2 и 5 "
+             "сегментов без ошибок валидатора и без новых предупреждений, питание строгое (без островов столбов и "
+             "незапитанных машин, даже если так было у автора; при необходимости столбы сегмента расставлены заново).", ""]
+    if previous:
+        lines += _changes(best, previous)
     for cat, ts in best.items():
         top = default_template(ts)
         lines += [f"## {CATEGORY_NAMES.get(cat, cat)}", "", f"**По умолчанию ({variant(top)}).** {_describe(top)}", "",
-                  "```", ascii_map(top.build(max(2, top.repeats) if top.metrics['kind'] == 'segment' else 1)), "```", ""]
+                  "```", ascii_map(labelled(top, top.build(max(2, top.repeats) if top.metrics['kind'] == 'segment' else 1,
+                                                           lamps=True))), "```", ""]
         others: Dict[str, Template] = {}
         for t in sorted(ts, key=score, reverse=True):
             if t is not top:
@@ -420,6 +545,9 @@ def write_outputs(best: Dict[str, List[Template]]) -> None:
               "сборщик кабеля/зелёных/красных схем/шестерён, прочие сборщики — первая буква имени, `L` лаборатория, "
               "`D` бур, `S`/`A` панель/аккумулятор, `O` котёл, `E` паровой двигатель, `W` насос, `#` маяк, "
               "`c` метка-комбинатор, `*` лампа, `|`/`!` труба/подземная труба.", ""]
+    if stats:
+        lines += ["## Статистика отбора", "", "| Счётчик | Значение |", "| --- | --- |"]
+        lines += [f"| {k} | {v} |" for k, v in sorted(stats.items())] + [""]
     REPORT.write_text("\n".join(lines), encoding="utf-8")
     print(f"[*] Catalog: {CATALOG}; report: {REPORT}")
 
@@ -437,8 +565,17 @@ def blueprint_string(ir: IRBlueprint, label: str) -> str:
     return bp.to_string()
 
 
+def labelled(t: Template, ir: IRBlueprint) -> IRBlueprint:
+    """The build with input / output labels from recipe data (furnaces: iron ore or, for steel, iron plates)."""
+    return add_port_labels(ir, smelt="iron-plate" if t.metrics.get("input") == "steel" else "iron-ore")
+
+
 def write_book(best: Dict[str, List[Template]], path: Path = Path("outputs/templates/catalog_book.txt")) -> None:
-    """One blueprint book to import in game: a sub-book per category, the default first."""
+    """
+    One blueprint book to import in game: a sub-book per category, the default first. Every design
+    is built with 3 segments, lamps (if the author had them) and new port labels; the default also
+    comes as a single segment on its own grid, to check tiling in game.
+    """
     from draftsman.blueprintable import BlueprintBook, get_blueprintable_from_string
 
     book = BlueprintBook()
@@ -451,10 +588,14 @@ def write_book(best: Dict[str, List[Template]], path: Path = Path("outputs/templ
             segments = 3 if t.metrics["kind"] == "segment" else 1
             name = (t.source.get("label") or t.source.get("title") or "").strip()
             label = f"{'DEFAULT ' if t is top else ''}{variant(t)} | {name}"
-            try:
-                sub.blueprints.append(get_blueprintable_from_string(blueprint_string(t.build(segments), label)))
-            except Exception as e:  # a template that cannot be rebuilt is reported, not hidden
-                print(f"    [!] {cat}: {name[:40]}: {type(e).__name__}: {e}")
+            builds = [(label, lambda t=t, n=segments: labelled(t, t.build(n, lamps=True)))]
+            if t is top:
+                builds.append((f"SEGMENT {t.snap[0]}x{t.snap[1]} | {name}", t.build_segment))
+            for text, build in builds:
+                try:
+                    sub.blueprints.append(get_blueprintable_from_string(blueprint_string(build(), text)))
+                except Exception as e:  # a template that cannot be rebuilt is reported, not hidden
+                    print(f"    [!] {cat}: {name[:40]}: {type(e).__name__}: {e}")
         book.blueprints.append(sub)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(book.to_string(), encoding="utf-8")
@@ -465,9 +606,15 @@ def main():
     parser = argparse.ArgumentParser(description="Mine tileable layout templates from popular blueprints")
     parser.add_argument("--min-favorites", type=int, default=10)
     parser.add_argument("--per-category", type=int, default=8)
+    parser.add_argument("--report-only", action="store_true",
+                        help="Rewrite the report and the book from the existing catalog (no mining)")
+    parser.add_argument("--previous", type=Path, default=None,
+                        help="Catalog to compare with (default: the catalog being replaced)")
     args = parser.parse_args()
-    best = mine(args.min_favorites, args.per_category)
-    write_outputs(best)
+    previous = load_catalog(args.previous) if args.previous else ({} if args.report_only else load_catalog())
+    best = load_catalog() if args.report_only else mine(args.min_favorites, args.per_category)
+    stats = json.loads(STATS.read_text(encoding="utf-8")) if STATS.exists() else None
+    write_outputs(best, previous, stats)
     write_book(best)
 
 
