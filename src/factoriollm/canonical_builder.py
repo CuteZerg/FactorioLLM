@@ -110,7 +110,8 @@ def collect_candidates(
                 stats["not_allowed" if "not allowed" in msg else "unknown_entity" if "unknown entity" in msg
                       else "unknown_recipe" if "unknown recipe" in msg else "not_vanilla_recipe" if "base game" in msg
                       else "circuit_logic" if "circuit-wired" in msg
-                      else "label_signal" if "label signal" in msg else "invalid_geometry"] += 1
+                      else "label_signal" if "label signal" in msg
+                      else "modules_or_requests" if "module" in msg or "request" in msg else "invalid_geometry"] += 1
                 continue
 
             code = lift_ir_to_code(ir)

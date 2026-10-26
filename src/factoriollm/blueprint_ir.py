@@ -89,8 +89,19 @@ LEGACY_RENAMES = {
 }
 
 # Entity attributes carried into the IR (and into generated code). Everything else
-# (modules, wires, inserter filters, quality, tags) is dropped.
-EXTRA_KEYS = ("recipe", "io_type", "input_priority", "output_priority", "filter", "signals", "text", "icon")
+# (wires, inserter filters, fuel requests, quality, tags) is dropped.
+EXTRA_KEYS = ("recipe", "io_type", "input_priority", "output_priority", "filter", "signals", "text", "icon",
+              "modules", "requests", "request_from_buffers", "trash_not_requested")
+
+# Base-game modules (quality modules come with the Quality DLC).
+MODULE_ITEMS = frozenset(f"{kind}-module{suffix}" for kind in ("speed", "productivity", "efficiency")
+                         for suffix in ("", "-2", "-3"))
+# Logistic chests whose request (or storage) filters are kept.
+REQUEST_ENTITIES = frozenset({"requester-chest", "buffer-chest", "storage-chest"})
+# Base-game items that no recipe produces.
+RAW_ITEMS = frozenset({"iron-ore", "copper-ore", "stone", "coal", "uranium-ore", "wood", "raw-fish",
+                       "depleted-uranium-fuel-cell", "space-science-pack",
+                       "blueprint", "blueprint-book", "deconstruction-planner", "upgrade-planner"})
 
 # Types whose direction is cosmetic: never emitted, never rotated.
 _NON_DIRECTIONAL_TYPES = frozenset({"furnace"})
@@ -260,7 +271,18 @@ def _clean_text(value: Any) -> str:
 
 
 # Item / signal renames of 2.0 that are not entity renames.
-LEGACY_SIGNAL_RENAMES = {"used-up-uranium-fuel-cell": "depleted-uranium-fuel-cell"}
+LEGACY_SIGNAL_RENAMES = {
+    "used-up-uranium-fuel-cell": "depleted-uranium-fuel-cell",
+    "effectivity-module": "efficiency-module",
+    "effectivity-module-2": "efficiency-module-2",
+    "effectivity-module-3": "efficiency-module-3",
+    "empty-barrel": "barrel",
+    "raw-wood": "wood",
+    "science-pack-1": "automation-science-pack",
+    "science-pack-2": "logistic-science-pack",
+    "science-pack-3": "chemical-science-pack",
+    "high-tech-science-pack": "utility-science-pack",
+}
 
 
 @lru_cache(maxsize=None)
@@ -298,8 +320,121 @@ def _label_signals(raw: Dict[str, Any]) -> str:
     return ";".join(f"{sid}={count}" for _, _, sid, count in sorted(found))
 
 
+@lru_cache(maxsize=None)
+def _base_game_item(name: str) -> bool:
+    """Whether an item exists in the base game: a product of a base-game recipe or a raw item."""
+    if name in RAW_ITEMS:
+        return True
+    from draftsman.data import recipes
+    for recipe in VANILLA_RECIPES:
+        data = recipes.raw.get(recipe) or {}
+        if any(isinstance(r, dict) and r.get("name") == name for r in data.get("results") or []):
+            return True
+    return False
+
+
+@lru_cache(maxsize=None)
+def _module_inventory(name: str) -> int:
+    """Inventory id of the entity's module slots in 2.0 item requests (as draftsman writes it)."""
+    from draftsman.entity import new_entity
+    ent = new_entity(name, tile_position=(0, 0))
+    ent.request_modules("speed-module", 0)
+    return int(ent.to_dict()["items"][0]["items"]["in_inventory"][0]["inventory"])
+
+
+def _item_name(name: Any) -> str:
+    name = str(name or "")
+    return LEGACY_SIGNAL_RENAMES.get(name, LEGACY_RENAMES.get(name, name))
+
+
+def _modules(raw: Dict[str, Any], name: str) -> str:
+    """
+    Module requests as 'name=count;...' (sorted). Formats: 0.x [{item, count}], 0.x/1.x
+    {name: count}, 2.0 [{id: {name, quality}, items: {in_inventory: [...]}}]. Other requested items
+    (fuel, ammunition, ingredients) are dropped; quality modules, quality levels and more modules
+    than the entity has slots are rejected.
+    """
+    items = raw.get("items")
+    found: Dict[str, int] = {}
+    if isinstance(items, dict):
+        pairs = [(k, v) for k, v in items.items()]
+    elif isinstance(items, list):
+        pairs = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            if "item" in it:  # 0.x
+                pairs.append((it["item"], it.get("count", 1)))
+                continue
+            ident = it.get("id") or {}
+            if "-module" not in _item_name(ident.get("name")):
+                continue
+            if ident.get("quality") not in (None, "normal"):
+                raise BlueprintIRError(f"module of quality '{ident['quality']}'")
+            stacks = (it.get("items") or {}).get("in_inventory") or []
+            slots = [s for s in stacks if isinstance(s, dict) and s.get("inventory") == _module_inventory(name)]
+            pairs.append((ident.get("name"), sum(int(s.get("count", 1)) for s in slots)))
+    else:
+        return ""
+    for item, count in pairs:
+        item = _item_name(item)
+        if "-module" not in item or not int(count):
+            continue  # fuel and other non-module requests
+        if item not in MODULE_ITEMS:
+            raise BlueprintIRError(f"module '{item}' is not in the base game")
+        found[item] = found.get(item, 0) + int(count)
+    if not found:
+        return ""
+    slots = int((_prototype(name) or {}).get("module_slots") or 0)
+    if sum(found.values()) > slots:
+        raise BlueprintIRError(f"{sum(found.values())} modules in '{name}' with {slots} slots")
+    return ";".join(f"{item}={count}" for item, count in sorted(found.items()))
+
+
+def _requests(raw: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Logistic request (or storage) filters as {'requests': 'name=count;...'} in slot order, plus the
+    request_from_buffers / trash_not_requested flags. Formats: 0.x/1.x [{index, name, count}] with
+    request_from_buffers on the entity, 2.0 {sections: [{index, filters: [...]}], flags}. Sections
+    are merged into one; inactive sections are skipped.
+    """
+    rf = raw.get("request_filters")
+    found: List[Tuple[int, int, str, int]] = []
+    flags = {"request_from_buffers": bool(raw.get("request_from_buffers")), "trash_not_requested": False}
+    if isinstance(rf, list):
+        filters = [(0, f) for f in rf if isinstance(f, dict)]
+    elif isinstance(rf, dict):
+        filters = [(int(s.get("index", 0)), f) for s in rf.get("sections") or []
+                   if isinstance(s, dict) and s.get("active", True) for f in s.get("filters") or [] if isinstance(f, dict)]
+        flags["request_from_buffers"] |= bool(rf.get("request_from_buffers"))
+        flags["trash_not_requested"] = bool(rf.get("trash_not_requested"))
+    else:
+        filters = []
+    for section, f in filters:
+        if not f.get("name"):
+            continue
+        if f.get("quality") not in (None, "normal") or f.get("type") not in (None, "item"):
+            raise BlueprintIRError(f"logistic request {f.get('type')}:{f.get('name')} of quality {f.get('quality')}")
+        item = _item_name(f["name"])
+        if not _base_game_item(item):
+            raise BlueprintIRError(f"requested item '{item}' is not in the base game")
+        found.append((section, int(f.get("index", 0)), item, int(f.get("count", 0))))
+    items = [item for _, _, item, _ in sorted(found)]
+    if len(set(items)) != len(items):
+        raise BlueprintIRError("the same item is requested in several slots")
+    out = {k: "true" for k, v in flags.items() if v}
+    if found:
+        out["requests"] = ";".join(f"{item}={count}" for _, _, item, count in sorted(found))
+    return out
+
+
 def _convert_extras(raw: Dict[str, Any], name: str = "") -> Tuple[Tuple[str, str], ...]:
     extras: Dict[str, str] = {}
+    modules = _modules(raw, name) if (_prototype(name) or {}).get("module_slots") else ""
+    if modules:
+        extras["modules"] = modules
+    if name in REQUEST_ENTITIES:
+        extras.update(_requests(raw))
     if name == "rocket-silo":
         raw = {k: v for k, v in raw.items() if k != "recipe"}  # its only recipe; draftsman does not export it
     if name == "constant-combinator":
@@ -332,7 +467,7 @@ def _convert_extras(raw: Dict[str, Any], name: str = "") -> Tuple[Tuple[str, str
             raise BlueprintIRError(f"unknown filter item '{flt}'")
         extras["filter"] = flt
     for key, value in extras.items():
-        allowed = "-_:;=" if key in ("signals", "icon") else "-_"
+        allowed = "-_:;=" if key in ("signals", "icon", "modules", "requests") else "-_"
         if key != "text" and not all(ch.isalnum() or ch in allowed for ch in value):  # text: free, emitted via repr
             raise BlueprintIRError(f"suspicious value for {key}: {value!r}")
     return tuple(sorted(extras.items()))
@@ -517,6 +652,7 @@ def extract_facts(ir: IRBlueprint) -> Dict[str, Any]:
     """Programmatic facts about a blueprint, used to ground generated prompts."""
     counts: Dict[str, int] = {}
     recipes: Dict[str, int] = {}
+    modules: Dict[str, int] = {}
     belt_dirs: Dict[str, int] = {}
     tiers: Dict[str, int] = {}
     for e in ir.entities:
@@ -524,6 +660,9 @@ def extract_facts(ir: IRBlueprint) -> Dict[str, Any]:
         recipe = e.extras_dict.get("recipe")
         if recipe:
             recipes[recipe] = recipes.get(recipe, 0) + 1
+        for part in filter(None, (e.extras_dict.get("modules") or "").split(";")):
+            module, n = part.split("=")
+            modules[module] = modules.get(module, 0) + int(n)
         if e.name in BELT_TIERS:
             tiers[BELT_TIERS[e.name]] = tiers.get(BELT_TIERS[e.name], 0) + 1
         if entity_type(e.name) == "transport-belt":
@@ -547,6 +686,7 @@ def extract_facts(ir: IRBlueprint) -> Dict[str, Any]:
         "entity_counts": dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))),
         "type_counts": dict(sorted(by_type.items(), key=lambda kv: (-kv[1], kv[0]))),
         "recipes": recipes,
+        "modules": modules,
         "belt_tiers": tiers,
         "main_belt_direction": max(belt_dirs, key=belt_dirs.get) if belt_dirs else None,
         "width": width,

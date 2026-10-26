@@ -78,18 +78,51 @@ def _check_entity_name(name: str) -> None:
         raise ValueError(f"Unknown entity name '{name}'.{hint}")
 
 
+def _apply_modules(ent: Any, modules: Dict[str, int]) -> None:
+    """Fills module slots in order, e.g. {'speed-module-3': 2} or {'productivity-module-3': 4}."""
+    slots = int(_entity_data.raw[ent.name].get("module_slots") or 0)
+    if sum(int(n) for n in modules.values()) > slots:
+        raise ValueError(f"{ent.name} has {slots} module slots, got {sum(modules.values())} modules.")
+    slot = 0
+    for module, count in modules.items():
+        ent.request_modules(str(module), range(slot, slot + int(count)))
+        slot += int(count)
+
+
+def _apply_requests(ent: Any, requests: Dict[str, int]) -> None:
+    """Logistic requests of a requester / buffer chest (or a storage chest filter): {'iron-plate': 200}."""
+    section = ent.add_section()
+    section.index = 0  # draftsman 3.3.1 numbers a new section one too high on export
+    for i, (item, count) in enumerate(requests.items()):
+        section.set_signal(i, str(item), count=int(count))
+
+
 def _instantiate_entity(name_or_class: Any, tile: Tuple[int, int], direction: Optional[int] = None, **kwargs) -> Any:
-    """Instantiates an entity by prototype name (or draftsman class) at a tile position."""
+    """
+    Instantiates an entity by prototype name (or draftsman class) at a tile position.
+    modules={'speed-module-3': 2} fills module slots; requests={'iron-plate': 200} sets logistic
+    requests; request_from_buffers / trash_not_requested are logistic chest flags.
+    """
+    modules = kwargs.pop("modules", None)
+    requests = kwargs.pop("requests", None)
+    flags = {k: kwargs.pop(k) for k in ("request_from_buffers", "trash_not_requested") if k in kwargs}
     call_kwargs = dict(tile_position=tile, **kwargs)
     if direction:
         call_kwargs["direction"] = direction
 
     if isinstance(name_or_class, type):
-        return name_or_class(**call_kwargs)
-
-    name = str(name_or_class).strip()
-    _check_entity_name(name)
-    return new_entity(name, **call_kwargs)
+        ent = name_or_class(**call_kwargs)
+    else:
+        name = str(name_or_class).strip()
+        _check_entity_name(name)
+        ent = new_entity(name, **call_kwargs)
+    if modules:
+        _apply_modules(ent, modules)
+    if requests:
+        _apply_requests(ent, requests)
+    for key, value in flags.items():
+        setattr(ent, key, bool(value))
+    return ent
 
 
 def _entity_tiles(ent: Any) -> List[Tuple[int, int]]:
@@ -188,6 +221,22 @@ def add_entity_row(
     guard = _PlacementGuard(bp)
     for i in range(int(count)):
         guard.append(_instantiate_entity(entity, (sx + i * dx, sy + i * dy), direction=dir_int, **kwargs))
+
+
+def add_entity(
+    bp: Any,
+    entity: Any,
+    tile: Union[Tuple[int, int], Dict[str, int]],
+    direction: Union[int, str, Direction, None] = None,
+    **kwargs,
+) -> None:
+    """
+    Appends one entity at a tile, e.g. a beacon with modules or a requester chest with requests:
+    add_entity(bp, 'beacon', (3, 0), modules={'speed-module-3': 2})
+    add_entity(bp, 'requester-chest', (0, 2), requests={'iron-plate': 200, 'copper-cable': 400})
+    """
+    dir_int = resolve_direction(direction) if direction is not None else None
+    _PlacementGuard(bp).append(_instantiate_entity(entity, _resolve_tile(tile), direction=dir_int, **kwargs))
 
 
 def add_power_poles(

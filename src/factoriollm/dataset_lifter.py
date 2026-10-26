@@ -26,8 +26,10 @@ from factoriollm.blueprint_ir import (
 from factoriollm.blueprint_ir import _prototype  # prototype lookup for underground reach
 
 
-HELPER_NAMES = ("add_belt_line", "add_underground_pair", "add_entity_row", "add_power_poles",
+HELPER_NAMES = ("add_belt_line", "add_underground_pair", "add_entity_row", "add_entity", "add_power_poles",
                 "add_signal_label", "add_display_panel")
+# Extras that only our helpers understand (draftsman's own bp.entities.append does not).
+HELPER_ONLY_EXTRAS = frozenset({"modules", "requests", "request_from_buffers", "trash_not_requested"})
 
 MIN_RUN = 3          # minimal belt line / entity row length worth a macro
 MIN_LOOP_GROUP = 3   # minimal number of same-kind calls worth a for-loop
@@ -62,8 +64,18 @@ def find_arithmetic_runs(values: List[int], min_len: int = MIN_RUN) -> List[Tupl
     return runs
 
 
+def _kwarg_value(key: str, value: str) -> str:
+    """Python literal of an IR extra: dicts for modules / requests, booleans for logistic flags."""
+    if key in ("modules", "requests"):
+        pairs = (part.rsplit("=", 1) for part in value.split(";"))
+        return "{" + ", ".join(f"{name!r}: {int(count)}" for name, count in pairs) + "}"
+    if key in ("request_from_buffers", "trash_not_requested"):
+        return "True"
+    return repr(value)
+
+
 def _kwargs_str(extras: Tuple[Tuple[str, str], ...]) -> str:
-    return "".join(f", {k}={v!r}" for k, v in extras)
+    return "".join(f", {k}={_kwarg_value(k, v)}" for k, v in extras)
 
 
 def _tile(x: int, y: int) -> str:
@@ -255,6 +267,17 @@ def lift_ir_to_code(ir: IRBlueprint, use_macros: bool = True) -> str:
     if singles:
         lines.append("# Individual entities")
         for (name, _, extras), group in sorted(singles.items(), key=lambda kv: (kv[1][0].y, kv[1][0].x, kv[0][0])):
+            if HELPER_ONLY_EXTRAS & set(dict(extras)):
+                helpers.add("add_entity")
+                e = group[0]
+                dir_kw = f", direction={direction_name(e.direction)!r}" if e.directional and e.direction else ""
+                tail = f"{dir_kw}{_kwargs_str(extras)})"
+                if use_macros and len(group) >= MIN_LOOP_GROUP:
+                    lines.append(f"for tile in [{', '.join(_tile(g.x, g.y) for g in group)}]:")
+                    lines.append(f"    add_entity(bp, {name!r}, tile{tail}")
+                else:
+                    lines += [f"add_entity(bp, {name!r}, {_tile(g.x, g.y)}{tail}" for g in group]
+                continue
             tail = f"{_direction_arg(group[0])}{_kwargs_str(extras)}"
             if use_macros and len(group) >= MIN_LOOP_GROUP:
                 specs = ", ".join(_tile(e.x, e.y) for e in group)
