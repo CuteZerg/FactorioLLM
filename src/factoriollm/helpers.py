@@ -101,10 +101,13 @@ def _instantiate_entity(name_or_class: Any, tile: Tuple[int, int], direction: Op
     """
     Instantiates an entity by prototype name (or draftsman class) at a tile position.
     modules={'speed-module-3': 2} fills module slots; requests={'iron-plate': 200} sets logistic
-    requests; request_from_buffers / trash_not_requested are logistic chest flags.
+    requests; request_from_buffers / trash_not_requested are logistic chest flags; filters=['coal']
+    (filter_mode='blacklist') sets inserter item filters.
     """
     modules = kwargs.pop("modules", None)
     requests = kwargs.pop("requests", None)
+    filters = kwargs.pop("filters", None)
+    filter_mode = kwargs.pop("filter_mode", None)
     flags = {k: kwargs.pop(k) for k in ("request_from_buffers", "trash_not_requested") if k in kwargs}
     call_kwargs = dict(tile_position=tile, **kwargs)
     if direction:
@@ -120,6 +123,12 @@ def _instantiate_entity(name_or_class: Any, tile: Tuple[int, int], direction: Op
         _apply_modules(ent, modules)
     if requests:
         _apply_requests(ent, requests)
+    if filters:
+        ent.use_filters = True
+        for slot, item in enumerate(filters):  # set_item_filter numbers slots as the game does
+            ent.set_item_filter(slot, item)
+        if filter_mode:
+            ent.filter_mode = filter_mode
     for key, value in flags.items():
         setattr(ent, key, bool(value))
     return ent

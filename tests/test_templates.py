@@ -160,6 +160,32 @@ class TestSelfContained(unittest.TestCase):
         self.assertTrue(any("electronic-circuit" in s and "signal-" in s for s in signals), signals)
         self.assertTrue(any("processing-unit" in s and "signal-" in s for s in signals), signals)
 
+    def test_underground_across_the_line_does_not_block(self):
+        north = [IREntity("underground-belt", 0, 5, 0), IREntity("underground-belt", 0, 1, 0, OUT),
+                 IREntity("underground-belt", 0, 3, 4)]  # a crossing line goes underground there
+        self.assertEqual(underground_pairs(north), {0: 1})
+
+    def test_strip_unused_keeps_feeds_and_drops_a_passing_bus(self):
+        from factoriollm.templates import strip_unused
+        gear = IREntity("assembling-machine-1", 0, 2, 0, (("recipe", "iron-gear-wheel"),))
+        feed = [IREntity("transport-belt", x, 0, 4) for x in range(4)] + [IREntity("inserter", 1, 1, 0)]
+        second = [IREntity("transport-belt", x, 6, 12) for x in range(4)] + [IREntity("inserter", 1, 5, 8)]
+        bus = [IREntity("transport-belt", x, -2, 4) for x in range(4)]
+        kept = strip_unused(IRBlueprint([gear] + feed + second + bus)).entities
+        self.assertEqual(sum(e.y == -2 for e in kept), 0)  # nobody takes from the passing bus
+        self.assertEqual(sum(e.y == 6 and "belt" in e.name for e in kept), 4)  # a second feed is not spare
+
+    def test_recipe_modules_only_where_they_fit(self):
+        from factoriollm.templates import normalize_modules
+        def am(name, x, r, modules):
+            return IREntity(name, x, 0, 0, (("modules", modules), ("recipe", r)) if modules else (("recipe", r),))
+        ents = [am("assembling-machine-3", 3 * i, "electronic-circuit", "speed-module-3=4") for i in range(3)] + \
+            [am("assembling-machine-3", 9, "iron-gear-wheel", "productivity-module-3=4"),
+             am("assembling-machine-2", 12, "iron-gear-wheel", "")]
+        t = normalize_modules(Template("multi", 15, [], ents, [], 1))
+        am2 = next(e for e in t.segment if e.name == "assembling-machine-2")
+        self.assertNotIn("modules", am2.extras_dict)  # 4 modules do not fit its 2 slots
+
     def test_feeder_poles_are_pruned(self):
         lab = IREntity("lab", 0, 0)
         near = IREntity("medium-electric-pole", 3, 1)

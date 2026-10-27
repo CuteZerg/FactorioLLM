@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from factoriollm.blueprint_ir import (
     BlueprintIRError,
     IRBlueprint,
+    IREntity,
     decode_blueprint_string,
     entity_type,
     footprint,
@@ -95,7 +96,7 @@ MIN_PURITY = 0.6
 # (a pump station with a few panels is not a solar field).
 AREA_PURITY = {"nuclear": 0.4, "steam": 0.5, "solar": 0.5, "mining": 0.5, "defense": 0.5}
 AREA_FAMILIES = {**FAMILIES, "mining": {"electric-mining-drill", "beacon"}}  # beaconed mining is still mining
-FAMILY_CATEGORIES = ("assembly_1in", "assembly_2in", "assembly_3in", "assembly_fluid", "chemistry", "oil")
+FAMILY_CATEGORIES = ("assembly_1in", "assembly_2in", "assembly_3in", "assembly_fluid", "chemistry", "oil", "uranium")
 TURRET_KINDS = {"gun-turret": "gun", "laser-turret": "laser", "flamethrower-turret": "flame", "artillery-turret": "artillery"}
 
 
@@ -129,10 +130,12 @@ def recipe_family(product: str) -> Optional[str]:
         r = recipe(name)
         if r is None:
             continue
-        if r.category in ("chemistry", "chemistry-or-cryogenics"):
+        if r.category == "chemistry":
             return "chemistry"
         if r.category == "oil-processing":
             return "oil"
+        if r.category == "centrifuging":
+            return "uranium"
         if r.fluids & set(r.ingredients):
             return "assembly_fluid"
         solid = len(set(r.ingredients) - r.fluids)
@@ -148,7 +151,8 @@ def _producers(product: str) -> List[str]:
 def _category(names: Counter, ir: IRBlueprint) -> Optional[str]:
     furnaces = {k: names[k] for k in FURNACES}
     turrets = sum(n for name, n in names.items() if name in DEFENSE and name.endswith("turret"))
-    if (turrets or names["stone-wall"] >= 8) and area_share(ir, DEFENSE) >= AREA_PURITY["defense"]             and area_share(ir, PRODUCTION) <= 0.1:  # not a production block behind its walls
+    if (turrets or names["stone-wall"] >= 8) and area_share(ir, DEFENSE) >= AREA_PURITY["defense"] \
+            and area_share(ir, PRODUCTION) <= 0.1:  # not a production block behind its walls
         return "defense"
     if names["nuclear-reactor"]:
         return "nuclear"
@@ -201,6 +205,16 @@ def main_machine(t: Template) -> str:
 
 def _belts_along_x(t: Template) -> int:
     return sum(1 for e in t.segment if e.name.endswith("transport-belt") and e.direction in (4, 12))
+
+
+def _docking_cell(ir: IRBlueprint, category: str, step: Tuple[int, int]) -> Template:
+    """A design that docks with its copies `step` apart, as a cell repeated along x at that pitch."""
+    relative = IRBlueprint(ir.entities, ir.label, ir.version, ir.book_path, ir.snap)  # a cell keeps no world grid
+    oriented = relative if step[0] else rotated(relative, 1)
+    template = extract_cell(oriented, category)
+    template.period = step[0] or step[1]
+    template.snap = (template.period, template.snap[1])
+    return template
 
 
 def mine_one(ir: IRBlueprint, category: str) -> Optional[Template]:
@@ -449,6 +463,42 @@ def run_flow(ir: IRBlueprint, hints: Optional[Dict] = None, first: str = "iron-o
 REASON_ORDER = ("starved", "clog", "output_mixed", "fluid_mix", "no_output", "dangling_inserter")
 
 
+def copies(ir: IRBlueprint, step: Tuple[int, int], n: int = 3) -> Optional[IRBlueprint]:
+    """n copies of a design `step` tiles apart (copies may share identical entities); None if they collide."""
+    placed: Dict[IREntity, None] = {}
+    occupied: Dict[Tuple[int, int], IREntity] = {}
+    for k in range(n):
+        for e in ir.entities:
+            c = IREntity(e.name, e.x + k * step[0], e.y + k * step[1], e.direction, e.extras)
+            if c in placed:
+                continue
+            w, h = footprint(c.name, c.direction)
+            for t in ((c.x + dx, c.y + dy) for dx in range(w) for dy in range(h)):
+                if occupied.setdefault(t, c) != c:
+                    return None
+            placed[c] = None
+    return ir.with_entities(list(placed))
+
+
+def middle_flow(ir: IRBlueprint, step: Tuple[int, int], hints: Optional[Dict] = None,
+                first: str = "iron-ore") -> Optional[Tuple[FlowResult, str]]:
+    """
+    The verdict for a design made to dock with copies of itself (its grid says how far apart): three
+    copies, and only the problems of the middle one count - the outer copies miss their own outer
+    neighbours. None if copies placed that way collide.
+    """
+    tiled = copies(ir, step)
+    if tiled is None:
+        return None
+    result, smelt = run_flow(tiled, hints, first)
+    axis = 0 if step[0] else 1
+    lo = min((e.x, e.y)[axis] for e in ir.entities) + step[axis]
+    middle = [p for p in result.problems if lo <= p.position[axis] < lo + step[axis]]
+    kept = FlowResult(middle, result.lanes, result.machines, result.working, result.ports, result.inputs,
+                      "ok" if not middle else result.status, result.score, result.fluids)
+    return kept, smelt
+
+
 def reason(result: FlowResult) -> str:
     """Why a design does not work: the search ran out, or its root problem (REASON_ORDER)."""
     if result.status == "inputs_ambiguous":
@@ -475,15 +525,20 @@ def _parse_reason(message: str) -> str:
 
 
 class Rejects:
-    """A few rejected designs per reason (reservoir sample), for the in-game rejects book."""
+    """
+    A few rejected designs per reason (reservoir sample), for the in-game rejects book. Workers send
+    only a reference to the design (row key, book path, category); resolve() rebuilds the blueprint
+    of the sampled ones.
+    """
 
     def __init__(self, per_reason: int = REJECTS_PER_REASON, seed: int = 7):
         import random
         self.per_reason, self.random = per_reason, random.Random(seed)
         self.seen: Counter = Counter()
-        self.kept: Dict[str, List[Tuple[str, IRBlueprint, FlowResult]]] = {}
+        self.kept: Dict[str, List[Tuple[str, Any, FlowResult]]] = {}  # (name, IR or reference, result)
+        self.ref: Any = None  # what add() files the next rejection under (set per design)
 
-    def add(self, why: str, name: str, ir: IRBlueprint, result: FlowResult) -> None:
+    def add(self, why: str, name: str, ir: Any, result: FlowResult) -> None:
         self.seen[why] += 1
         bucket = self.kept.setdefault(why, [])
         if len(bucket) < self.per_reason:
@@ -492,6 +547,25 @@ class Rejects:
             k = self.random.randrange(self.seen[why])
             if k < self.per_reason:
                 bucket[k] = (name, ir, result)
+
+    def resolve(self, rows: Dict[str, Dict[str, Any]]) -> None:
+        """Rebuilds the blueprint of each sampled rejection from its reference (see _Collected)."""
+        for why, bucket in self.kept.items():
+            for n, (name, ref, result) in enumerate(bucket):
+                if isinstance(ref, tuple):
+                    bucket[n] = (name, _rejected_design(rows[ref[0]], ref[1], ref[2], why), result)
+
+
+def _rejected_design(row: Dict[str, Any], path: str, category: str, why: str) -> IRBlueprint:
+    """The blueprint a rejection was about: the author's design, or the template build that failed."""
+    bp, version = next((bp, v) for p, bp, v in iter_blueprints(decode_blueprint_string(row["blueprint_string"]))
+                       if p == path)
+    ir = parse_blueprint_dict(bp, version=version, book_path=path)
+    if why.startswith("author:"):
+        return prepare(ir, margin=None, keep_defense=category == "defense")
+    capture = Rejects()
+    _mine_design(ir, category, "", Counter(), capture)  # deterministic: fails the same way again
+    return next(ir for bucket in capture.kept.values() for _, ir, _ in bucket)
 
 
 MAX_WALL_THICKNESS = 20  # rows of wall (staggered rows and gaps included)
@@ -534,13 +608,15 @@ def is_simple(t: Template) -> bool:
 
 
 class _Collected:
-    """Rejections of one worker, light enough to send back (the problems, not the whole simulation)."""
+    """Rejections of one worker, light to send back: a reference to the design and its first problems."""
 
     def __init__(self):
-        self.items: List[Tuple[str, str, IRBlueprint, FlowResult]] = []
+        self.items: List[Tuple[str, str, Tuple[str, str, str], FlowResult]] = []
+        self.ref: Tuple[str, str, str] = ("", "", "")
 
     def add(self, why: str, name: str, ir: IRBlueprint, result: FlowResult) -> None:
-        self.items.append((why, name, ir, FlowResult(result.problems[:3], {}, {}, frozenset(), [], status=result.status)))
+        self.items.append((why, name, self.ref,
+                           FlowResult(result.problems[:3], {}, {}, frozenset(), [], status=result.status)))
 
 
 def _mine_row(job: Tuple[Dict[str, Any], Optional[set]]) -> Tuple[Counter, list, List[Tuple[str, Template]]]:
@@ -575,6 +651,7 @@ def _mine_row(job: Tuple[Dict[str, Any], Optional[set]]) -> Tuple[Counter, list,
             continue
         stats[f"candidates {category}"] += 1
         name = (ir.label or row["title"] or "").strip()
+        rejects.ref = (row["key"], path, category)
         template = _mine_design(ir, category, name, stats, rejects)
         if template is None:
             continue
@@ -612,8 +689,8 @@ def mine(min_favorites: int = 10, per_category: int = 8, only: Optional[set] = N
     def collect(results) -> None:
         for n, (row_stats, row_rejects, row_found) in enumerate(results, 1):
             stats.update(row_stats)
-            for why, name, ir, result in row_rejects:
-                rejects.add(why, name, ir, result)
+            for why, name, ref, result in row_rejects:
+                rejects.add(why, name, ref, result)
             for category, template in row_found:
                 found.setdefault(category, []).append(template)
             if n % 1000 == 0:
@@ -625,6 +702,7 @@ def mine(min_favorites: int = 10, per_category: int = 8, only: Optional[set] = N
         with multiprocessing.get_context("spawn").Pool(workers) as pool:
             collect(pool.imap(this._mine_row, jobs, chunksize=1))  # rows differ a lot (whole books)
     print(f"[*] {len(rows)} rows mined in {time.time() - start:.0f} s with {workers} worker(s)")
+    rejects.resolve({row["key"]: row for row in rows})
     best: Dict[str, List[Template]] = {}
     for cat, ts in sorted(found.items()):
         unique: Dict[Any, Template] = {}
@@ -655,24 +733,42 @@ def _mine_design(ir: IRBlueprint, category: str, name: str, stats: Counter, reje
     hints = author_hints(ir)
     full = prepare(ir, margin=None, keep_defense=defense)
     source_flow, smelt = run_flow(full, hints)
+    dock: Optional[Tuple[int, int]] = None  # step to the neighbouring copy for a design made to dock
+    if not source_flow.ok:
+        # the author's grid gives the step to the next copy; without one, copies stand side by side
+        width, height = ir.snap or full.size
+        for step in ((width, 0), (0, height)):
+            tiled = middle_flow(full, step, hints, smelt)
+            if tiled is not None and tiled[0].ok:
+                (source_flow, smelt), dock = tiled, step
+                stats["works docked to its copies"] += 1
+                break
     if not source_flow.ok:
         rejects.add(f"author: {reason(source_flow)}", name, full, source_flow)
         return None
+
+    def verdict(design: IRBlueprint) -> FlowResult:
+        if not dock:
+            return run_flow(design, hints, smelt)[0]
+        docked = middle_flow(design, dock, hints, smelt)
+        return docked[0] if docked else FlowResult([], {}, {}, frozenset(), [], status="copies_collide")
+
     cut, cut_flow = full, source_flow
-    for step, (margin, taps) in enumerate(CROP_STEPS):
+    for step_no, (margin, taps) in enumerate(CROP_STEPS):
         candidate = prepare(ir, margin, defense, taps) if margin is not None else full
-        flow = run_flow(candidate, hints, smelt)[0] if margin is not None else source_flow
+        flow = verdict(candidate) if margin is not None else source_flow
         if flow.ok:
             cut, cut_flow = candidate, flow
-            stats[f"crop step {step}"] += 1
+            stats[f"crop step {step_no}"] += 1
             break
-    # what the working design leaves unused: the author's bus passing through, taps to nowhere, extra poles
-    stripped = strip_unused(cut, cut_flow)
-    if len(stripped.entities) < len(cut.entities) and run_flow(stripped, hints, smelt)[0].ok:
-        cut = stripped
-        stats["unused parts removed"] += 1
+    # never used, whatever comes in: the author's bus passing through, taps to nowhere, extra poles
+    if not dock:
+        stripped = strip_unused(cut)
+        if len(stripped.entities) < len(cut.entities) and verdict(stripped).ok:
+            cut = stripped
+            stats["unused parts removed"] += 1
     try:
-        template = mine_one(cut, category)
+        template = _docking_cell(cut, category, dock) if dock else mine_one(cut, category)
     except BlueprintIRError:
         template = None
     if template is None:
@@ -680,11 +776,12 @@ def _mine_design(ir: IRBlueprint, category: str, name: str, stats: Counter, reje
         return None
     template.belt = main_belt(template.head + template.segment + template.tail)
     try:
-        check = tiling_check(template)
-        if not check["ok"] and check["power_only"]:
+        check = tiling_check(template, docks=bool(dock))
+        if not check["ok"] and check["power_only"] and not dock:
             repaired = repair_power(template)
-            if repaired is not None and tiling_check(repaired)["ok"]:
-                template, check = repaired, tiling_check(repaired)
+            repaired_check = tiling_check(repaired) if repaired is not None else None
+            if repaired_check and repaired_check["ok"]:
+                template, check = repaired, repaired_check
                 stats["power_repaired"] += 1
     except ValueError:  # BlueprintIRError is handled above; this is retier
         stats["belt_tier_failed"] += 1
@@ -704,13 +801,20 @@ def _mine_design(ir: IRBlueprint, category: str, name: str, stats: Counter, reje
         stats["defense_not_a_straight_wall"] += 1  # an outpost, a ring or a perimeter, not a piece of wall to repeat
         return None
     build_flow = None
-    for n in (1, 2) if segment else (1,):
+    if dock:  # a docking cell works in a row of copies: judge the middle one of three
+        build = template.build(1)
+        docked = middle_flow(build, (template.period, 0), None, smelt)
+        build_flow, smelt = docked if docked else (FlowResult([], {}, {}, frozenset(), [], status="collide"), smelt)
+        if not build_flow.ok:
+            rejects.add(f"template: {reason(build_flow)}", name, template.build(3), build_flow)
+            return None
+    for n in () if dock else (1, 2) if segment else (1,):
         build = template.build(n)
         build_flow, smelt = run_flow(build, first=smelt)
         if not build_flow.ok:
             rejects.add(f"template: {reason(build_flow)}", name, build, build_flow)
             return None
-    template.metrics = {"source_warnings": check["source_warnings"], "smelt": smelt}
+    template.metrics = {"source_warnings": check["source_warnings"], "smelt": smelt, "docks": bool(dock)}
     if category.startswith("smelting_"):
         template.metrics["input"] = furnace_input(build_flow)
     return template
@@ -730,7 +834,7 @@ CATEGORY_NAMES = {
     "plastic": "Пластик", "multi": "Мульти-блоки (несколько продуктов)",
     "assembly_1in": "Сборщики: 1 твёрдый вход", "assembly_2in": "Сборщики: 2 входа", "assembly_3in": "Сборщики: 3 входа",
     "assembly_fluid": "Сборщики: вход с жидкостью", "chemistry": "Химия (химзаводы)", "oil": "Нефтепереработка",
-    "defense": "Оборона (отрезки стены)",
+    "defense": "Оборона (отрезки стены)", "uranium": "Обогащение урана (центрифуги)",
     "science_red": "Красная наука", "science_green": "Зелёная наука", "science_military": "Военная наука",
     "science_blue": "Синяя наука", "science_purple": "Фиолетовая наука", "science_yellow": "Жёлтая наука",
 }
@@ -879,7 +983,7 @@ def write_book(best: Dict[str, List[Template]], path: Path = Path("outputs/templ
         sub = BlueprintBook()
         sub.label = CATEGORY_NAMES.get(cat, cat)
         for t in [top] + [t for t in sorted(ts, key=score, reverse=True) if t is not top]:
-            segments = 3 if t.metrics["kind"] == "segment" else 1
+            segments = 3 if t.metrics["kind"] == "segment" or t.metrics.get("docks") else 1
             name = (t.source.get("label") or t.source.get("title") or "").strip()
             label = f"{name[:40]} | {'DEFAULT ' if t is top else ''}{variant(t)}"  # the name first: labels are cut at 100
             builds = [(label, lambda t=t, n=segments: labelled(t, t.build(n, lamps=True)))]
@@ -953,7 +1057,8 @@ def main():
     if args.report_only:
         best = load_catalog()
     elif only:
-        best = {**load_catalog(), **mine(args.min_favorites, args.per_category, only, args.workers)[0]}
+        kept = {cat: ts for cat, ts in load_catalog().items() if cat not in only}  # a category may now be empty
+        best = {**kept, **mine(args.min_favorites, args.per_category, only, args.workers)[0]}
         previous = load_catalog(args.previous) if args.previous else {}
     else:
         best, rejects = mine(args.min_favorites, args.per_category, workers=args.workers)

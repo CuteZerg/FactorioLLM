@@ -11,11 +11,11 @@ each smelting input to its product.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Dict, FrozenSet, Iterable, Optional, Set
 
-from factoriollm.base_game import FLUIDS, ITEMS, RECIPES
+from factoriollm.base_game import RECIPES
 
 # Smelting input -> product. Steel takes iron plates (5 per steel, 16 s); everything else takes ore or stone.
 SMELTING = {"iron-ore": "iron-plate", "copper-ore": "copper-plate", "stone": "stone-brick", "iron-plate": "steel-plate"}
@@ -29,6 +29,9 @@ class Recipe:
     fluids: FrozenSet[str]     # ingredients and results that are fluids
     time: float
     category: str
+    # fluid -> 1-based index among the machine's input / output fluid boxes, where the recipe says so
+    box_in: Dict[str, int] = field(default_factory=dict)
+    box_out: Dict[str, int] = field(default_factory=dict)
 
 
 @lru_cache(maxsize=None)
@@ -37,16 +40,10 @@ def recipe(name: str) -> Optional[Recipe]:
     data = RECIPES.get(name)
     if data is None:
         return None
+    boxes = data.get("fluid_boxes") or {}
     return Recipe(name=name, ingredients=dict(data["ingredients"]), results=dict(data["results"]),
-                  fluids=frozenset(data["fluids"]), time=float(data["time"]), category=data["category"])
-
-
-def is_item(name: str) -> bool:
-    return name in ITEMS
-
-
-def is_fluid(name: str) -> bool:
-    return name in FLUIDS
+                  fluids=frozenset(data["fluids"]), time=float(data["time"]), category=data["category"],
+                  box_in=dict(boxes.get("in") or {}), box_out=dict(boxes.get("out") or {}))
 
 
 @lru_cache(maxsize=None)

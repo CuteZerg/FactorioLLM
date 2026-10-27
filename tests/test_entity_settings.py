@@ -178,5 +178,33 @@ class TestHelpers(unittest.TestCase):
                          "speed-module-3")
 
 
+class TestInserterFiltersAndMirror(unittest.TestCase):
+    def setUp(self):
+        warnings.simplefilter("ignore")
+
+    def test_filters_and_mirror_survive_the_round_trip(self):
+        bp = {"entities": [
+            {"entity_number": 1, "name": "fast-inserter", "position": {"x": 0.5, "y": 0.5}, "use_filters": True,
+             "filters": [{"index": 1, "name": "coal", "quality": "normal", "comparator": "="}], "filter_mode": "blacklist"},
+            {"entity_number": 2, "name": "chemical-plant", "position": {"x": 3.5, "y": 1.5}, "recipe": "plastic-bar",
+             "mirror": True}]}
+        ir = parse_blueprint_dict(bp)
+        self.assertEqual(ir.entities[0].extras_dict, {"filters": "coal", "filter_mode": "blacklist"})
+        self.assertEqual(ir.entities[1].extras_dict.get("mirror"), "true")
+        self.assertIsNotNone(lift_and_verify_locally(ir))
+
+    def test_legacy_filter_inserter_keeps_its_filter(self):
+        bp = {"entities": [{"entity_number": 1, "name": "filter-inserter", "position": {"x": 0.5, "y": 0.5},
+                            "filters": [{"index": 1, "name": "iron-ore"}]}]}
+        ir = parse_blueprint_dict(bp, version=(1, 1))
+        self.assertEqual((ir.entities[0].name, ir.entities[0].extras_dict), ("fast-inserter", {"filters": "iron-ore"}))
+
+    def test_modded_inserter_positions_are_rejected(self):
+        bp = {"entities": [{"entity_number": 1, "name": "inserter", "position": {"x": 0.5, "y": 0.5},
+                            "drop_position": {"x": -1.5, "y": 0.5}}]}
+        with self.assertRaisesRegex(BlueprintIRError, "mod"):
+            parse_blueprint_dict(bp)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -89,9 +89,9 @@ LEGACY_RENAMES = {
 }
 
 # Entity attributes carried into the IR (and into generated code). Everything else
-# (wires, inserter filters, fuel requests, quality, tags) is dropped.
+# (wires, fuel requests, quality, tags) is dropped.
 EXTRA_KEYS = ("recipe", "io_type", "input_priority", "output_priority", "filter", "signals", "text", "icon",
-              "modules", "requests", "request_from_buffers", "trash_not_requested")
+              "modules", "requests", "request_from_buffers", "trash_not_requested", "filters", "filter_mode", "mirror")
 
 # Base-game modules (quality modules come with the Quality DLC).
 MODULE_ITEMS = frozenset(f"{kind}-module{suffix}" for kind in ("speed", "productivity", "efficiency")
@@ -304,7 +304,8 @@ def _signal_id(signal: Dict[str, Any]) -> str:
     kind = str(signal.get("type") or "item")
     name = str(signal.get("name") or "")
     name = LEGACY_SIGNAL_RENAMES.get(name, LEGACY_RENAMES.get(name, name))
-    if kind not in LABEL_SIGNAL_TYPES or signal.get("quality") not in (None, "normal")             or not _signal_exists(kind, name):
+    if kind not in LABEL_SIGNAL_TYPES or signal.get("quality") not in (None, "normal") \
+            or not _signal_exists(kind, name):
         raise BlueprintIRError(f"unsupported label signal {kind}:{name}")
     return f"{kind}:{name}"
 
@@ -424,8 +425,38 @@ def _requests(raw: Dict[str, Any]) -> Dict[str, str]:
     return out
 
 
+def _inserter_filters(raw: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Item filters of an inserter as {'filters': 'a;b'} (+ 'filter_mode': 'blacklist'). 1.x filter
+    inserters keep filters without a flag, 2.0 inserters need use_filters. A filter by quality is DLC.
+    """
+    active = raw.get("use_filters") or "filter" in str(raw.get("name", ""))
+    items = []
+    for f in (raw.get("filters") or []) if active else []:
+        if not isinstance(f, dict) or not f.get("name"):
+            continue
+        if f.get("quality") not in (None, "normal"):
+            raise BlueprintIRError(f"inserter filter of quality '{f['quality']}'")
+        item = _item_name(f["name"])
+        if not _base_game_item(item):
+            raise BlueprintIRError(f"inserter filter item '{item}' is not in the base game")
+        items.append(item)
+    if not items:
+        return {}
+    out = {"filters": ";".join(sorted(set(items)))}
+    if raw.get("filter_mode") == "blacklist":
+        out["filter_mode"] = "blacklist"
+    return out
+
+
 def _convert_extras(raw: Dict[str, Any], name: str = "") -> Tuple[Tuple[str, str], ...]:
     extras: Dict[str, str] = {}
+    if name and entity_type(name) == "inserter":
+        if raw.get("pickup_position") or raw.get("drop_position"):
+            raise BlueprintIRError(f"'{name}' with its own pickup / drop position (a mod)")
+        extras.update(_inserter_filters(raw))
+    if raw.get("mirror"):  # 2.0: the machine is flipped, its fluid connections too
+        extras["mirror"] = "true"
     modules = _modules(raw, name) if (_prototype(name) or {}).get("module_slots") else ""
     if modules:
         extras["modules"] = modules
@@ -466,7 +497,7 @@ def _convert_extras(raw: Dict[str, Any], name: str = "") -> Tuple[Tuple[str, str
             raise BlueprintIRError(f"unknown filter item '{flt}'")
         extras["filter"] = flt
     for key, value in extras.items():
-        allowed = "-_:;=" if key in ("signals", "icon", "modules", "requests") else "-_"
+        allowed = "-_:;=" if key in ("signals", "icon", "modules", "requests", "filters") else "-_"
         if key != "text" and not all(ch.isalnum() or ch in allowed for ch in value):  # text: free, emitted via repr
             raise BlueprintIRError(f"suspicious value for {key}: {value!r}")
     return tuple(sorted(extras.items()))

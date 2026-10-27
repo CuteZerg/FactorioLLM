@@ -198,9 +198,14 @@ class Template:
             raw = self._place(parts, copies)
             name_at = {(e.x, e.y): t.name for e, t in zip(raw, retier(raw, belt)) if e.name in _TIER}
             shift = {"head": 0, "segment": self.period, "tail": (copies - self.repeats) * self.period}
-            cache[belt] = {part: [IREntity(name_at.get((e.x + shift[part], e.y), e.name) if e.name in _TIER else e.name,
-                                           e.x, e.y, e.direction, e.extras) for e in ents]
-                           for part, ents in parts.items()}
+            tiered = {part: [IREntity(name_at.get((e.x + shift[part], e.y), e.name) if e.name in _TIER else e.name,
+                                      e.x, e.y, e.direction, e.extras) for e in ents]
+                      for part, ents in parts.items()}
+            # head and tail took their tiers next to copies 0 and 2, every segment those of copy 1:
+            # the assembled parts must still pair their undergrounds as the design does
+            if underground_pairs(self._place(tiered, copies)) != underground_pairs(raw):
+                raise ValueError(f"no belt tiers at {belt} keep the undergrounds of every copy paired as in the design")
+            cache[belt] = tiered
         return cache[belt]
 
     def build_segment(self, belt: Optional[str] = None) -> IRBlueprint:
@@ -239,12 +244,24 @@ def _set_modules(ents: List[IREntity], by_type: Dict[str, str], by_recipe: Dict[
         if not (_prototype(e.name) or {}).get("module_slots") or (r not in by_recipe and e.name not in by_type):
             out.append(e)
             continue
-        want = by_recipe[r] if r in by_recipe else by_type[e.name]
+        want = by_recipe[r] if r in by_recipe and _fits(e.name, by_recipe[r]) else by_type.get(e.name)
+        if want is None or not _fits(e.name, want):
+            out.append(e)
+            continue
         ex = {k: v for k, v in ex.items() if k != "modules"}
         if want:
             ex["modules"] = want
         out.append(IREntity(e.name, e.x, e.y, e.direction, tuple(sorted(ex.items()))))
     return out
+
+
+def _fits(name: str, modules: str) -> bool:
+    """Whether a module set ('speed-module-3=2;...') fits the entity's slots (beacons take no productivity)."""
+    counts = {m.split("=")[0]: int(m.split("=")[1]) for m in modules.split(";") if m}
+    slots = int((_prototype(name) or {}).get("module_slots") or 0)
+    if entity_type(name) == "beacon" and any("productivity" in m for m in counts):
+        return False
+    return sum(counts.values()) <= slots
 
 
 def normalize_modules(t: Template) -> Template:
@@ -378,23 +395,34 @@ def along_x(ir: IRBlueprint) -> List[IRBlueprint]:
     return out
 
 
-def tiling_check(template: Template, segments: Tuple[int, ...] = (1, 2, 5)) -> Dict[str, Any]:
+def tiling_check(template: Template, segments: Tuple[int, ...] = (1, 2, 5), docks: bool = False) -> Dict[str, Any]:
     """
     Builds the design with several segment counts and validates each build: no errors, and no
     warning categories beyond those the source blueprint already has (a belt end the author left
     on purpose stays allowed). Power is always strict: a module must not depend on poles outside it
     (POWER_CATEGORIES are never allowed, even if the author had them). `power_only` tells whether
-    power was the only problem, i.e. whether repair_power may help.
+    power was the only problem, i.e. whether repair_power may help. A cell made to dock with its
+    copies (docks=True) is built 3 and 5 copies long and judged on its inner copies: the outer ones
+    miss the neighbours that would power and feed their outer edge.
     """
+    if docks:
+        segments = (3, 5)
+
+    def counted(report, n):
+        if not docks:
+            return report.errors, report.warnings
+        inner = lambda issue: template.period <= issue.position[0] < (n - 1) * template.period  # noqa: E731
+        return report.errors, [w for w in report.warnings if inner(w)]
+
     source = validate(template.build(template.repeats))
     allowed = set(source.category_counts()) - POWER_CATEGORIES
     problems, categories = [], set()
     for n in segments:
-        report = validate(template.build(n))
-        if report.errors:
-            problems.append(f"{n} segments: {report.errors[0].message}")
-            categories |= {issue.category for issue in report.errors}
-        new = set(report.category_counts()) - allowed - {issue.category for issue in report.errors}
+        errors, warnings = counted(validate(template.build(n)), n)
+        if errors:
+            problems.append(f"{n} segments: {errors[0].message}")
+            categories |= {issue.category for issue in errors}
+        new = {issue.category for issue in warnings} - allowed
         if new:
             problems.append(f"{n} segments: new warnings {sorted(new)}")
             categories |= new
@@ -467,21 +495,18 @@ def repair_power(template: Template) -> Optional[Template]:
     return fixed
 
 
+def _supplies(pole: IREntity, e: IREntity) -> bool:
+    """Whether the entity's footprint touches the pole's supply area (as the validator counts it)."""
+    d = float((_prototype(pole.name) or {}).get("supply_area_distance") or 0)
+    cx, cy = _center(pole)
+    w, h = footprint(e.name, e.direction)
+    return e.x < cx + d and e.x + w > cx - d and e.y < cy + d and e.y + h > cy - d
+
+
 def _uncovered(ents: List[IREntity]) -> List[int]:
-    """Indices of electric consumers outside every pole's supply area (as the validator counts them)."""
-    areas = []
-    for e in ents:
-        if entity_type(e.name) == "electric-pole":
-            d = float((_prototype(e.name) or {}).get("supply_area_distance") or 0)
-            cx, cy = _center(e)
-            areas.append((cx - d, cy - d, cx + d, cy + d))
-    out = []
-    for i, e in enumerate(ents):
-        if is_electric_consumer(e.name):
-            w, h = footprint(e.name, e.direction)
-            if not any(e.x < x2 and e.x + w > x1 and e.y < y2 and e.y + h > y1 for x1, y1, x2, y2 in areas):
-                out.append(i)
-    return out
+    """Indices of electric consumers outside every pole's supply area."""
+    poles = [e for e in ents if entity_type(e.name) == "electric-pole"]
+    return [i for i, e in enumerate(ents) if is_electric_consumer(e.name) and not any(_supplies(p, e) for p in poles)]
 
 
 def metrics(template: Template) -> Dict[str, Any]:
@@ -546,10 +571,10 @@ def underground_pairs(ents: List[IREntity], names: Optional[List[str]] = None) -
         dx, dy = _DIRS[e.direction]
         for k in range(1, int((_prototype(names[i]) or {}).get("max_distance") or 5) + 1):
             j = at.get((e.x + k * dx, e.y + k * dy))
-            if j is not None and names[j] == names[i]:
+            if j is not None and names[j] == names[i] and ents[j].direction % 8 == e.direction % 8:
                 if ents[j].direction == e.direction and ents[j].extras_dict.get("io_type") == "output":
                     pairs[i] = j
-                break
+                break  # an underground across the line (another axis) does not interact
     return pairs
 
 
@@ -671,22 +696,31 @@ def prepare(ir: IRBlueprint, margin: Optional[int] = CROP_MARGIN, keep_defense: 
     return ir.with_entities(ents)
 
 
-def strip_unused(ir: IRBlueprint, flow: Any) -> IRBlueprint:
+def strip_unused(ir: IRBlueprint) -> IRBlueprint:
     """
-    Removes what a working design does not use under its input assignment (flow_sim result): belts,
-    undergrounds and splitters no item travels on (pieces of the author's bus passing through, a tap
-    to nowhere), pipes without fluid, then poles that power nothing and only lead to other such poles.
+    Removes what the design could never use, whatever comes in (not just what one input assignment
+    leaves empty: the simulator does not count throughput, so a second feed of the same item is not
+    spare): belt lines from which nothing is taken anywhere and on which no product is put (the
+    author's bus passing through, a tap to nowhere), pipes of networks no machine takes from or gives
+    to, then poles that power nothing (prune_poles).
     """
+    from factoriollm.flow_sim import Layout, _fluid_roles, _reach_all
+
     ents = list(ir.entities)
-    used_lanes = {k[0] for k, items in flow.lanes.items() if items}
-    keep = []
-    for i, e in enumerate(ents):
-        t = entity_type(e.name)
-        if t in ("transport-belt", "underground-belt", "splitter") and i not in used_lanes:
-            continue
-        if e.name in PIPE_LIKE and not flow.fluids.get(i):
-            continue
-        keep.append(e)
+    L = Layout(ir)
+    need = L.lane_need()
+    dropped = {dst[1] for src, dst in L.links if dst[0] == "lane"} | {ref for _, (kind, ref) in L.drills if kind == "lane"}
+    carries_products = _reach_all(L, dropped)
+    useful = {k[0] for k in L.edges if need[k] is None or need[k] or k in carries_products}
+    lines = _belt_lines(ents)  # a whole line goes or stays: the tail after its last inserter is still the author's line
+    useful_lines = {lines[ents[i]] for i in useful}
+    useful = {i for i in L.belts if lines.get(ents[i]) in useful_lines}
+    needs_f, makes_f = _fluid_roles(L)
+    used_nets = {L.network[b] for ns in needs_f.values() for bs, _ in ns for b in bs} \
+        | {L.network[b] for ms in makes_f.values() for b, _ in ms}
+    piped = {L.boxes[b][0] for b in range(len(L.boxes)) if L.network[b] in used_nets}
+    keep = [e for i, e in enumerate(ents)
+            if not (i in L.belts and i not in useful) and not (e.name in PIPE_LIKE and i not in piped)]
     return ir.with_entities(prune_poles(keep))
 
 
@@ -698,16 +732,8 @@ def prune_poles(ents: List[IREntity]) -> List[IREntity]:
     poles = [i for i, e in enumerate(ents) if entity_type(e.name) == "electric-pole"]
     if not poles:
         return ents
-    covering: Set[int] = set()
     consumers = [e for e in ents if is_electric_consumer(e.name)]
-    for i in poles:
-        d = float((_prototype(ents[i].name) or {}).get("supply_area_distance") or 0)
-        cx, cy = _center(ents[i])
-        for c in consumers:
-            w, h = footprint(c.name, c.direction)
-            if c.x < cx + d and c.x + w > cx - d and c.y < cy + d and c.y + h > cy - d:
-                covering.add(i)
-                break
+    covering = {i for i in poles if any(_supplies(ents[i], c) for c in consumers)}
     adj: Dict[int, Set[int]] = {i: set() for i in poles}
     for a, b in itertools.combinations(poles, 2):
         reach = min(float((_prototype(ents[k].name) or {}).get("maximum_wire_distance") or 0) for k in (a, b))
@@ -791,7 +817,8 @@ def _trim_tails(ents: List[IREntity], margin: int, cut_taps: bool = True) -> Lis
     for i, j in underground_pairs(ents).items():
         belt_adj.setdefault(i, set()).add(j)
         belt_adj.setdefault(j, set()).add(i)
-    core = {src[1] for src, _ in L.links if src[0] == "belt"} | {dst[1][0] for _, dst in L.links if dst[0] == "lane"}         | {ref[0] for _, (kind, ref) in L.drills if kind == "lane"}
+    core = {src[1] for src, _ in L.links if src[0] == "belt"} | {dst[1][0] for _, dst in L.links if dst[0] == "lane"} \
+        | {ref[0] for _, (kind, ref) in L.drills if kind == "lane"}
     splitters = {i for i in L.belts if L.types[i] == "splitter"}
     keep_belts = _prune(set(L.belts), belt_adj, core, margin, splitters if cut_taps else set())
 
@@ -898,14 +925,21 @@ def add_port_labels(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal"
     def free(t: Tuple[int, int]) -> bool:
         return t not in used and (not inside_only or (min(xs) <= t[0] <= max(xs) and min(ys) <= t[1] <= max(ys)))
 
-    def put(ring: List[Tuple[int, int]], signals: List[str]) -> bool:
-        """The first free tile of the ring, else the nearest free tile around it (beacons all round)."""
+    def dist(a: Tuple[int, int], b: Tuple[int, int]) -> int:
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+    def put(ring: List[Tuple[int, int]], signals: List[str], home: Optional[Tuple[int, int]] = None) -> bool:
+        """
+        The first free tile of the ring, else the nearest free tile around the port (`home`; beacons
+        all round), but never one nearer to another port: there it reads as that port's label.
+        """
         spot = next((t for t in ring if free(t)), None)
         if spot is None and ring:
-            x0, y0 = ring[0]
+            x0, y0 = home or ring[0]
             around = sorted(((x0 + dx, y0 + dy) for dx in range(-LABEL_REACH, LABEL_REACH + 1)
-                             for dy in range(-LABEL_REACH, LABEL_REACH + 1)), key=lambda t: abs(t[0] - x0) + abs(t[1] - y0))
-            spot = next((t for t in around if free(t)), None)
+                             for dy in range(-LABEL_REACH, LABEL_REACH + 1)), key=lambda t: dist(t, (x0, y0)))
+            spot = next((t for t in around if free(t) and all(
+                dist(t, (x0, y0)) <= dist(t, other) for other in port_tiles if other != (x0, y0))), None)
         if spot is None:
             return False
         used.add(spot)
@@ -919,18 +953,16 @@ def add_port_labels(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal"
             return tiles[0]
         return next((t for t in tiles if layout.half(i, t) == half), tiles[0])
 
-    def belt_ring(i: int, half: int, start: bool, lane: Optional[int]) -> List[Tuple[int, int]]:
+    def belt_ring(i: int, half: int, start: bool) -> List[Tuple[int, int]]:
+        """Behind a belt start / in front of a belt end, then beside it."""
         e = ents[i]
         dx, dy = _DIRS[e.direction]
         lx, ly = dy, -dx  # left of the direction of travel
         x, y = tile_of(i, half)
         s = -1 if start else 1
         behind = (x + s * dx, y + s * dy)
-        if lane is None:
-            return [behind, (x + lx, y + ly), (x - lx, y - ly), (behind[0] + lx, behind[1] + ly),
-                    (behind[0] - lx, behind[1] - ly)]
-        side = 1 if lane % 2 == 0 else -1  # lane 0 is on the left
-        return [(x + side * lx, y + side * ly), (behind[0] + side * lx, behind[1] + side * ly)]
+        return [behind, (x + lx, y + ly), (x - lx, y - ly), (behind[0] + lx, behind[1] + ly),
+                (behind[0] - lx, behind[1] - ly)]
 
     def lanes_matter(i: int, half: int, by_lane: Dict[int, Set[str]]) -> bool:
         """Whether the design stops working with the two lanes' items swapped."""
@@ -949,13 +981,14 @@ def add_port_labels(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal"
         reads as the label of the next belt.
         """
         items = set().union(*by_lane.values())
-        whole = belt_ring(i, half, start, None)
+        whole = belt_ring(i, half, start)
+        home = tile_of(i, half)
         same = len({frozenset(v) for v in by_lane.values()}) == 1
         if not mixed and (same or (start and not lanes_matter(i, half, by_lane))):
-            put(whole, [f"item:{x}" for x in items])
+            put(whole, [f"item:{x}" for x in items], home)
             return
         for lane, v in sorted(by_lane.items()):
-            put(whole, [f"item:{x}" for x in v] + ["virtual:signal-" + ("L" if lane % 2 == 0 else "R")])
+            put(whole, [f"item:{x}" for x in v] + ["virtual:signal-" + ("L" if lane % 2 == 0 else "R")], home)
 
     inputs: Dict[Tuple[int, int], Dict[int, Set[str]]] = {}
     outputs: Dict[Tuple[int, int], Dict[int, Set[str]]] = {}
@@ -963,9 +996,9 @@ def add_port_labels(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal"
         if p.kind == "lane":
             group = inputs if p.role == "input" else outputs
             group.setdefault((p.entity, p.lane // 2), {}).setdefault(p.lane, set()).update(p.items)
-        elif p.kind == "chest":
-            e = ents[p.entity]
-            put([(e.x + dx, e.y + dy) for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1))], [f"item:{x}" for x in p.items])
+    port_tiles = {tile_of(i, half) for i, half in list(inputs) + list(outputs)} | \
+        {p.tile for p in flow.ports if p.kind == "fluid"} | {(ents[p.entity].x, ents[p.entity].y) for p in flow.ports
+                                                             if p.kind == "chest"}
     in_lines = {lines.get(ents[i]) for i, _ in inputs}
     out_lines = {lines.get(ents[i]) for i, _ in outputs}
     for (i, half), by_lane in sorted(inputs.items(), key=lambda kv: (ents[kv[0][0]].y, ents[kv[0][0]].x)):
@@ -973,11 +1006,15 @@ def add_port_labels(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal"
     for (i, half), by_lane in sorted(outputs.items(), key=lambda kv: (ents[kv[0][0]].y, ents[kv[0][0]].x)):
         label_belt(i, half, by_lane, False, mixed=lines.get(ents[i]) in in_lines)
     for p in flow.ports:
+        if p.kind == "chest":
+            e = ents[p.entity]
+            put([(e.x + dx, e.y + dy) for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1))], [f"item:{x}" for x in p.items],
+                (e.x, e.y))
         if p.kind != "fluid":
             continue
         ox, oy = p.tile
         dx, dy = _DIRS[p.direction]
         inside = (ox - dx, oy - dy)
         put([(inside[0] + dy, inside[1] - dx), (inside[0] - dy, inside[1] + dx), (ox + dy, oy - dx), (ox - dy, oy + dx)],
-            [f"fluid:{x}" for x in p.items])
+            [f"fluid:{x}" for x in p.items], p.tile)
     return ir.with_entities(ents + labels)

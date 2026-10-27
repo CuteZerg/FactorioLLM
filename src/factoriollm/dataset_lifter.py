@@ -29,7 +29,8 @@ from factoriollm.blueprint_ir import _prototype  # prototype lookup for undergro
 HELPER_NAMES = ("add_belt_line", "add_underground_pair", "add_entity_row", "add_entity", "add_power_poles",
                 "add_signal_label", "add_display_panel")
 # Extras that only our helpers understand (draftsman's own bp.entities.append does not).
-HELPER_ONLY_EXTRAS = frozenset({"modules", "requests", "request_from_buffers", "trash_not_requested"})
+HELPER_ONLY_EXTRAS = frozenset({"modules", "requests", "request_from_buffers", "trash_not_requested", "filters",
+                                "filter_mode"})
 
 MIN_RUN = 3          # minimal belt line / entity row length worth a macro
 MIN_LOOP_GROUP = 3   # minimal number of same-kind calls worth a for-loop
@@ -65,11 +66,13 @@ def find_arithmetic_runs(values: List[int], min_len: int = MIN_RUN) -> List[Tupl
 
 
 def _kwarg_value(key: str, value: str) -> str:
-    """Python literal of an IR extra: dicts for modules / requests, booleans for logistic flags."""
+    """Python literal of an IR extra: dicts for modules / requests, a list of filter items, booleans for flags."""
     if key in ("modules", "requests"):
         pairs = (part.rsplit("=", 1) for part in value.split(";"))
         return "{" + ", ".join(f"{name!r}: {int(count)}" for name, count in pairs) + "}"
-    if key in ("request_from_buffers", "trash_not_requested"):
+    if key == "filters":
+        return "[" + ", ".join(repr(item) for item in value.split(";")) + "]"
+    if key in ("request_from_buffers", "trash_not_requested", "mirror"):
         return "True"
     return repr(value)
 

@@ -18,7 +18,7 @@ RECIPES = {
     'atomic-bomb': {'ingredients': {'processing-unit': 10.0, 'explosives': 10.0, 'uranium-235': 30.0}, 'results': {'atomic-bomb': 1.0}, 'fluids': [], 'time': 50.0, 'category': 'crafting'},
     'automation-science-pack': {'ingredients': {'copper-plate': 1.0, 'iron-gear-wheel': 1.0}, 'results': {'automation-science-pack': 1.0}, 'fluids': [], 'time': 5.0, 'category': 'crafting'},
     'barrel': {'ingredients': {'steel-plate': 1.0}, 'results': {'barrel': 1.0}, 'fluids': [], 'time': 1.0, 'category': 'crafting'},
-    'basic-oil-processing': {'ingredients': {'crude-oil': 100.0}, 'results': {'petroleum-gas': 45.0}, 'fluids': ['crude-oil', 'petroleum-gas'], 'time': 5.0, 'category': 'oil-processing'},
+    'basic-oil-processing': {'ingredients': {'crude-oil': 100.0}, 'results': {'petroleum-gas': 45.0}, 'fluids': ['crude-oil', 'petroleum-gas'], 'time': 5.0, 'category': 'oil-processing', 'fluid_boxes': {'in': {'crude-oil': 2}, 'out': {'petroleum-gas': 3}}},
     'battery': {'ingredients': {'sulfuric-acid': 20.0, 'iron-plate': 1.0, 'copper-plate': 1.0}, 'results': {'battery': 1.0}, 'fluids': ['sulfuric-acid'], 'time': 4.0, 'category': 'chemistry'},
     'battery-equipment': {'ingredients': {'battery': 5.0, 'steel-plate': 10.0}, 'results': {'battery-equipment': 1.0}, 'fluids': [], 'time': 10.0, 'category': 'crafting'},
     'battery-mk2-equipment': {'ingredients': {'battery-equipment': 10.0, 'processing-unit': 15.0, 'low-density-structure': 5.0}, 'results': {'battery-mk2-equipment': 1.0}, 'fluids': [], 'time': 10.0, 'category': 'crafting'},

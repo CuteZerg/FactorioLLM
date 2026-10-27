@@ -39,12 +39,11 @@ from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 
 from factoriollm.blueprint_ir import IRBlueprint, IREntity, _prototype, entity_type, footprint
 from factoriollm.game_data import SMELTING, recipe
-from factoriollm.validator import _center, _rotate
+from factoriollm.validator import _DIRECTION_VECTORS, _center, _occupied_tiles as _tiles, _rotate
 
 Tile = Tuple[int, int]
 Lane = Tuple[int, int]  # (entity index, 0 = left / 1 = right)
 
-DIRS = {0: (0, -1), 4: (1, 0), 8: (0, 1), 12: (-1, 0)}
 BELT_LIKE = frozenset({"transport-belt", "underground-belt", "splitter"})
 CONTAINERS = frozenset({"container", "logistic-container"})
 FUELS = ("coal", "wood", "solid-fuel", "rocket-fuel", "nuclear-fuel")
@@ -58,8 +57,11 @@ ROBOPORT_ITEMS = ("logistic-robot", "construction-robot", "repair-pack")
 INSERTER_RATE = {"burner-inserter": 0.6, "inserter": 0.83, "long-handed-inserter": 1.2, "fast-inserter": 2.31,
                  "bulk-inserter": 4.6}
 ANY = None  # "accepts any item" (chests, belts, the ground)
-# Entities inserters take from even when they do not work: labs and boilers pass on packs and fuel, reactors give spent cells.
-PASS_ON = frozenset({"lab", "boiler", "reactor"})
+# Entities an inserter takes items back out of, to hand them on along a chain of inserters: labs
+# pass science packs on, boilers fuel, turrets ammunition. (Reactors give out spent fuel cells.)
+PASS_ON = {"lab": frozenset(SCIENCE_PACKS), "boiler": frozenset(FUELS),
+           "ammo-turret": frozenset(AMMO["ammo-turret"]), "artillery-turret": frozenset(AMMO["artillery-turret"])}
+GIVES_OUT = frozenset(PASS_ON) | {"reactor"}  # inserters take from these whether or not they "work"
 MAX_LEAVES = 400      # full simulations per solve before giving up as ambiguous
 MAX_SOLUTIONS = 12    # working assignments compared by score
 MAX_EXTRA_LEAVES = 40  # simulations spent on alternatives after the first working assignment
@@ -103,7 +105,7 @@ class FlowResult:
 
 
 def _vec(d: int) -> Tuple[int, int]:
-    return DIRS[d % 16]
+    return _DIRECTION_VECTORS[d % 16]
 
 
 def _left(d: int) -> Tuple[int, int]:
@@ -122,11 +124,6 @@ def _type(name: str) -> str:
 
 def _burner(name: str) -> bool:
     return ((_prototype(name) or {}).get("energy_source") or {}).get("type") == "burner"
-
-
-def _tiles(e: IREntity) -> List[Tile]:
-    w, h = footprint(e.name, e.direction)
-    return [(e.x + dx, e.y + dy) for dx in range(w) for dy in range(h)]
 
 
 def _point(e: IREntity, key: str) -> Optional[Tuple[float, float]]:
@@ -172,6 +169,12 @@ class Layout:
         self._need: Optional[Dict[Lane, Optional[Set[str]]]] = None
         self.inserters = [i for i, t in enumerate(self.types) if t == "inserter"]
         self.links = [self._inserter(i) for i in self.inserters]
+        # item filters per inserter: (whitelist?, items) or None
+        self.filters: List[Optional[Tuple[bool, FrozenSet[str]]]] = []
+        for i in self.inserters:
+            ex = self.ents[i].extras_dict
+            items = frozenset(x for x in (ex.get("filters") or "").split(";") if x)
+            self.filters.append((ex.get("filter_mode") != "blacklist", items) if items else None)
         self.drills = [(i, self._drop(self.ents[i], _point(self.ents[i], "vector_to_place_result")))
                        for i, t in enumerate(self.types) if t == "mining-drill" and self.ents[i].name != "pumpjack"]
         self._build_fluids()
@@ -362,6 +365,19 @@ class Layout:
 
     # --- machines -------------------------------------------------------------------------
 
+    def moves(self, idx: int, items: Iterable[str]) -> Set[str]:
+        """What inserter number idx (in self.links) moves out of these items: its filter, then what its target accepts."""
+        out = set(items)
+        flt = self.filters[idx]
+        if flt is not None:
+            out = out & flt[1] if flt[0] else out - flt[1]
+        dst = self.links[idx][1]
+        if dst[0] == "entity":
+            acc = self.accepts(dst[1])
+            if acc is not ANY:
+                out &= acc
+        return out
+
     def accepts(self, j: int) -> Optional[FrozenSet[str]]:
         """Items an inserter may put into entity j (ANY for chests)."""
         e, t = self.ents[j], self.types[j]
@@ -413,12 +429,10 @@ class Layout:
             return frozenset(set(r.results) - r.fluids)
         if t == "furnace":
             return frozenset(SMELTING[i] for i in received if i in SMELTING)
-        if t == "lab":
-            return frozenset(received & set(SCIENCE_PACKS))  # inserters pass packs on from lab to lab
+        if t in PASS_ON:
+            return frozenset(received & PASS_ON[t])
         if t == "reactor":
             return frozenset({"depleted-uranium-fuel-cell"}) if "uranium-fuel-cell" in received else frozenset()
-        if t == "boiler":
-            return frozenset(received & set(FUELS))  # inserters pass fuel on from boiler to boiler
         if t in CONTAINERS:
             return received
         return frozenset()
@@ -451,20 +465,25 @@ class Layout:
                 boxes.append(box)
         out = []
         cx, cy = _center(e)
+        mirror = e.extras_dict.get("mirror") == "true"  # 2.0: flipped left-right before rotating
         for box in boxes:
             conns = []
             for c in box.get("pipe_connections") or []:
                 if c.get("connection_type") == "linked":
                     continue
                 pos = c.get("position")
+                d0 = int(c.get("direction", 0))
                 if pos is None and c.get("positions"):
                     pos = c["positions"][(e.direction // 4) % 4]
                     vx, vy = float(pos[0]), float(pos[1])
                 else:
                     if pos is None:
                         continue
-                    vx, vy = _rotate((float(pos[0]), float(pos[1])), e.direction)
-                d = (int(c.get("direction", 0)) + e.direction) % 16
+                    px = -float(pos[0]) if mirror else float(pos[0])
+                    if mirror and d0 % 8 == 4:
+                        d0 = (d0 + 8) % 16  # east and west swap
+                    vx, vy = _rotate((px, float(pos[1])), e.direction)
+                d = (d0 + e.direction) % 16
                 inside = _tile_of((cx + vx, cy + vy))
                 conns.append((inside, d, c.get("connection_type") == "underground",
                               int(c.get("max_underground_distance") or 0)))
@@ -529,12 +548,12 @@ def _passes(rule: Optional[Tuple[str, str]], item: str) -> bool:
 FLAMETHROWER = "<flamethrower>"  # any of FLAMETHROWER_FLUIDS
 
 
-def _fluid_roles(L: Layout, mirrored: bool) -> Tuple[Dict[int, List[Tuple[List[int], str]]], Dict[int, List[Tuple[int, str]]]]:
+def _fluid_roles(L: Layout) -> Tuple[Dict[int, List[Tuple[List[int], str]]], Dict[int, List[Tuple[int, str]]]]:
     """
-    Per machine: [(input boxes, fluid)] - the fluid must reach one of those boxes - and [(output box,
-    fluid)] it puts out. Which input box takes which fluid is not checked: the IR does not keep the
-    2.0 `mirror` flag, and players mirror machines to share pipes. Outputs follow the box order (or
-    the reverse order for `mirrored`); a single fluid product goes to every output box.
+    Per machine: [(input boxes, fluid)] the fluid must reach and [(output box, fluid)] it puts out.
+    A recipe fluid uses the box its fluidbox_index names (1-based among the machine's input or output
+    boxes), else the boxes in order; where the boxes are on the machine follows its mirror flag
+    (Layout._fluid_boxes).
     """
     needs: Dict[int, List[Tuple[List[int], str]]] = {}
     makes: Dict[int, List[Tuple[int, str]]] = {}
@@ -546,12 +565,9 @@ def _fluid_roles(L: Layout, mirrored: bool) -> Tuple[Dict[int, List[Tuple[List[i
         r = recipe(e.extras_dict.get("recipe") or "")
         ins = [b for b in bs if L.boxes[b][2] == "input"]
         outs = [b for b in bs if L.boxes[b][2] == "output"]
-        if mirrored:
-            outs = outs[::-1]
         if t == "assembling-machine" and r:
-            fout = [f for f in r.results if f in r.fluids]
-            needs[j] = [(ins, f) for f in r.ingredients if f in r.fluids]
-            makes[j] = [(b, fout[0]) for b in outs] if len(fout) == 1 else list(zip(outs, fout))
+            needs[j] = _boxes_for([f for f in r.ingredients if f in r.fluids], ins, r.box_in, lambda b, f: ([b], f))
+            makes[j] = _boxes_for([f for f in r.results if f in r.fluids], outs, r.box_out, lambda b, f: (b, f))
         elif t == "boiler":
             needs[j] = [(ins, L.boxes[ins[0]][3] or "water")] if ins else []
             makes[j] = [(b, L.boxes[b][3] or "steam") for b in outs]
@@ -566,6 +582,18 @@ def _fluid_roles(L: Layout, mirrored: bool) -> Tuple[Dict[int, List[Tuple[List[i
     return needs, makes
 
 
+def _boxes_for(fluids: List[str], boxes: List[int], index: Dict[str, int], make) -> list:
+    """Each fluid on its box: the recipe's fluidbox_index, else the next box no index claims."""
+    named = {f: boxes[i - 1] for f, i in index.items() if 0 < i <= len(boxes)}
+    unclaimed = [b for b in boxes if b not in named.values()]
+    out = []
+    for f in fluids:
+        b = named[f] if f in named else (unclaimed.pop(0) if unclaimed else None)  # box 0 is a valid id
+        if b is not None:
+            out.append(make(b, f))
+    return out
+
+
 def _has_fluid(fluid: str, have: Set[str]) -> bool:
     return bool(have & set(FLAMETHROWER_FLUIDS)) if fluid == FLAMETHROWER else fluid in have
 
@@ -574,18 +602,12 @@ def check(ir: IRBlueprint, inputs: Dict[Any, Optional[str]], layout: Optional[La
           resource: str = "iron-ore") -> FlowResult:
     """Simulates one assignment of input items ({('lane', i, l) | ('chest', j) | ('fluid', net): item})."""
     L = layout or Layout(ir, resource)
-    best: Optional[FlowResult] = None
-    for mirrored in (False, True):
-        result = _simulate(L, inputs, mirrored)
-        if best is None or len(result.problems) < len(best.problems):
-            best = result
-        if not result.problems or not L.boxes:
-            break
-    best.inputs = dict(inputs)
-    return best
+    result = _simulate(L, inputs)
+    result.inputs = dict(inputs)
+    return result
 
 
-def _simulate(L: Layout, inputs: Dict[Any, Optional[str]], mirrored: bool) -> FlowResult:
+def _simulate(L: Layout, inputs: Dict[Any, Optional[str]]) -> FlowResult:
     ents = L.ents
     lanes: Dict[Lane, Set[str]] = {k: set() for k in L.edges}
     received: Dict[int, Set[str]] = {}
@@ -602,7 +624,7 @@ def _simulate(L: Layout, inputs: Dict[Any, Optional[str]], mirrored: bool) -> Fl
             lanes[(key[1], key[2])].add(item)
         elif key[0] == "chest":
             chests.setdefault(key[1], set()).add(item)
-    needs_f, makes_f = _fluid_roles(L, mirrored)
+    needs_f, makes_f = _fluid_roles(L)
     net_fluids: Dict[int, Set[str]] = {}
     for key, item in inputs.items():
         if key[0] == "fluid" and item:
@@ -634,7 +656,7 @@ def _simulate(L: Layout, inputs: Dict[Any, Optional[str]], mirrored: bool) -> Fl
         if kind == "entity":
             if L.types[ref] in CONTAINERS:
                 return chests.get(ref, set())
-            return set(L.products(ref, frozenset(received.get(ref, set())))) if ref in working or L.types[ref] in PASS_ON \
+            return set(L.products(ref, frozenset(received.get(ref, set())))) if ref in working or L.types[ref] in GIVES_OUT \
                 else set()
         return set()
 
@@ -660,13 +682,11 @@ def _simulate(L: Layout, inputs: Dict[Any, Optional[str]], mirrored: bool) -> Fl
             if j in working:
                 changed |= _put(L, kind, ref, {L.resource}, lanes, received, ground, chests)
         # inserters
-        for k, (src, dst) in zip(L.inserters, L.links):
+        for idx, (src, dst) in enumerate(L.links):
             items = source_items(src)
             if not items:
                 continue
-            if dst[0] == "entity":
-                acc = L.accepts(dst[1])
-                items = items if acc is ANY else items & acc
+            items = L.moves(idx, items)
             if items:
                 changed |= _put(L, dst[0], dst[1], items, lanes, received, ground, chests)
         # machines and fluids
@@ -696,10 +716,13 @@ def _put(L: Layout, kind: str, ref: Any, items: Set[str], lanes, received, groun
 def _picks(L: Layout) -> Dict[int, Optional[FrozenSet[str]]]:
     """Per belt entity: the items inserters take from it (ANY if a chest or the ground takes all)."""
     out: Dict[int, Optional[FrozenSet[str]]] = {}
-    for (src, dst) in L.links:
+    for idx, (src, dst) in enumerate(L.links):
         if src[0] != "belt":
             continue
         acc = ANY if dst[0] in ("ground", "lane") else L.accepts(dst[1]) if dst[0] == "entity" else frozenset()
+        flt = L.filters[idx]
+        if flt is not None and flt[0]:  # a whitelist takes only its items
+            acc = flt[1] if acc is ANY else acc & flt[1]
         prev = out.get(src[1], frozenset())
         out[src[1]] = ANY if acc is ANY or prev is ANY else prev | acc
     return out
@@ -741,7 +764,7 @@ def _verdict(L: Layout, lanes, received, ground, chests, working, inputs, needs_
             problems.append(Problem("no_output", f"nobody takes the products of {ents[j].name} at {pos(j)}", pos(j)))
 
     # inserters
-    for k, (src, dst) in zip(L.inserters, L.links):
+    for idx, (k, (src, dst)) in enumerate(zip(L.inserters, L.links)):
         e = ents[k]
         kind, ref = src
         if kind == "belt":
@@ -750,12 +773,10 @@ def _verdict(L: Layout, lanes, received, ground, chests, working, inputs, needs_
             items = ground.get(ref, set())
         elif kind == "entity":
             items = chests.get(ref, set()) if L.types[ref] in CONTAINERS else \
-                set(L.products(ref, frozenset(received.get(ref, set())))) if ref in working or L.types[ref] in PASS_ON else set()
+                set(L.products(ref, frozenset(received.get(ref, set())))) if ref in working or L.types[ref] in GIVES_OUT else set()
         else:
             items = set()
-        if dst[0] == "entity":
-            acc = L.accepts(dst[1])
-            items = items if acc is ANY else items & acc
+        items = L.moves(idx, items)
         if not items:
             problems.append(Problem("dangling_inserter", f"{e.name} at {(e.x, e.y)} has nothing to pick", (e.x, e.y)))
         elif dst[0] == "ground" and not any(s == ("ground", dst[1]) for s, _ in L.links):
@@ -852,7 +873,7 @@ def _fluid_domains(L: Layout) -> Dict[Tuple[Any, ...], List[Optional[str]]]:
     Pipe networks with an open end and no producer inside are input ports: candidates are the fluids
     the machines on the network need (the most wanted first; flamethrowers take light oil).
     """
-    needs_f, makes_f = _fluid_roles(L, False)
+    needs_f, makes_f = _fluid_roles(L)
     produced = {L.network[b] for made in makes_f.values() for b, _ in made}
     wanted: Dict[int, Dict[str, int]] = {}
     for j, ns in needs_f.items():
@@ -955,32 +976,69 @@ def _wants(L: Layout, dst: Tuple[str, Any], smelt: str, fuel: str) -> List[str]:
     return out
 
 
+def _demand(L: Layout, smelt: str, fuel: str) -> Dict[Tuple[Any, ...], Dict[str, int]]:
+    """
+    What could be of use arriving at each place of the flow graph, with a preference rank (lower is
+    better): ('lane', lane), ('entity', j) and ('ground', tile). Machines want their ingredients; a
+    chest, the ground or an entity that passes items on (PASS_ON) wants what the inserters taking
+    from it deliver onward; a lane wants what is taken from it or from the lanes it flows into. So a
+    manual chest feeding a belt, an inserter moving coal from one belt to another or ammunition
+    passed from turret to turret all get their candidates.
+    """
+    demand: Dict[Tuple[Any, ...], Dict[str, int]] = {}
+
+    def add(node: Tuple[Any, ...], items: Dict[str, int]) -> bool:
+        have = demand.setdefault(node, {})
+        grew = False
+        for x, rank in items.items():
+            if x not in have or rank < have[x]:
+                have[x] = rank
+                grew = True
+        return grew
+
+    for j in range(len(L.ents)):
+        own = _wants(L, ("entity", j), smelt, fuel)
+        if own:
+            add(("entity", j), {x: r for r, x in enumerate(own)})
+    changed = True
+    while changed:
+        changed = False
+        for idx, (src, dst) in enumerate(L.links):
+            node = ("lane", dst[1]) if dst[0] == "lane" else dst
+            wanted = {x: r for x, r in demand.get(node, {}).items() if L.moves(idx, {x})}
+            if not wanted:
+                continue
+            if src[0] == "belt":
+                for lane in L.belt_lanes(src[1]):
+                    changed |= add(("lane", lane), wanted)
+            elif src[0] == "ground" or (src[0] == "entity" and (L.types[src[1]] in CONTAINERS
+                                                                or L.types[src[1]] in PASS_ON)):
+                acc = L.accepts(src[1]) if src[0] == "entity" and L.types[src[1]] in PASS_ON else ANY
+                passed = {x: r for x, r in wanted.items() if acc is ANY or x in acc}
+                changed |= add(src, passed)
+        for lane, outs in L.edges.items():
+            for dst_lane, rule in outs:
+                wanted = {x: r for x, r in demand.get(("lane", dst_lane), {}).items() if _passes(rule, x)}
+                if wanted:
+                    changed |= add(("lane", lane), wanted)
+    return demand
+
+
 def _domains(L: Layout, ports: List[Tuple[Any, ...]], smelt: str, fuel: str, static: _Static
              ) -> Dict[Tuple[Any, ...], List[Optional[str]]]:
-    """Candidate items per port: what the inserters downstream deliver to their targets, if safe for the lanes."""
-    takers: Dict[int, List[int]] = {}
-    for idx, (src, dst) in enumerate(L.links):
-        if src[0] == "belt" or (src[0] == "entity" and L.types[src[1]] in CONTAINERS):
-            takers.setdefault(src[1], []).append(idx)
+    """
+    Candidate items per port: what is of use downstream of it (_demand), best ranked first, if safe
+    for the lanes; what a machine here makes does not come from outside (cable in a circuit block).
+    """
+    demand = _demand(L, smelt, fuel)
     domains: Dict[Tuple[Any, ...], List[Optional[str]]] = {}
     for port in ports:
-        cands: List[str] = []
+        node = ("lane", (port[1], port[2])) if port[0] == "lane" else ("entity", port[1])
+        ranked = sorted(demand.get(node, {}).items(), key=lambda kv: (kv[1], kv[0]))
+        cands = [x for x, _ in ranked if x not in static.crafted]
         if port[0] == "lane":
-            start = (port[1], port[2])
-            by_item: Dict[str, Set[Lane]] = {}  # lanes an item from this port can reach (splitter filters)
-            for k in _reach(L, start):
-                for idx in takers.get(k[0], []):
-                    for x in _wants(L, L.links[idx][1], smelt, fuel):
-                        if x not in by_item:
-                            by_item[x] = _reach(L, start, x)
-                        if k in by_item[x]:
-                            cands.append(x)
-            # what a machine here makes does not come from outside (cable in a circuit block)
-            cands = [x for x in dict.fromkeys(cands) if x not in static.crafted and static.safe(start, x)]
-        else:
-            for idx in takers.get(port[1], []):
-                cands += _wants(L, L.links[idx][1], smelt, fuel)
-        domains[port] = list(dict.fromkeys(cands)) + [None]
+            cands = [x for x in cands if static.safe((port[1], port[2]), x)]
+        domains[port] = cands + [None]
     return domains
 
 
@@ -1002,9 +1060,7 @@ def _constraints(L: Layout, ports: List[Tuple[Any, ...]], domains, static: _Stat
             else:
                 hit = {idx for idx, (src, _) in enumerate(L.links) if src == ("entity", port[1])}
             for idx in hit:
-                dst = L.links[idx][1]
-                acc = L.accepts(dst[1]) if dst[0] == "entity" else ANY
-                if acc is ANY or item in acc:
+                if L.moves(idx, {item}):
                     serves.setdefault(idx, []).append((port, item))
     inner_fed: Set[int] = set()  # inserters that may get something from inside
     for idx, (src, dst) in enumerate(L.links):
@@ -1034,7 +1090,7 @@ def _constraints(L: Layout, ports: List[Tuple[Any, ...]], domains, static: _Stat
 
 def _fluid_constraints(L: Layout, fluid_domains) -> List[List[Tuple[Tuple[Any, ...], str]]]:
     """Every fluid a machine needs must come through one of its input networks (unless made inside)."""
-    needs_f, makes_f = _fluid_roles(L, False)
+    needs_f, makes_f = _fluid_roles(L)
     made = {(L.network[b], f) for ms in makes_f.values() for b, f in ms}
     out = []
     for j, ns in needs_f.items():
@@ -1063,12 +1119,10 @@ def _score(L: Layout, result: FlowResult, smelt: str, fuel: str, hints: Dict[Til
     used = sum(1 for key, item in result.inputs.items() if item and key[0] != "fluid")
     supply: Dict[str, float] = {}
     demand: Dict[str, float] = {}
-    for k, (src, dst) in zip(L.inserters, L.links):
+    for idx, (k, (src, dst)) in enumerate(zip(L.inserters, L.links)):
         if src[0] != "belt" or dst[0] != "entity":
             continue
-        acc = L.accepts(dst[1])
-        items = set().union(*(result.lanes[k] for k in L.belt_lanes(src[1])))
-        for x in items if acc is ANY else items & acc:
+        for x in L.moves(idx, set().union(*(result.lanes[lane] for lane in L.belt_lanes(src[1])))):
             supply[x] = supply.get(x, 0.0) + INSERTER_RATE.get(L.ents[k].name, 1.0)
     for j in result.working:
         r = recipe(L.ents[j].extras_dict.get("recipe") or "")

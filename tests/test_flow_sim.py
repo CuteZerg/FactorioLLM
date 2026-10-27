@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 from factoriollm.blueprint_ir import IRBlueprint, IREntity
-from factoriollm.flow_sim import Layout, check, input_ports, solve
+from factoriollm.flow_sim import Layout, _fluid_roles, check, input_ports, solve
 
 DATA = Path(__file__).parent / "fixtures" / "flow"
 
@@ -95,6 +95,54 @@ class FlowSimTest(unittest.TestCase):
                           E("pumpjack", 0, 4, 0)])
         r = check(ir, {}, Layout(ir))
         self.assertIn("fluid_mix", {p.kind for p in r.problems})
+
+
+class FlowSimReviewTest(unittest.TestCase):
+    """Mistakes found in the review of step 2d."""
+
+    def test_filter_inserter_takes_only_its_item(self):
+        copper = gear_line([])
+        line = list(copper.entities)
+        line[4] = E("inserter", 1, 1, 0, filters="copper-plate")  # feeds the gear machine copper only
+        self.assertIn("dangling_inserter", {p.kind for p in solve(IRBlueprint(line)).problems})
+        line[4] = E("inserter", 1, 1, 0, filters="iron-plate")
+        self.assertTrue(solve(IRBlueprint(line)).ok)
+
+    def test_manual_chest_feeding_a_belt(self):
+        # a chest filled by hand, an inserter puts its items on the belt the gear machine takes from
+        ir = IRBlueprint([E("wooden-chest", 0, -2), E("inserter", 0, -1, 0)] + list(gear_line().entities))
+        r = solve(ir)
+        self.assertTrue(r.ok, r.problems)
+        self.assertIn("iron-plate", {v for k, v in r.inputs.items() if k[0] == "chest"})
+
+    def test_ammunition_passed_from_turret_to_turret(self):
+        ir = IRBlueprint(belts(0, 3, 0) + [E("inserter", 1, 1, 0), E("gun-turret", 1, 2), E("inserter", 3, 2, 12),
+                                           E("gun-turret", 4, 2)])
+        r = solve(ir)
+        self.assertTrue(r.ok, r.problems)
+
+    def test_basic_oil_processing_uses_its_fluid_boxes(self):
+        L = Layout(IRBlueprint([E("oil-refinery", 0, 0, 0, recipe="basic-oil-processing")]))
+        needs, makes = _fluid_roles(L)
+        (j, made), = makes.items()
+        self.assertEqual([(L.boxes[b][1], f) for b, f in made], [(4, "petroleum-gas")])  # the third output box
+        self.assertEqual([(L.boxes[bs[0]][1], f) for bs, f in needs[j]], [(1, "crude-oil")])  # the second input box
+
+    def test_mirror_flips_fluid_connections(self):
+        plain = Layout(IRBlueprint([E("chemical-plant", 0, 0, 0, recipe="plastic-bar")]))
+        flipped = Layout(IRBlueprint([E("chemical-plant", 0, 0, 0, recipe="plastic-bar", mirror="true")]))
+        first = lambda L: L._fluid_boxes(0)[0][2][0][0]  # noqa: E731  inside tile of the first input box
+        self.assertEqual(first(plain), (0, 0))
+        self.assertEqual(first(flipped), (2, 0))
+
+    def test_design_made_to_dock(self):
+        # the machine's input inserter takes from the belt of the copy to its left
+        cell = IRBlueprint([E("inserter", 0, 1, 12), E("assembling-machine-1", 1, 0, recipe="iron-gear-wheel"),
+                            E("inserter", 2, 3, 0), E("wooden-chest", 2, 4)] + [E("transport-belt", 4, y, 0) for y in range(3)])
+        self.assertFalse(solve(cell).ok)
+        from factoriollm.template_miner import middle_flow
+        docked, _ = middle_flow(cell, (5, 0))
+        self.assertTrue(docked.ok, docked.problems)
 
 
 class FlowSimRealDesignsTest(unittest.TestCase):

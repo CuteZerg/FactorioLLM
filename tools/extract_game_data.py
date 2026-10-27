@@ -259,13 +259,21 @@ def recipe_record(proto: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if any(p is None for p in ingredients + results):
         return None
     time = body.get("energy_required", 0.5)
-    return {
+    record = {
         "ingredients": {name: _round(amount) for _, name, amount in ingredients},
         "results": {name: _round(amount) for _, name, amount in results},
         "fluids": sorted({name for kind, name, _ in ingredients + results if kind == "fluid"}),
         "time": _round(float(time if isinstance(time, (int, float)) else 0.5)),
         "category": str(proto.get("category") or "crafting"),
     }
+    # which fluid box of the machine a fluid uses (1-based among its input / output boxes); without
+    # it the fluids take the boxes in order
+    boxes = {side: {p["name"]: int(p["fluidbox_index"]) for p in body.get(key) or []
+                    if isinstance(p, dict) and isinstance(p.get("fluidbox_index"), (int, float))}
+             for side, key in (("in", "ingredients"), ("out", "results"))}
+    if boxes["in"] or boxes["out"]:
+        record["fluid_boxes"] = boxes
+    return record
 
 
 def _round(x: float) -> float:
