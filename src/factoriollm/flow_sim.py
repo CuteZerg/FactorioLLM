@@ -1149,10 +1149,10 @@ def solve(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal", resource
 
     def simulate(assign: Dict[Tuple[Any, ...], str]) -> bool:
         key = frozenset(assign.items())
-        leaves[0] += 1  # a repeat counts too: the budget bounds the search, not only the simulations
         if key in tried:
             return False
         tried.add(key)
+        leaves[0] += 1
         result = check(ir, {p: assign.get(p) for p in ports}, L)
         if not result.problems:
             solutions.append(result)
