@@ -414,7 +414,6 @@ def _vanilla(tags: Optional[str]) -> bool:
 
 SMELT_CHOICES = ("iron-ore", "iron-plate", "copper-ore", "stone")
 SIMPLE_QUOTA = 3  # simple designs kept per category besides the best-ranked ones
-SIMPLE_MACHINES = {"assembling-machine-1", "assembling-machine-2", "stone-furnace", "steel-furnace"}
 
 
 def author_hints(ir: IRBlueprint) -> Dict[Tuple[int, int], set]:
@@ -444,12 +443,16 @@ def run_flow(ir: IRBlueprint, hints: Optional[Dict] = None, first: str = "iron-o
     return found
 
 
+REASON_ORDER = ("starved", "clog", "output_mixed", "fluid_mix", "no_output", "dangling_inserter")
+
+
 def reason(result: FlowResult) -> str:
-    """Why a design does not work: the search ran out, or its most common problem."""
+    """Why a design does not work: the search ran out, or its root problem (REASON_ORDER)."""
     if result.status == "inputs_ambiguous":
         return "inputs_ambiguous"
-    kinds = Counter(p.kind for p in result.problems)
-    return kinds.most_common(1)[0][0] if kinds else result.status
+    kinds = {p.kind for p in result.problems}
+    # the cause before its consequences: a starved machine leaves its inserters with nothing to move
+    return next((k for k in REASON_ORDER if k in kinds), next(iter(kinds), result.status))
 
 
 def furnace_input(result: FlowResult) -> str:
@@ -489,15 +492,14 @@ class Rejects:
 
 
 def is_simple(t: Template) -> bool:
-    """No beacons, no machine modules, no belt weaving, early machines (AM1/AM2, stone / steel furnaces)."""
+    """No beacons, no machine modules, no belt weaving, no assembling machine 3."""
     tr = t.metrics.get("traits") or {}
-    machine = main_machine(t)
-    early = machine in SIMPLE_MACHINES or not (machine.startswith("assembling") or machine.endswith("furnace"))
     return (not (t.metrics.get("beacons_per_machine") or 0) and not tr.get("machine_modules")
-            and not tr.get("weaving") and early)
+            and not tr.get("weaving") and main_machine(t) != "assembling-machine-3")
 
 
-def mine(min_favorites: int = 10, per_category: int = 8) -> Tuple[Dict[str, List[Template]], Rejects]:
+def mine(min_favorites: int = 10, per_category: int = 8, only: Optional[set] = None
+         ) -> Tuple[Dict[str, List[Template]], Rejects]:
     rows = asyncio.run(_load(min_favorites))
     stats: Counter = Counter()
     rejects = Rejects()
@@ -524,6 +526,8 @@ def mine(min_favorites: int = 10, per_category: int = 8) -> Tuple[Dict[str, List
             if category is None:
                 if is_mall(products(ir)):
                     stats["mall"] += 1
+                continue
+            if only and category not in only:
                 continue
             stats[f"candidates {category}"] += 1
             name = (ir.label or row["title"] or "").strip()
@@ -552,8 +556,9 @@ def mine(min_favorites: int = 10, per_category: int = 8) -> Tuple[Dict[str, List
         best[cat] = sorted(chosen, key=lambda t: (variant(t), -score(t)))
     stats.update({f"rejected: {why}": n for why, n in rejects.seen.items()})
     print(f"[*] {dict(stats)}")
-    STATS.parent.mkdir(parents=True, exist_ok=True)
-    STATS.write_text(json.dumps(dict(stats), ensure_ascii=False, indent=1), encoding="utf-8")
+    if not only:  # a partial run keeps the full run's counters
+        STATS.parent.mkdir(parents=True, exist_ok=True)
+        STATS.write_text(json.dumps(dict(stats), ensure_ascii=False, indent=1), encoding="utf-8")
     return best, rejects
 
 
@@ -659,6 +664,9 @@ def default_template(ts: List[Template]) -> Template:
                    lambda t: not (t.metrics.get("traits") or {}).get("machine_modules"),
                    lambda t: t.metrics.get("input") in (None, "ore"),
                    is_simple,
+                   # defence: a wall with turrets (not a turret row meant to stand behind another wall)
+                   lambda t: t.category != "defense" or ((t.metrics.get("traits") or {}).get("wall_rows")
+                                                         and (t.metrics.get("traits") or {}).get("turrets") != "walls only"),
                    lambda t: t.metrics.get("belt_tier")):  # brings its own belts, not a city-block cell
         plain = [t for t in plain if prefer(t)] or plain
 
@@ -846,11 +854,17 @@ def main():
                         help="Rewrite the report and the book from the existing catalog (no mining)")
     parser.add_argument("--previous", type=Path, default=None,
                         help="Catalog to compare with (default: the catalog being replaced)")
+    parser.add_argument("--only", default="",
+                        help="Comma-separated categories to mine again; the rest of the catalog is kept")
     args = parser.parse_args()
+    only = {c for c in args.only.split(",") if c}
     previous = load_catalog(args.previous) if args.previous else ({} if args.report_only else load_catalog())
     rejects = None
     if args.report_only:
         best = load_catalog()
+    elif only:
+        best = {**load_catalog(), **mine(args.min_favorites, args.per_category, only)[0]}
+        previous = load_catalog(args.previous) if args.previous else {}
     else:
         best, rejects = mine(args.min_favorites, args.per_category)
     stats = json.loads(STATS.read_text(encoding="utf-8")) if STATS.exists() else None

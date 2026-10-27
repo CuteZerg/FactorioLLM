@@ -788,12 +788,16 @@ def _verdict(L: Layout, lanes, received, ground, chests, working, inputs, needs_
         e = ents[k[0]]
         ports.append(Port("lane", "output", k[0], k[1], frozenset(lanes[k] & products), (e.x, e.y), e.direction))
     producing = {L.network[b] for j, made in makes_f.items() if j in working for b, _ in made}
-    for b, tile, d in L.open_ends:
+    consuming = {L.network[b] for ns in needs_f.values() for bs, _ in ns for b in bs}
+    labelled_nets: Set[int] = set()
+    for b, tile, d in L.open_ends:  # one port per pipe network; fluid used up inside is no output
         net = L.network[b]
         fluids = net_fluids.get(net, set())
-        if fluids:
-            ports.append(Port("fluid", "output" if net in producing else "input", L.boxes[b][0], None,
-                              frozenset(fluids), tile, d))
+        if not fluids or net in labelled_nets or (net in producing and net in consuming):
+            continue
+        labelled_nets.add(net)
+        ports.append(Port("fluid", "output" if net in producing else "input", L.boxes[b][0], None,
+                          frozenset(fluids), tile, d))
     return FlowResult(problems, {k: frozenset(v) for k, v in lanes.items()},
                       {j: frozenset(v) for j, v in received.items()}, frozenset(working), ports)
 
@@ -928,6 +932,8 @@ def _wants(L: Layout, dst: Tuple[str, Any], smelt: str, fuel: str) -> List[str]:
             out += [smelt] + sorted(set(SMELTING) - {smelt})
         elif need == frozenset(FUELS):
             out += [fuel] + [f for f in FUELS if f != fuel]
+        elif need == frozenset(SCIENCE_PACKS):
+            out += [x for x in SCIENCE_PACKS if x != "space-science-pack"]  # rocket launches bring that one
         else:
             out += sorted(need)
     if L.types[j] in AMMO:
@@ -1057,6 +1063,41 @@ def _score(L: Layout, result: FlowResult, smelt: str, fuel: str, hints: Dict[Til
     return (agree, prefer, round(min(ratios), 3) if ratios else 0.0, -used)
 
 
+MAX_IMPROVE = 120  # simulations spent on improving the chosen assignment
+
+
+def _improve(ir: IRBlueprint, L: Layout, best: FlowResult, domains, smelt: str, fuel: str,
+             hints: Dict[Tile, Set[str]]) -> FlowResult:
+    """
+    Local search on a working assignment: other candidates on one port at a time, kept if the
+    layout still works and more different items come in (labs fed all their science packs, not one
+    pack on every lane), or the score improves otherwise.
+    """
+    def key(r: FlowResult) -> Tuple[Any, ...]:
+        distinct = len({x for k, x in r.inputs.items() if x and k[0] != "fluid"})
+        return (r.score[0], r.score[1], distinct) + tuple(r.score[2:])
+
+    budget = MAX_IMPROVE
+    improved = True
+    while improved and budget > 0:
+        improved = False
+        for port, current in list(best.inputs.items()):
+            if port[0] == "fluid":
+                continue
+            for alt in domains.get(port, []):
+                if alt == current or not alt or budget <= 0:
+                    continue
+                budget -= 1
+                trial = check(ir, {**best.inputs, port: alt}, L)
+                if trial.problems:
+                    continue
+                trial.score = _score(L, trial, smelt, fuel, hints)
+                if key(trial) > key(best):
+                    best, improved = trial, True
+                    break
+    return best
+
+
 def solve(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal", resource: str = "iron-ore",
           hints: Optional[Dict[Tile, Set[str]]] = None, max_leaves: int = MAX_LEAVES) -> FlowResult:
     """
@@ -1146,7 +1187,7 @@ def solve(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal", resource
     if solutions:
         for s in solutions:
             s.score = _score(L, s, smelt, fuel, hints)
-        return max(solutions, key=lambda s: s.score)
+        return _improve(ir, L, max(solutions, key=lambda s: s.score), domains, smelt, fuel, hints)
     result = best_fail[0] or check(ir, {p: (fluid_domains[p][0] if p in fluid_domains else None) for p in ports}, L)
     result.status = "inputs_ambiguous" if leaves[0] >= max_leaves else "inputs_unsolved"
     return result
