@@ -511,9 +511,11 @@ def signature(template: Template) -> Tuple[Any, ...]:
 def underground_pairs(ents: List[IREntity], names: Optional[List[str]] = None) -> Dict[int, int]:
     """
     Underground belt pairs as {entrance index: exit index}. An entrance connects to the nearest
-    underground of the same name and direction ahead within reach; if that one is another
-    entrance, it does not connect (same-tier pairs cannot be woven). `names` overrides entity names
-    (to test another belt tier without building new entities).
+    underground of the same name ahead within reach if that one is an exit in the same direction;
+    any other underground of that name in between (another entrance, or one going the other way)
+    breaks the connection: same-tier undergrounds cannot be woven, so players use another tier even
+    for a line going the other way. `names` overrides entity names (to test another belt tier
+    without building new entities).
     """
     names = names or [e.name for e in ents]
     at = {(e.x, e.y): i for i, e in enumerate(ents) if entity_type(names[i]) == "underground-belt"}
@@ -525,15 +527,18 @@ def underground_pairs(ents: List[IREntity], names: Optional[List[str]] = None) -
         dx, dy = _DIRS[e.direction]
         for k in range(1, int((_prototype(names[i]) or {}).get("max_distance") or 5) + 1):
             j = at.get((e.x + k * dx, e.y + k * dy))
-            if j is not None and names[j] == names[i] and ents[j].direction == e.direction:
-                if ents[j].extras_dict.get("io_type") == "output":
+            if j is not None and names[j] == names[i]:
+                if ents[j].direction == e.direction and ents[j].extras_dict.get("io_type") == "output":
                     pairs[i] = j
                 break
     return pairs
 
 
 def has_weaving(ents: List[IREntity]) -> bool:
-    """Belt weaving: an underground pair passes under another underground on the same line."""
+    """
+    Belt weaving: an underground pair passes under another underground on the same line (either way;
+    it needs another belt tier).
+    """
     ugs = {(e.x, e.y): e for e in ents if entity_type(e.name) == "underground-belt"}
     for i, o in underground_pairs(ents).items():
         a, b = ents[i], ents[o]
@@ -619,7 +624,7 @@ def _underground_clusters(ents: List[IREntity]) -> List[List[Tuple[int, ...]]]:
         else:
             ahead = (1 if e.direction in (4, 8) else -1) * (1 if e.extras_dict.get("io_type", "input") == "input" else -1)
             lo, hi = sorted((along[0], along[0] + ahead * reach))
-        lines.setdefault((e.direction, e.x if vertical else e.y), []).append((lo, hi, unit))
+        lines.setdefault((e.direction % 8, e.x if vertical else e.y), []).append((lo, hi, unit))  # both ways interact
     clusters: List[List[Tuple[int, ...]]] = []
     for spans in lines.values():
         spans.sort()
@@ -645,6 +650,79 @@ def prepare(ir: IRBlueprint, margin: Optional[int] = CROP_MARGIN, keep_defense: 
     if margin is not None and ents:
         ents = _trim_tails(ents, margin, cut_taps)
     return ir.with_entities(ents)
+
+
+def strip_unused(ir: IRBlueprint, flow: Any) -> IRBlueprint:
+    """
+    Removes what a working design does not use under its input assignment (flow_sim result): belts,
+    undergrounds and splitters no item travels on (pieces of the author's bus passing through, a tap
+    to nowhere), pipes without fluid, then poles that power nothing and only lead to other such poles.
+    """
+    ents = list(ir.entities)
+    used_lanes = {k[0] for k, items in flow.lanes.items() if items}
+    keep = []
+    for i, e in enumerate(ents):
+        t = entity_type(e.name)
+        if t in ("transport-belt", "underground-belt", "splitter") and i not in used_lanes:
+            continue
+        if e.name in PIPE_LIKE and not flow.fluids.get(i):
+            continue
+        keep.append(e)
+    return ir.with_entities(prune_poles(keep))
+
+
+def prune_poles(ents: List[IREntity]) -> List[IREntity]:
+    """
+    Drops poles that cover no electric consumer as long as the poles that do stay connected as before:
+    long feeder lines and poles left over from the author's grid go, bridges between covered poles stay.
+    """
+    poles = [i for i, e in enumerate(ents) if entity_type(e.name) == "electric-pole"]
+    if not poles:
+        return ents
+    covering: Set[int] = set()
+    consumers = [e for e in ents if is_electric_consumer(e.name)]
+    for i in poles:
+        d = float((_prototype(ents[i].name) or {}).get("supply_area_distance") or 0)
+        cx, cy = _center(ents[i])
+        for c in consumers:
+            w, h = footprint(c.name, c.direction)
+            if c.x < cx + d and c.x + w > cx - d and c.y < cy + d and c.y + h > cy - d:
+                covering.add(i)
+                break
+    adj: Dict[int, Set[int]] = {i: set() for i in poles}
+    for a, b in itertools.combinations(poles, 2):
+        reach = min(float((_prototype(ents[k].name) or {}).get("maximum_wire_distance") or 0) for k in (a, b))
+        (ax, ay), (bx, by) = _center(ents[a]), _center(ents[b])
+        if math.hypot(ax - bx, ay - by) <= reach:
+            adj[a].add(b)
+            adj[b].add(a)
+    def groups(nodes: Set[int]) -> int:
+        """How many separate networks the covering poles fall into, using only `nodes`."""
+        seen: Set[int] = set()
+        count = 0
+        for start in covering & nodes:
+            if start in seen:
+                continue
+            count += 1
+            stack = [start]
+            while stack:
+                n = stack.pop()
+                if n in seen:
+                    continue
+                seen.add(n)
+                stack += [m for m in adj[n] if m in nodes and m not in seen]
+        return count
+
+    kept = set(poles)
+    target = groups(kept)
+    centre = [_center(c) for c in consumers] or [(0.0, 0.0)]
+    # poles far from the machines first, so a feeder line is taken back from its far end
+    order = sorted((i for i in poles if i not in covering),
+                   key=lambda i: -min(math.hypot(_center(ents[i])[0] - x, _center(ents[i])[1] - y) for x, y in centre))
+    for i in order:
+        if groups(kept - {i}) <= target:
+            kept.discard(i)
+    return [e for i, e in enumerate(ents) if i not in poles or i in kept]
 
 
 def _prune(nodes: Set[int], adj: Dict[int, Set[int]], core: Set[int], margin: int, no_tail: Set[int]) -> Set[int]:
@@ -777,22 +855,24 @@ def add_port_labels(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal"
     Labels every port of a design with a constant combinator showing what goes in or comes out,
     from the flow simulator (see flow_sim.solve; `smelt`, `fuel`, `resource` are its preferences),
     not from the author:
-    - an input belt gets one label at its start with its item; with a different item on each lane,
-      one label per lane on that lane's side (one label with both items if there is no room);
-    - a mixed belt (one lane in, the other out) gets the input label at its start and the output
-      label at its end, each on its lane's side;
-    - an output belt gets a label in front of its end with what leaves on it;
+    - an input belt gets one label at its start with its items (up to two, one per lane); a label per
+      lane on that lane's side only where the lanes matter: the design stops working with the lanes
+      swapped, or the other lane of the line carries products (a mixed belt: one lane in, one out);
+    - an output belt gets a label in front of its end with what leaves on it (per lane on a mixed belt);
+    - each half of a splitter is a belt of its own;
     - a chest filled from outside and an open pipe end get a label next to them (fluid signals).
     Labels go behind a start / in front of an end first, then to the sides; with inside_only the
     bounding box is not left.
     """
-    from factoriollm.flow_sim import solve
+    from factoriollm.flow_sim import Layout, check, solve
 
     ents = list(ir.entities)
     flow = flow or solve(ir, smelt=smelt, fuel=fuel, resource=resource)
+    layout = Layout(ir, resource)
     used = {t for e in ents for t in _tiles(e)}
     xs, ys = [t[0] for t in used], [t[1] for t in used]
     labels: List[IREntity] = []
+    lines = _belt_lines(ents)
 
     def free(t: Tuple[int, int]) -> bool:
         return t not in used and (not inside_only or (min(xs) <= t[0] <= max(xs) and min(ys) <= t[1] <= max(ys)))
@@ -806,13 +886,18 @@ def add_port_labels(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal"
                 return True
         return False
 
-    def belt_ring(e: IREntity, start: bool, lane: Optional[int]) -> List[Tuple[int, int]]:
+    def tile_of(i: int, half: int) -> Tuple[int, int]:
+        tiles = _tiles(ents[i])
+        if len(tiles) == 1:
+            return tiles[0]
+        return next((t for t in tiles if layout.half(i, t) == half), tiles[0])
+
+    def belt_ring(i: int, half: int, start: bool, lane: Optional[int]) -> List[Tuple[int, int]]:
+        e = ents[i]
         dx, dy = _DIRS[e.direction]
         lx, ly = dy, -dx  # left of the direction of travel
-        tiles = _tiles(e)
+        x, y = tile_of(i, half)
         s = -1 if start else 1
-        # the end tile of a 2-wide splitter: either of its tiles; ring around the first
-        x, y = tiles[0] if lane is None or lane < 2 else tiles[-1]
         behind = (x + s * dx, y + s * dy)
         if lane is None:
             return [behind, (x + lx, y + ly), (x - lx, y - ly), (behind[0] + lx, behind[1] + ly),
@@ -820,43 +905,48 @@ def add_port_labels(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal"
         side = 1 if lane % 2 == 0 else -1  # lane 0 is on the left
         return [(x + side * lx, y + side * ly), (behind[0] + side * lx, behind[1] + side * ly)]
 
-    def label_belt(i: int, by_lane: Dict[int, Set[str]], start: bool, mixed: bool) -> None:
-        """One label for the belt, or one per lane on its side when lanes differ or the other lane goes the other way."""
-        e = ents[i]
+    def lanes_matter(i: int, half: int, by_lane: Dict[int, Set[str]]) -> bool:
+        """Whether the design stops working with the two lanes' items swapped."""
+        a, b = 2 * half, 2 * half + 1
+        if a not in by_lane or b not in by_lane:
+            return False
+        swapped = dict(flow.inputs)
+        swapped[("lane", i, a)], swapped[("lane", i, b)] = flow.inputs.get(("lane", i, b)), flow.inputs.get(("lane", i, a))
+        before = {(q.kind, q.position) for q in flow.problems}
+        return any((q.kind, q.position) not in before for q in check(ir, swapped, layout).problems)
+
+    def label_belt(i: int, half: int, by_lane: Dict[int, Set[str]], start: bool, mixed: bool) -> None:
         items = set().union(*by_lane.values())
-        whole = belt_ring(e, start, None)
-        if not mixed and len({frozenset(v) for v in by_lane.values()}) == 1:
+        whole = belt_ring(i, half, start, None)
+        same = len({frozenset(v) for v in by_lane.values()}) == 1
+        if not mixed and (same or (start and not lanes_matter(i, half, by_lane))):
             put(whole, [f"item:{x}" for x in items])
             return
-        placed = all(put(belt_ring(e, start, lane), [f"item:{x}" for x in v]) for lane, v in sorted(by_lane.items()))
+        placed = all(put(belt_ring(i, half, start, lane), [f"item:{x}" for x in v]) for lane, v in sorted(by_lane.items()))
         if not placed:  # no room on the sides: one label with everything
             put(whole, [f"item:{x}" for x in items])
 
-    inputs: Dict[int, Dict[int, Set[str]]] = {}
-    outputs: Dict[int, Dict[int, Set[str]]] = {}
+    inputs: Dict[Tuple[int, int], Dict[int, Set[str]]] = {}
+    outputs: Dict[Tuple[int, int], Dict[int, Set[str]]] = {}
     for p in flow.ports:
         if p.kind == "lane":
-            (inputs if p.role == "input" else outputs).setdefault(p.entity, {}).setdefault(p.lane, set()).update(p.items)
+            group = inputs if p.role == "input" else outputs
+            group.setdefault((p.entity, p.lane // 2), {}).setdefault(p.lane, set()).update(p.items)
         elif p.kind == "chest":
             e = ents[p.entity]
             put([(e.x + dx, e.y + dy) for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1))], [f"item:{x}" for x in p.items])
-    for i, by_lane in sorted(inputs.items(), key=lambda kv: (ents[kv[0]].y, ents[kv[0]].x)):
-        label_belt(i, by_lane, True, mixed=i in outputs)
-    for i, by_lane in sorted(outputs.items(), key=lambda kv: (ents[kv[0]].y, ents[kv[0]].x)):
-        label_belt(i, by_lane, False, mixed=i in inputs)
-    done_fluid: Set[Tuple[str, FrozenSet[str]]] = set()
+    in_lines = {lines.get(ents[i]) for i, _ in inputs}
+    out_lines = {lines.get(ents[i]) for i, _ in outputs}
+    for (i, half), by_lane in sorted(inputs.items(), key=lambda kv: (ents[kv[0][0]].y, ents[kv[0][0]].x)):
+        label_belt(i, half, by_lane, True, mixed=lines.get(ents[i]) in out_lines)
+    for (i, half), by_lane in sorted(outputs.items(), key=lambda kv: (ents[kv[0][0]].y, ents[kv[0][0]].x)):
+        label_belt(i, half, by_lane, False, mixed=lines.get(ents[i]) in in_lines)
     for p in flow.ports:
         if p.kind != "fluid":
             continue
-        key = (p.role, p.items)
-        e = ents[p.entity]
         ox, oy = p.tile
         dx, dy = _DIRS[p.direction]
         inside = (ox - dx, oy - dy)
-        ring = [(inside[0] + dy, inside[1] - dx), (inside[0] - dy, inside[1] + dx),
-                (ox + dy, oy - dx), (ox - dy, oy + dx)]
-        if key in done_fluid and len(flow.ports) > 40:
-            continue  # very large designs: one label per fluid and role is enough
-        done_fluid.add(key)
-        put(ring, [f"fluid:{x}" for x in p.items])
+        put([(inside[0] + dy, inside[1] - dx), (inside[0] - dy, inside[1] + dx), (ox + dy, oy - dx), (ox - dy, oy + dx)],
+            [f"fluid:{x}" for x in p.items])
     return ir.with_entities(ents + labels)

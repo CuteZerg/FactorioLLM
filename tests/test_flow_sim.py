@@ -113,14 +113,16 @@ class FlowSimRealDesignsTest(unittest.TestCase):
         self.assertTrue(r.ok, r.problems)
         self.assertIn("electronic-circuit", set(r.inputs.values()))
 
-    def test_red_and_green_on_separate_lanes(self):
+    def test_red_and_green_come_apart(self):
+        # the author splits red and green over lanes; whole belts work too and are preferred
         r = solve(fixture("processing_units_lanes"))
         self.assertTrue(r.ok, r.problems)
-        mixed = {}
+        by_belt = {}
         for key, item in r.inputs.items():
             if key[0] == "lane" and item:
-                mixed.setdefault(key[1], set()).add(item)
-        self.assertTrue(any(items == {"electronic-circuit", "advanced-circuit"} for items in mixed.values()))
+                by_belt.setdefault(key[1], set()).add(item)
+        self.assertEqual(set().union(*by_belt.values()), {"electronic-circuit", "advanced-circuit"})
+        self.assertTrue(all(len(items) == 1 for items in by_belt.values()))
 
     def test_blue_science_without_coal(self):
         r = solve(fixture("blue_science_no_coal"))

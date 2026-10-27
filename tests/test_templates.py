@@ -13,6 +13,7 @@ from factoriollm.templates import (
     main_belt,
     metrics,
     prepare,
+    prune_poles,
     repair_power,
     retier,
     tiling_check,
@@ -129,6 +130,22 @@ class TestSelfContained(unittest.TestCase):
         self.assertEqual(names["underground-belt"], 0)  # its exit was cut, so the entrance goes too
         self.assertEqual(min(e.y for e in ir.entities if e.name == "transport-belt"), -2)
 
+    def test_opposite_same_tier_undergrounds_block(self):
+        east = [IREntity("underground-belt", 0, 0, 4), IREntity("underground-belt", 4, 0, 4, OUT)]
+        west = [IREntity("underground-belt", 2, 0, 12), IREntity("underground-belt", 1, 0, 12, OUT)]
+        self.assertEqual(underground_pairs(east), {0: 1})
+        self.assertNotIn(0, underground_pairs(east + west))  # a yellow pair going the other way in between
+        mixed = retier(east + [IREntity("fast-underground-belt", 2, 0, 12), IREntity("fast-underground-belt", 1, 0, 12, OUT)],
+                       "transport-belt")
+        self.assertEqual(len({e.name for e in mixed}), 2)  # retier keeps the two directions on two tiers
+
+    def test_feeder_poles_are_pruned(self):
+        lab = IREntity("lab", 0, 0)
+        near = IREntity("medium-electric-pole", 3, 1)
+        feeder = [IREntity("medium-electric-pole", 3 + 8 * k, 1) for k in range(1, 4)]
+        kept = prune_poles([lab, near] + feeder)
+        self.assertEqual([e for e in kept if "pole" in e.name], [near])
+
     def test_retier_brings_every_belt_to_one_tier(self):
         ents = furnace_row(3).entities + [IREntity("fast-transport-belt", 14, 0, 4)]
         self.assertEqual(main_belt(ents), "transport-belt")
@@ -186,11 +203,12 @@ class TestSelfContained(unittest.TestCase):
         self.assertTrue(has_weaving(weave))
         self.assertFalse(has_weaving([ug("underground-belt", 0), ug("underground-belt", 4, True)]))
 
-    def test_furnace_labels_follow_the_lanes(self):
-        # iron plates (steel) and coal on the two lanes of the input belt: one label per lane, on its side
+    def test_one_label_when_lanes_do_not_matter(self):
+        # iron plates (steel) and coal on the two lanes of the input belt; the furnaces take both from
+        # either lane, so the lanes do not matter: one label with both items
         ir = add_port_labels(furnace_row(3), smelt="iron-plate")
         labels = sorted(e.extras_dict["signals"] for e in ir.entities if e.name == "constant-combinator")
-        self.assertEqual(labels, ["item:coal=1", "item:iron-plate=1"])
+        self.assertEqual(labels, ["item:coal=1;item:iron-plate=1"])
         inside = add_port_labels(furnace_row(3), inside_only=True)
         self.assertTrue(all(e.x >= 0 and e.y >= 0 for e in inside.entities))
 

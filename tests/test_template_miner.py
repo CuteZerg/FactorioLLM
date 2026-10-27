@@ -13,6 +13,7 @@ from factoriollm.template_miner import (
     is_mall,
     products,
     recipe_family,
+    straight_wall,
 )
 from factoriollm.templates import Template, normalize_modules
 
@@ -116,6 +117,22 @@ class TestFamiliesAndDefense(unittest.TestCase):
         wall = [IREntity("stone-wall", x, y) for x in range(20) for y in (0, 1)]
         turrets = [IREntity("laser-turret", 4 * i, 3) for i in range(5)]
         self.assertEqual(classify(IRBlueprint(wall + turrets)), "defense")
+
+
+class TestStraightWall(unittest.TestCase):
+    def wall(self, ys, x0=0, n=4):
+        return [IREntity("stone-wall", x0 + x, y) for x in range(n) for y in ys]
+
+    def test_straight_wall_and_ring(self):
+        straight = Template("defense", 4, self.wall([0, 1], -2, 2), self.wall([0, 1]), self.wall([0, 1], 8, 2), 2)
+        self.assertTrue(straight_wall(straight))
+        caps = [IREntity("stone-wall", -1, y) for y in range(10)]  # a ring: the head closes the two walls
+        ring = Template("defense", 4, caps, self.wall([0, 9]), [], 2)
+        self.assertFalse(straight_wall(ring))
+        across = Template("defense", 1, [], self.wall(range(30), n=1), [], 5)  # repeats across a long wall
+        self.assertFalse(straight_wall(across))
+        turrets = Template("defense", 4, [], [IREntity("gun-turret", 0, 0)], [], 3)
+        self.assertTrue(straight_wall(turrets))
 
 
 class TestSmeltingInput(unittest.TestCase):

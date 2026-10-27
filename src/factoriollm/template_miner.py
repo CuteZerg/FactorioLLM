@@ -48,6 +48,7 @@ from factoriollm.templates import (
     metrics,
     normalize_modules,
     prepare,
+    strip_unused,
     repair_power,
     signature,
     tiling_check,
@@ -491,6 +492,38 @@ class Rejects:
                 bucket[k] = (name, ir, result)
 
 
+MAX_WALL_THICKNESS = 20  # rows of wall (staggered rows and gaps included)
+MIN_WALL_COVER = 0.6     # share of the segment columns with a wall piece (gaps for gates, turrets)
+MAX_WALL_GAP = 3         # empty rows between staggered wall rows
+
+
+def straight_wall(t: Template) -> bool:
+    """
+    A piece of defence to repeat along the line: a segment form with walls in most columns of the
+    segment (MIN_WALL_COVER), all within one band at most MAX_WALL_THICKNESS thick, and the head and tail walls inside
+    that band too (dragon's teeth are fine; two walls far apart, or caps across the line, are a ring
+    or a perimeter; a thicker band repeats across the wall, not along it).
+    """
+    if not (t.head or t.repeats > 1 or t.tail):
+        return False
+    walls = ("stone-wall", "gate")
+    rows: Dict[int, set] = {}
+    for e in t.segment:
+        if e.name in walls:
+            w, h = footprint(e.name, e.direction)
+            for dx in range(w):
+                rows.setdefault((e.x + dx) % t.period, set()).update(range(e.y, e.y + h))
+    if not rows:
+        return True  # a row of turrets meant to stand behind a wall
+    every = set().union(*rows.values())
+    lo, hi = min(every), max(every)
+    ends = [y for e in t.head + t.tail if e.name in walls for y in range(e.y, e.y + footprint(e.name, e.direction)[1])]
+    gap = max((b - a - 1 for a, b in zip(sorted(every), sorted(every)[1:])), default=0)
+    return (len(rows) >= MIN_WALL_COVER * t.period and hi - lo + 1 <= MAX_WALL_THICKNESS
+            and gap <= MAX_WALL_GAP  # two walls with room between them are the sides of a ring
+            and all(lo <= y <= hi for y in ends))  # the caps of a ring stick out of the band
+
+
 def is_simple(t: Template) -> bool:
     """No beacons, no machine modules, no belt weaving, no assembling machine 3."""
     tr = t.metrics.get("traits") or {}
@@ -575,13 +608,19 @@ def _mine_design(ir: IRBlueprint, category: str, name: str, stats: Counter, reje
     if not source_flow.ok:
         rejects.add(f"author: {reason(source_flow)}", name, full, source_flow)
         return None
-    cut = full
+    cut, cut_flow = full, source_flow
     for step, (margin, taps) in enumerate(CROP_STEPS):
         candidate = prepare(ir, margin, defense, taps) if margin is not None else full
-        if margin is None or run_flow(candidate, hints, smelt)[0].ok:
-            cut = candidate
+        flow = run_flow(candidate, hints, smelt)[0] if margin is not None else source_flow
+        if flow.ok:
+            cut, cut_flow = candidate, flow
             stats[f"crop step {step}"] += 1
             break
+    # what the working design leaves unused: the author's bus passing through, taps to nowhere, extra poles
+    stripped = strip_unused(cut, cut_flow)
+    if len(stripped.entities) < len(cut.entities) and run_flow(stripped, hints, smelt)[0].ok:
+        cut = stripped
+        stats["unused parts removed"] += 1
     try:
         template = mine_one(cut, category)
     except BlueprintIRError:
@@ -611,8 +650,8 @@ def _mine_design(ir: IRBlueprint, category: str, name: str, stats: Counter, reje
         return None
     template = normalize_modules(template)
     segment = template.head or template.repeats > 1 or template.tail
-    if category == "defense" and not segment:
-        stats["defense_not_a_straight_wall"] += 1  # an outpost or a perimeter, not a piece of wall to repeat
+    if category == "defense" and not straight_wall(template):
+        stats["defense_not_a_straight_wall"] += 1  # an outpost, a ring or a perimeter, not a piece of wall to repeat
         return None
     build_flow = None
     for n in (1, 2) if segment else (1,):

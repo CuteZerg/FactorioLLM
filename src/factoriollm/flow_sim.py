@@ -94,6 +94,7 @@ class FlowResult:
     inputs: Dict[Any, Optional[str]] = field(default_factory=dict)
     status: str = "ok"  # ok / inputs_unsolved / inputs_ambiguous
     score: Tuple[float, ...] = ()
+    fluids: Dict[int, FrozenSet[str]] = field(default_factory=dict)  # entity -> fluids in its pipe networks
 
     @property
     def ok(self) -> bool:
@@ -798,8 +799,12 @@ def _verdict(L: Layout, lanes, received, ground, chests, working, inputs, needs_
         labelled_nets.add(net)
         ports.append(Port("fluid", "output" if net in producing else "input", L.boxes[b][0], None,
                           frozenset(fluids), tile, d))
+    entity_fluids: Dict[int, Set[str]] = {}
+    for b, (j, _, _, _) in enumerate(L.boxes):
+        entity_fluids.setdefault(j, set()).update(net_fluids.get(L.network[b], set()))
     return FlowResult(problems, {k: frozenset(v) for k, v in lanes.items()},
-                      {j: frozenset(v) for j, v in received.items()}, frozenset(working), ports)
+                      {j: frozenset(v) for j, v in received.items()}, frozenset(working), ports,
+                      fluids={j: frozenset(v) for j, v in entity_fluids.items()})
 
 
 # --- Input assignment -----------------------------------------------------------------------
@@ -1034,8 +1039,9 @@ def _fluid_constraints(L: Layout, fluid_domains) -> List[List[Tuple[Tuple[Any, .
 def _score(L: Layout, result: FlowResult, smelt: str, fuel: str, hints: Dict[Tile, Set[str]]) -> Tuple[float, ...]:
     """
     Ranks working assignments: agreement with the author's labels, the preferred smelting input and
-    fuel, then supply against demand (an item that machines use fast should be on the lane more or
-    faster inserters take from: green circuits on the near lane), then fewer used lanes.
+    fuel, whole belts (one item on both lanes) over lane-split ones, then supply against demand (an
+    item that machines use fast should be on the lane more or faster inserters take from: green
+    circuits on the near lane), then fewer used lanes.
     """
     agree = 0
     for key, item in result.inputs.items():
@@ -1060,7 +1066,13 @@ def _score(L: Layout, result: FlowResult, smelt: str, fuel: str, hints: Dict[Til
             for x, n in r.ingredients.items():
                 demand[x] = demand.get(x, 0.0) + n * speed / r.time
     ratios = [supply[x] / demand[x] for x in demand if x in supply and demand[x] > 0]
-    return (agree, prefer, round(min(ratios), 3) if ratios else 0.0, -used)
+    # a belt with a different item on each lane only when needed: whole belts are easier to feed
+    by_belt: Dict[int, Set[str]] = {}
+    for key, item in result.inputs.items():
+        if key[0] == "lane" and item:
+            by_belt.setdefault((key[1], key[2] // 2), set()).add(item)
+    mixed = sum(1 for items in by_belt.values() if len(items) > 1)
+    return (agree, prefer, -mixed, round(min(ratios), 3) if ratios else 0.0, -used)
 
 
 MAX_IMPROVE = 120  # simulations spent on improving the chosen assignment
@@ -1075,7 +1087,7 @@ def _improve(ir: IRBlueprint, L: Layout, best: FlowResult, domains, smelt: str, 
     """
     def key(r: FlowResult) -> Tuple[Any, ...]:
         distinct = len({x for k, x in r.inputs.items() if x and k[0] != "fluid"})
-        return (r.score[0], r.score[1], distinct) + tuple(r.score[2:])
+        return (r.score[0], r.score[1], distinct) + tuple(r.score[2:])  # then whole belts, supply, fewer lanes
 
     budget = MAX_IMPROVE
     improved = True
