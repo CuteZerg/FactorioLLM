@@ -259,6 +259,16 @@ class TestSelfContained(unittest.TestCase):
         inside = add_port_labels(furnace_row(3), inside_only=True)
         self.assertTrue(all(e.x >= 0 and e.y >= 0 for e in inside.entities))
 
+    def test_pass_through_belt_is_not_mixed(self):
+        # the coal belt runs past the boilers on to the next block: the line has an input and an
+        # output, but nothing is added to it, so each end gets one label without L / R
+        import json
+        from pathlib import Path
+        data = json.loads((Path(__file__).parent / "fixtures" / "flow" / "steam_coal_pass_through.json").read_text())
+        ir = IRBlueprint([IREntity(n, x, y, d, tuple(sorted(ex.items()))) for n, x, y, d, ex in data["entities"]])
+        labels = [e.extras_dict["signals"] for e in add_port_labels(ir).entities if e.name == "constant-combinator"]
+        self.assertEqual([s for s in labels if s.startswith("item:")], ["item:coal=1", "item:coal=1"])
+
 
 if __name__ == "__main__":
     unittest.main()

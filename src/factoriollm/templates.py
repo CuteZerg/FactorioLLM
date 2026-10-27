@@ -902,10 +902,11 @@ def add_port_labels(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal"
     from the flow simulator (see flow_sim.solve; `smelt`, `fuel`, `resource` are its preferences),
     not from the author:
     - an input belt gets one label at its start with its items (up to two, one per lane); a label per
-      lane, marked with the virtual signal L or R, only where the lanes matter: the design stops
-      working with the lanes swapped, or the other lane of the line carries products (a mixed belt:
-      one lane in, one out);
-    - an output belt gets a label in front of its end with what leaves on it (per lane on a mixed belt);
+      lane, marked with the virtual signal L or R, only where the lanes differ and matter: the design
+      stops working with the lanes swapped, or the line also carries products (a mixed belt: one lane
+      in, one out; a belt passing its inputs on to the next block is not mixed);
+    - an output belt gets a label in front of its end with what leaves on it (per lane on a mixed belt
+      and where the belt passes on input lanes that matter);
     - each half of a splitter is a belt of its own;
     - a chest filled from outside and an open pipe end get a label next to them (fluid signals).
     Labels go behind a start / in front of an end first, then to the sides, then to the nearest free
@@ -974,21 +975,24 @@ def add_port_labels(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal"
         before = {(q.kind, q.position) for q in flow.problems}
         return any((q.kind, q.position) not in before for q in check(ir, swapped, layout).problems)
 
-    def label_belt(i: int, half: int, by_lane: Dict[int, Set[str]], start: bool, mixed: bool) -> None:
+    def label_belt(i: int, half: int, by_lane: Dict[int, Set[str]], start: bool, mixed: bool) -> bool:
         """
         One label in line with the belt end. Where the lane matters, one label per lane, each with the
         virtual signal L or R (left / right lane in the direction of travel): a label beside a belt
-        reads as the label of the next belt.
+        reads as the label of the next belt. Returns whether the lanes got labels of their own.
         """
         items = set().union(*by_lane.values())
         whole = belt_ring(i, half, start)
         home = tile_of(i, half)
-        same = len({frozenset(v) for v in by_lane.values()}) == 1
-        if not mixed and (same or (start and not lanes_matter(i, half, by_lane))):
+        # both lanes carry the same: L / R tell nothing, even on a mixed line; a single lane on a
+        # mixed line still needs its side
+        same = len(by_lane) == 2 and len({frozenset(v) for v in by_lane.values()}) == 1
+        if same or (not mixed and (len(by_lane) < 2 or not start or not lanes_matter(i, half, by_lane))):
             put(whole, [f"item:{x}" for x in items], home)
-            return
+            return False
         for lane, v in sorted(by_lane.items()):
             put(whole, [f"item:{x}" for x in v] + ["virtual:signal-" + ("L" if lane % 2 == 0 else "R")], home)
+        return True
 
     inputs: Dict[Tuple[int, int], Dict[int, Set[str]]] = {}
     outputs: Dict[Tuple[int, int], Dict[int, Set[str]]] = {}
@@ -999,12 +1003,20 @@ def add_port_labels(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal"
     port_tiles = {tile_of(i, half) for i, half in list(inputs) + list(outputs)} | \
         {p.tile for p in flow.ports if p.kind == "fluid"} | {(ents[p.entity].x, ents[p.entity].y) for p in flow.ports
                                                              if p.kind == "chest"}
-    in_lines = {lines.get(ents[i]) for i, _ in inputs}
-    out_lines = {lines.get(ents[i]) for i, _ in outputs}
+    # a mixed line carries products next to its inputs; a line that passes its inputs through to the
+    # next block (coal past boilers, science past labs) is not mixed
+    line_items: Dict[Any, Dict[str, Set[str]]] = {}
+    for group, role in ((inputs, "in"), (outputs, "out")):
+        for (i, _), by_lane in group.items():
+            line_items.setdefault(lines.get(ents[i]), {"in": set(), "out": set()})[role].update(*by_lane.values())
+    mixed = {line for line, v in line_items.items() if v["in"] and v["out"] - v["in"]}
+    split: Set[Any] = set()  # lines whose input lanes matter: their pass-through outputs are labelled per lane too
     for (i, half), by_lane in sorted(inputs.items(), key=lambda kv: (ents[kv[0][0]].y, ents[kv[0][0]].x)):
-        label_belt(i, half, by_lane, True, mixed=lines.get(ents[i]) in out_lines)
+        if label_belt(i, half, by_lane, True, mixed=lines.get(ents[i]) in mixed):
+            split.add(lines.get(ents[i]))
     for (i, half), by_lane in sorted(outputs.items(), key=lambda kv: (ents[kv[0][0]].y, ents[kv[0][0]].x)):
-        label_belt(i, half, by_lane, False, mixed=lines.get(ents[i]) in in_lines)
+        line = lines.get(ents[i])
+        label_belt(i, half, by_lane, False, mixed=line in mixed or line in split)
     for p in flow.ports:
         if p.kind == "chest":
             e = ents[p.entity]
