@@ -98,8 +98,12 @@ The adapter is taken from `--adapter`, `$FACTORIOLLM_ADAPTER`, the newest folder
 
 Blueprints are parsed into an integer **tile-grid IR** (`blueprint_ir.py`): every entity is stored by its
 top-left tile, and 1.x (and 0.15+) strings are converted to 2.0 (renames, 8 → 16 directions, half-tile origin
-shift). Only Factorio 2.0 **base-game** entities and recipes are kept (no Space Age, no mods). Grid snapping,
-unwired label combinators / display panels and splitter settings are preserved.
+shift). Only Factorio 2.0 **base-game** content is kept: entities, recipes, items, signals and quality are
+checked against `base_game.py`, generated from the base mod of
+[wube/factorio-data](https://github.com/wube/factorio-data) (draftsman's own data includes Space Age).
+Recipes whose ingredients differed in the blueprint's game version (0.15 ... 1.1) are rejected, and so are
+inserters with their own pickup / drop positions (mods). Grid snapping, unwired label combinators / display
+panels, splitter settings, modules, logistic requests, inserter filters and the 2.0 `mirror` flag are preserved.
 
 ```bash
 uv run python src/factoriollm/init_db.py                                 # create / migrate tables
@@ -114,18 +118,34 @@ uv run python -m factoriollm.dataset_builder export                      # data/
   children, books with 10+ up to 50, others up to 25.
 * `prompts` sends several blueprints per request and rejects prompts with numbers that are not in the facts.
 
+## Flow simulator
+
+`flow_sim.py` answers "does this layout work on its own?" without running the game. It tracks which items can
+reach every belt lane (side-loading, curves, underground pairs, both halves of a splitter and its filter),
+what inserters move (with their filters, over the ground, through chests, from lab to lab, boiler to boiler
+or turret to turret), what machines make and which fluids fill each pipe network. `solve()` searches the items
+to feed into the inputs so that every machine gets its ingredients, products leave, no lane clogs and no
+fluids mix; problems are reported with their positions.
+
 ## Layout templates mined from player blueprints
 
-`template_miner.py` finds the best tileable designs per category in the scraped corpus, cuts each into
-**head + repeating segment + tail** (`templates.py`), checks that 1, 2 and 5 segments pass the validator and
-draftsman's collision check, and writes:
+`template_miner.py` finds the best tileable designs per category in the scraped corpus and keeps a design
+only if the simulator finds it working: as the author built it (a design made to dock with copies of itself
+is judged on the middle of three copies), after the author's surroundings are cut by flow, and in builds of
+the template. Each design is cut into **head + repeating segment + tail** or a whole cell (`templates.py`)
+with one belt tier (belt weaving kept), the same modules per machine kind, its own grid and input / output
+labels from the simulator. Categories follow the final product; intermediate products form families by
+recipe shape (one, two or three inputs, a fluid input), and defence is a category of straight wall pieces.
+Outputs:
 
 * `data/templates/catalog.json` — the templates with provenance and density metrics;
 * `outputs/templates/catalog.md` — a readable report;
-* `outputs/templates/catalog_book.txt` — one blueprint book with all templates for checking in game.
+* `outputs/templates/catalog_book.txt` — one blueprint book with all templates for checking in game;
+* `outputs/templates/rejects_book.txt` — a few rejected designs per reason, to check the reasons in game.
 
 ```bash
-uv run python -m factoriollm.template_miner --min-favorites 10
+uv run python -m factoriollm.template_miner --min-favorites 10   # ~20 min on 11 processes
+uv run python -m factoriollm.template_miner --only defense,labs  # re-mine some categories into the catalog
 uv run python tools/extract_balancers.py          # balancer templates (Raynquist's book first) -> helpers.py
 uv run python tools/extract_game_data.py         # base-game recipes, items, signals, recipe history
 ```
@@ -166,8 +186,9 @@ uv run python -m unittest discover tests     # all (test_sandbox needs Docker; t
 - [x] Validator, evaluation suite, configurable LoRA training, unattended runs
 - [x] Parametric modules, automatic power wiring, balancer templates, grid snapping, label combinators
 - [x] Template miner over popular player blueprints and an in-game review book
-- [ ] Template fixes after the in-game review (product-based categories, modules and logistic requests,
+- [x] Template fixes after the in-game reviews (product-based categories, modules and logistic requests,
       self-contained templates, computed grids, strict power checks, density-first defaults)
+- [x] Flow simulator; only working templates; labels per lane; base-game data and recipe history; defence
 - [ ] Generic templates (assembler rows by number of input lanes, fluid rows, furnace lines) for any recipe
 - [ ] Modules API on top of templates; synthetic and repair examples; dataset v5; fine-tuning
 - [ ] Iterative refinement (edit a generated blueprint by instruction); mod support via game data dumps
