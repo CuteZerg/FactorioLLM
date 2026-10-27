@@ -1094,10 +1094,13 @@ def _improve(ir: IRBlueprint, L: Layout, best: FlowResult, domains, smelt: str, 
     """
     Local search on a working assignment: other candidates on one port at a time, kept if the
     layout still works and more different items come in (labs fed all their science packs, not one
-    pack on every lane), or the score improves otherwise.
+    pack on every lane; alternatives such as fuels do not count), or the score improves otherwise.
     """
+    # fuels, ammunition and smelting inputs are alternatives: one is enough, more is no better
+    alternatives = set(FUELS) | {a for kinds in AMMO.values() for a in kinds} | set(SMELTING)
+
     def key(r: FlowResult) -> Tuple[Any, ...]:
-        distinct = len({x for k, x in r.inputs.items() if x and k[0] != "fluid"})
+        distinct = len({x for k, x in r.inputs.items() if x and k[0] != "fluid" and x not in alternatives})
         return (r.score[0], r.score[1], distinct) + tuple(r.score[2:])  # then whole belts, supply, fewer lanes
 
     budget = MAX_IMPROVE
