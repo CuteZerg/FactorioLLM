@@ -71,7 +71,7 @@ blueprints, not from the model's memory.
 * PostgreSQL (for the dataset pipeline)
 * An NVIDIA GPU with CUDA for training and inference (developed on an RTX 5070, 12 GB)
 * A `.env` file with `DATABASE_URL`, `GEMINI_API_KEY` (and optionally `PROXY_URL`, `GEMINI_MODEL`, `GEMINI_RPM`,
-  `GEMINI_MAX_REQUESTS`, `TELEGRAM_BOT_TOKEN`)
+  `GEMINI_MAX_REQUESTS`)
 
 ### Installation
 
@@ -157,7 +157,7 @@ uv run python src/factoriollm/train_model.py --run-name smoke --subsample per-bl
 uv run python src/factoriollm/train_model.py --run-name pilot --subsample per-blueprint --epochs 1
 uv run python -m factoriollm.eval_suite --adapter adapters/pilot [--retries 3]
 uv run python -m factoriollm.eval_suite --compare outputs/eval/<a>.json outputs/eval/<b>.json
-uv run python tools/overnight.py --detach         # unattended pipeline (Task Scheduler) + tools/train_monitor.py
+uv run python tools/overnight.py --detach         # unattended pipeline (Task Scheduler)
 ```
 
 The loss is computed on the assistant's code only. `eval_suite` measures completeness, execution, validity,

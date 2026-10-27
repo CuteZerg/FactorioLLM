@@ -27,6 +27,11 @@ unsloth_compiled_cache/
 # Claude Code: personal local settings
 .claude/settings.local.json
 
+# Local Telegram tools (bot, notifications): never published
+*telegram*
+*Telegram*
+tools/train_monitor.py
+
 # AI
 docs/
 CLAUDE.md

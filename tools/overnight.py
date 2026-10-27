@@ -1,6 +1,6 @@
 """
 Unattended overnight pipeline: runs evaluation / training steps one after another and records
-progress in outputs/pipeline/status.json (read by tools/train_monitor.py).
+progress in outputs/pipeline/status.json.
 
     uv run python tools/overnight.py            # run in the foreground
     uv run python tools/overnight.py --detach   # run via Windows Task Scheduler, independent of this terminal
