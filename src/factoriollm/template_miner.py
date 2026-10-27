@@ -480,6 +480,16 @@ def copies(ir: IRBlueprint, step: Tuple[int, int], n: int = 3) -> Optional[IRBlu
     return ir.with_entities(list(placed))
 
 
+EDGE_REACH = 3  # tiles from the border within which a problem may be a neighbour copy's business
+
+
+def _at_edge(ir: IRBlueprint, result: FlowResult, axis: int) -> bool:
+    """Whether some problem lies near the design's border across `axis` (0: left/right, 1: top/bottom)."""
+    lo = min((e.x, e.y)[axis] for e in ir.entities)
+    hi = max((e.x, e.y)[axis] + footprint(e.name, e.direction)[axis] for e in ir.entities)
+    return any(p.position[axis] - lo < EDGE_REACH or hi - p.position[axis] <= EDGE_REACH for p in result.problems)
+
+
 def middle_flow(ir: IRBlueprint, step: Tuple[int, int], hints: Optional[Dict] = None,
                 first: str = "iron-ore") -> Optional[Tuple[FlowResult, str]]:
     """
@@ -735,9 +745,10 @@ def _mine_design(ir: IRBlueprint, category: str, name: str, stats: Counter, reje
     source_flow, smelt = run_flow(full, hints)
     dock: Optional[Tuple[int, int]] = None  # step to the neighbouring copy for a design made to dock
     if not source_flow.ok:
-        # the author's grid gives the step to the next copy; without one, copies stand side by side
+        # the author's grid gives the step to the next copy; without one, copies stand side by side.
+        # A neighbour copy can only help where a problem sits at that edge of the design.
         width, height = ir.snap or full.size
-        for step in ((width, 0), (0, height)):
+        for step in [s for s, axis in (((width, 0), 0), ((0, height), 1)) if _at_edge(full, source_flow, axis)]:
             tiled = middle_flow(full, step, hints, smelt)
             if tiled is not None and tiled[0].ok:
                 (source_flow, smelt), dock = tiled, step

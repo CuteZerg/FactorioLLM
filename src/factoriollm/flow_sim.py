@@ -32,6 +32,7 @@ assignment that makes the layout work (`check()` lists the problems of one assig
 from __future__ import annotations
 
 import itertools
+from collections import Counter
 import math
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -550,24 +551,40 @@ FLAMETHROWER = "<flamethrower>"  # any of FLAMETHROWER_FLUIDS
 
 def _fluid_roles(L: Layout) -> Tuple[Dict[int, List[Tuple[List[int], str]]], Dict[int, List[Tuple[int, str]]]]:
     """
-    Per machine: [(input boxes, fluid)] the fluid must reach and [(output box, fluid)] it puts out.
-    A recipe fluid uses the box its fluidbox_index names (1-based among the machine's input or output
-    boxes), else the boxes in order; where the boxes are on the machine follows its mirror flag
-    (Layout._fluid_boxes).
+    Per machine: [(input boxes, fluid)] the fluid may come through and [(output box, fluid)] it puts
+    out. A fluid uses the box its recipe's fluidbox_index names (1-based among the machine's input or
+    output boxes). Otherwise an ingredient may use any free input box, several products take the
+    output boxes in order, and a single product the box something is connected to: the game's rule
+    for fluids without an index is not documented, and these choices match the corpus (see the
+    review of 27.10). Where the boxes are follows the machine's mirror flag (Layout._fluid_boxes).
     """
+    if getattr(L, "_roles", None) is not None:  # independent of the inputs: once per layout
+        return L._roles
     needs: Dict[int, List[Tuple[List[int], str]]] = {}
     makes: Dict[int, List[Tuple[int, str]]] = {}
     by_entity: Dict[int, List[int]] = {}
     for b, (j, k, ptype, flt) in enumerate(L.boxes):
         by_entity.setdefault(j, []).append(b)
+    net_size = Counter(L.network)
+    open_boxes = {b for b, _, _ in L.open_ends}
     for j, bs in by_entity.items():
         e, t = L.ents[j], L.types[j]
         r = recipe(e.extras_dict.get("recipe") or "")
         ins = [b for b in bs if L.boxes[b][2] == "input"]
         outs = [b for b in bs if L.boxes[b][2] == "output"]
         if t == "assembling-machine" and r:
-            needs[j] = _boxes_for([f for f in r.ingredients if f in r.fluids], ins, r.box_in, lambda b, f: ([b], f))
-            makes[j] = _boxes_for([f for f in r.results if f in r.fluids], outs, r.box_out, lambda b, f: (b, f))
+            # a fluid ingredient may come through any input box the recipe does not give to another one
+            # (popular 0.16 / 1.x designs feed lubricant's heavy oil through the second input)
+            named_in = {f: ins[i - 1] for f, i in r.box_in.items() if 0 < i <= len(ins)}
+            free_in = [b for b in ins if b not in named_in.values()]
+            needs[j] = [([named_in[f]] if f in named_in else free_in, f) for f in r.ingredients if f in r.fluids]
+            fout = [f for f in r.results if f in r.fluids]
+            if len(fout) == 1 and fout[0] not in r.box_out and len(outs) > 1:
+                # one fluid product: out of the box something is connected to (else the first)
+                linked = [b for b in outs if net_size[L.network[b]] > 1 or b in open_boxes]
+                makes[j] = [((linked or outs)[0], fout[0])]
+            else:
+                makes[j] = _boxes_for(fout, outs, r.box_out, lambda b, f: (b, f))
         elif t == "boiler":
             needs[j] = [(ins, L.boxes[ins[0]][3] or "water")] if ins else []
             makes[j] = [(b, L.boxes[b][3] or "steam") for b in outs]
@@ -579,6 +596,7 @@ def _fluid_roles(L: Layout) -> Tuple[Dict[int, List[Tuple[List[int], str]]], Dic
             makes[j] = [(b, "crude-oil") for b in bs]
         elif t == "fluid-turret":
             needs[j] = [(bs, FLAMETHROWER)]
+    L._roles = (needs, makes)
     return needs, makes
 
 
@@ -1000,27 +1018,33 @@ def _demand(L: Layout, smelt: str, fuel: str) -> Dict[Tuple[Any, ...], Dict[str,
         own = _wants(L, ("entity", j), smelt, fuel)
         if own:
             add(("entity", j), {x: r for r, x in enumerate(own)})
-    changed = True
-    while changed:
-        changed = False
-        for idx, (src, dst) in enumerate(L.links):
-            node = ("lane", dst[1]) if dst[0] == "lane" else dst
-            wanted = {x: r for x, r in demand.get(node, {}).items() if L.moves(idx, {x})}
+    into: Dict[Tuple[Any, ...], List[int]] = {}  # node -> inserters putting items there
+    for idx, (_, dst) in enumerate(L.links):
+        into.setdefault(("lane", dst[1]) if dst[0] == "lane" else dst, []).append(idx)
+    stack = list(demand)
+    while stack:  # what a node wants spreads back to what feeds it
+        node = stack.pop()
+        have = demand.get(node, {})
+        if node[0] == "lane":
+            for src_lane, rule in L.reverse[node[1]]:
+                if add(("lane", src_lane), {x: r for x, r in have.items() if _passes(rule, x)}):
+                    stack.append(("lane", src_lane))
+        for idx in into.get(node, []):
+            src = L.links[idx][0]
+            wanted = {x: r for x, r in have.items() if L.moves(idx, {x})}
             if not wanted:
                 continue
             if src[0] == "belt":
-                for lane in L.belt_lanes(src[1]):
-                    changed |= add(("lane", lane), wanted)
-            elif src[0] == "ground" or (src[0] == "entity" and (L.types[src[1]] in CONTAINERS
-                                                                or L.types[src[1]] in PASS_ON)):
+                targets = [("lane", lane) for lane in L.belt_lanes(src[1])]
+            elif src[0] == "ground" or (src[0] == "entity" and (L.types[src[1]] in CONTAINERS or L.types[src[1]] in PASS_ON)):
                 acc = L.accepts(src[1]) if src[0] == "entity" and L.types[src[1]] in PASS_ON else ANY
-                passed = {x: r for x, r in wanted.items() if acc is ANY or x in acc}
-                changed |= add(src, passed)
-        for lane, outs in L.edges.items():
-            for dst_lane, rule in outs:
-                wanted = {x: r for x, r in demand.get(("lane", dst_lane), {}).items() if _passes(rule, x)}
-                if wanted:
-                    changed |= add(("lane", lane), wanted)
+                wanted = {x: r for x, r in wanted.items() if acc is ANY or x in acc}
+                targets = [src]
+            else:
+                targets = []
+            for target in targets:
+                if add(target, wanted):
+                    stack.append(target)
     return demand
 
 
