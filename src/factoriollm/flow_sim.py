@@ -626,6 +626,35 @@ def check(ir: IRBlueprint, inputs: Dict[Any, Optional[str]], layout: Optional[La
 
 
 def _simulate(L: Layout, inputs: Dict[Any, Optional[str]]) -> FlowResult:
+    """
+    The flow from these inputs. A fluid loop that feeds itself (coal liquefaction needs the heavy
+    oil it makes) works once primed, as players do in game: a fluid a stopped machine would put into
+    a network where it is needed is assumed present, and assumptions whose makers still do not work
+    are dropped until the rest holds up.
+    """
+    result = _fixpoint(L, inputs, frozenset())
+    if getattr(L, "_priming", None) is None:
+        needs_f, makes_f = _fluid_roles(L)
+        needed = {(L.network[b], f) for ns in needs_f.values() for bs, f in ns for b in bs if f != FLAMETHROWER}
+        makers: Dict[Tuple[int, str], Set[int]] = {}
+        for j, made in makes_f.items():
+            for b, f in made:
+                if (L.network[b], f) in needed:
+                    makers.setdefault((L.network[b], f), set()).add(j)
+        L._priming = makers
+    makers = L._priming
+    assumed = frozenset(nf for nf, js in makers.items() if not js & result.working)
+    while assumed:
+        trial = _fixpoint(L, inputs, assumed)
+        kept = frozenset(nf for nf in assumed if makers[nf] & trial.working)
+        if kept == assumed:
+            return trial
+        assumed = kept
+    return result
+
+
+def _fixpoint(L: Layout, inputs: Dict[Any, Optional[str]], primed: FrozenSet[Tuple[int, str]]) -> FlowResult:
+    """Items and fluids spread from the inputs (and the primed (network, fluid) pairs) until nothing changes."""
     ents = L.ents
     lanes: Dict[Lane, Set[str]] = {k: set() for k in L.edges}
     received: Dict[int, Set[str]] = {}
@@ -647,6 +676,8 @@ def _simulate(L: Layout, inputs: Dict[Any, Optional[str]]) -> FlowResult:
     for key, item in inputs.items():
         if key[0] == "fluid" and item:
             net_fluids.setdefault(key[1], set()).add(item)
+    for net, fluid in primed:
+        net_fluids.setdefault(net, set()).add(fluid)
     working: Set[int] = set()
 
     def works(j: int) -> bool:
@@ -834,6 +865,7 @@ def _verdict(L: Layout, lanes, received, ground, chests, working, inputs, needs_
 
     # ports
     ports: List[Port] = []
+    chest_items: Dict[int, Set[str]] = {}  # a chest filled by hand may hold several items
     for key, item in inputs.items():
         if not item:
             continue
@@ -841,7 +873,9 @@ def _verdict(L: Layout, lanes, received, ground, chests, working, inputs, needs_
             e = ents[key[1]]
             ports.append(Port("lane", "input", key[1], key[2], frozenset({item}), (e.x, e.y), e.direction))
         elif key[0] == "chest":
-            ports.append(Port("chest", "input", key[1], None, frozenset({item}), pos(key[1])))
+            chest_items.setdefault(key[1], set()).add(item)
+    for j, items in sorted(chest_items.items()):
+        ports.append(Port("chest", "input", j, None, frozenset(items), pos(j)))
     for k in sorted(outputs):
         e = ents[k[0]]
         ports.append(Port("lane", "output", k[0], k[1], frozenset(lanes[k] & products), (e.x, e.y), e.direction))
@@ -1112,6 +1146,83 @@ def _constraints(L: Layout, ports: List[Tuple[Any, ...]], domains, static: _Stat
     return out
 
 
+def _doomed(L: Layout, ports: List[Tuple[Any, ...]]) -> bool:
+    """
+    Whether the layout has a problem whatever comes in: an inserter dropping into nothing (or on
+    ground nobody picks from), a machine whose products nobody takes, or a machine or inserter that
+    no flow reaches from any input or inner source (a machine missing its input inserter).
+    """
+    picked_ground = {src for src, _ in L.links if src[0] == "ground"}
+    taken_from = {src[1] for src, _ in L.links if src[0] == "entity"}
+    for src, dst in L.links:
+        if dst[0] == "none" or (dst[0] == "ground" and dst not in picked_ground) or (
+                dst[0] == "entity" and L.accepts(dst[1]) is not ANY and not L.accepts(dst[1])):
+            return True
+    for j, t in enumerate(L.types):
+        if t in ("assembling-machine", "furnace") and L.is_machine(j) and j not in taken_from:
+            r = recipe(L.ents[j].extras_dict.get("recipe") or "")
+            if t == "furnace" or (r and set(r.results) - r.fluids):
+                return True
+    # what can reach where: from the input ports, request chests, drills and fluid sources
+    needs_f, makes_f = _fluid_roles(L)
+    out_of: Dict[Tuple[Any, ...], List[Tuple[Any, ...]]] = {}
+    for idx, (src, dst) in enumerate(L.links):
+        node = ("entity", src[1]) if src[0] == "belt" else src
+        out_of.setdefault(node, []).append(("inserter", idx))
+        out_of.setdefault(("inserter", idx), []).append(("entity", dst[1][0]) if dst[0] == "lane" else dst)
+    for (i, _), outs in L.edges.items():
+        out_of.setdefault(("entity", i), []).extend(("entity", j) for (j, _), _ in outs)
+    for b, (j, _, _, _) in enumerate(L.boxes):
+        out_of.setdefault(("net", L.network[b]), []).append(("entity", j))
+    for j, made in makes_f.items():
+        out_of.setdefault(("entity", j), []).extend(("net", L.network[b]) for b, _ in made)
+    starts = [("entity", p[1]) if p[0] != "fluid" else ("net", p[1]) for p in ports]
+    starts += [("entity", j) for j, t in enumerate(L.types) if t in CONTAINERS and L.ents[j].extras_dict.get("requests")]
+    starts += [("entity", j) for j, _ in L.drills] + [("entity", j) for j in makes_f if j not in needs_f]
+    seen = set(starts)
+    stack = list(starts)
+    while stack:
+        for n in out_of.get(stack.pop(), []):
+            if n not in seen:
+                seen.add(n)
+                stack.append(n)
+    if any(("inserter", idx) not in seen for idx in range(len(L.links))):
+        return True
+    return any(("entity", j) not in seen for j in range(len(L.ents))
+               if L.is_machine(j) and (L.needs(j) or needs_f.get(j)))
+
+
+def _same_fuels(L: Layout, constraints: List[List[Tuple[Tuple[Any, ...], str]]], hints: Dict[Tile, Set[str]]
+                ) -> List[List[Tuple[Tuple[Any, ...], str]]]:
+    """
+    Fuels nothing in the layout names (no inserter or splitter filter, chest request, recipe or
+    author label) behave the same everywhere: each port keeps only the first of them (the preferred
+    fuel). Otherwise every need of fuel branches five ways and the search runs out of budget.
+    """
+    named: Set[str] = set().union(*hints.values()) if hints else set()
+    for flt in L.filters:
+        if flt is not None:
+            named |= flt[1]
+    for e in L.ents:
+        ex = e.extras_dict
+        named |= {ex["filter"]} if ex.get("filter") else set()
+        named |= {p.split("=")[0] for p in (ex.get("requests") or "").split(";") if p}
+        r = recipe(ex.get("recipe") or "")
+        if r:
+            named |= set(r.ingredients) | set(r.results)
+    out = []
+    for options in constraints:
+        seen: Set[Tuple[Any, ...]] = set()
+        kept = []
+        for p, x in options:
+            key = (p[:2] if p[0] == "chest" else p, "<fuel>") if x in FUELS and x not in named else (p, x)
+            if key not in seen:
+                seen.add(key)
+                kept.append((p, x))
+        out.append(kept)
+    return out
+
+
 def _fluid_constraints(L: Layout, fluid_domains) -> List[List[Tuple[Tuple[Any, ...], str]]]:
     """Every fluid a machine needs must come through one of its input networks (unless made inside)."""
     needs_f, makes_f = _fluid_roles(L)
@@ -1202,24 +1313,148 @@ def _improve(ir: IRBlueprint, L: Layout, best: FlowResult, domains, smelt: str, 
     return best
 
 
+def _parts(L: Layout) -> List[List[int]]:
+    """
+    Groups of entities that share flow (lanes, inserters with what they pick from and drop into,
+    drills, pipe connections); no item or fluid passes between two groups, so each can get its
+    inputs on its own. Entities without any flow (poles, beacons, lamps) are left out.
+    """
+    parent: Dict[Any, Any] = {}
+
+    def root(a: Any) -> Any:
+        parent.setdefault(a, a)
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def join(a: Any, b: Any) -> None:
+        parent[root(a)] = root(b)
+
+    def node(end: Tuple[str, Any]) -> Optional[Any]:
+        kind, ref = end
+        if kind == "lane":
+            return ref[0]
+        if kind in ("belt", "entity"):
+            return ref
+        return ("ground", ref) if kind == "ground" else None
+
+    for (i, _), outs in L.edges.items():
+        root(i)
+        for (j, _), _ in outs:
+            join(i, j)
+    for i, (src, dst) in zip(L.inserters, L.links):
+        for end in (src, dst):
+            n = node(end)
+            join(i, i) if n is None else join(i, n)
+    for j, drop in L.drills:
+        n = node(drop)
+        join(j, j) if n is None else join(j, n)
+    for a, b in L.pipe_links:
+        join(a, b)
+    for j, _, _, _ in L.boxes:
+        root(j)
+    groups: Dict[Any, List[int]] = {}
+    for a in list(parent):
+        if not isinstance(a, tuple):
+            groups.setdefault(root(a), []).append(a)
+    return [sorted(g) for g in groups.values()]
+
+
+def _part_blueprint(ir: IRBlueprint, L: Layout, part: List[int], hints: Dict[Tile, Set[str]]
+                    ) -> Tuple[IRBlueprint, List[int], Dict[Tile, Set[str]], Tile]:
+    """
+    One part as a blueprint of its own, moved to the origin and in a fixed order (identical parts
+    give identical blueprints): the part's entities, then a wall on every neighbouring tile another
+    part occupies (a pipe that ends against another machine is not an open end). Returns the
+    blueprint, the full index of each of its entities, the author's labels moved with it, the shift.
+    """
+    ox = min(L.ents[i].x for i in part)
+    oy = min(L.ents[i].y for i in part)
+    order = sorted(part, key=lambda i: (L.ents[i].y, L.ents[i].x, L.ents[i].name, L.ents[i].direction, L.ents[i].extras))
+    own = {t for i in part for t in _tiles(L.ents[i])}
+    blocked = sorted({(x + dx, y + dy) for x, y in own for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))
+                      if (x + dx, y + dy) in L.tiles and (x + dx, y + dy) not in own}, key=lambda t: (t[1], t[0]))
+    ents = [IREntity(L.ents[i].name, L.ents[i].x - ox, L.ents[i].y - oy, L.ents[i].direction, L.ents[i].extras)
+            for i in order] + [IREntity("stone-wall", x - ox, y - oy) for x, y in blocked]
+    xs = [t[0] for t in own]
+    ys = [t[1] for t in own]
+    near = {(x - ox, y - oy): v for (x, y), v in hints.items()
+            if min(xs) - 3 <= x <= max(xs) + 3 and min(ys) - 3 <= y <= max(ys) + 3}
+    return ir.with_entities(ents), order, near, (ox, oy)
+
+
 def solve(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal", resource: str = "iron-ore",
           hints: Optional[Dict[Tile, Set[str]]] = None, max_leaves: int = MAX_LEAVES) -> FlowResult:
     """
-    Finds the input assignment under which the layout works (no problems). The search picks the
-    open constraint with the fewest options (see _constraints), tries each (port, item) choice and
-    simulates the layout once all constraints are met. Among working assignments the best by
-    _score wins. Without one, the result with the fewest problems is returned with status
-    'inputs_unsolved', or 'inputs_ambiguous' when the search ran out of MAX_LEAVES simulations.
+    Finds the input assignment under which the layout works (no problems), see _solve_whole. A
+    layout made of parts that share no flow (furnace columns side by side, separate lines of a
+    book page) is solved part by part, each with the full search budget, and identical parts only
+    once: one search over all of them at once runs out of budget long before it tries every
+    combination. The joined assignment is simulated on the whole layout.
     """
     L = Layout(ir, resource)
     hints = hints or {}
+    fluid_nets = {port[1] for port in _fluid_domains(L)}
+    at_ports = {port[1] for port in input_ports(L)} | {j for b, (j, _, _, _) in enumerate(L.boxes)
+                                                       if L.network[b] in fluid_nets}
+    parts = [p for p in _parts(L) if at_ports.intersection(p)]
+    if len(parts) <= 1:
+        return _solve_whole(ir, L, smelt, fuel, hints, max_leaves)
+    box_of = {(j, k): b for b, (j, k, _, _) in enumerate(L.boxes)}
+    solved: Dict[Any, Tuple[Layout, FlowResult]] = {}
+    inputs: Dict[Any, Optional[str]] = {}
+    ambiguous = False
+    for part in parts:
+        sub, order, near, _ = _part_blueprint(ir, L, part, hints)
+        key = (tuple(sub.entities), tuple(sorted((t, tuple(sorted(v))) for t, v in near.items())))
+        if key not in solved:
+            S = Layout(sub, resource)
+            solved[key] = (S, _solve_whole(sub, S, smelt, fuel, near, max_leaves))
+        S, res = solved[key]
+        ambiguous |= res.status == "inputs_ambiguous"
+        for port, item in res.inputs.items():
+            if port[0] == "fluid":
+                b = S.network.index(port[1])
+                j, k = S.boxes[b][0], S.boxes[b][1]
+                inputs[("fluid", L.network[box_of[(order[j], k)]])] = item
+            else:
+                inputs[(port[0], order[port[1]]) + tuple(port[2:])] = item
+    result = check(ir, inputs, L)
+    if result.problems:
+        result.status = "inputs_ambiguous" if ambiguous else "inputs_unsolved"
+    else:
+        result.score = _score(L, result, smelt, fuel, hints)
+    return result
+
+
+def _solve_whole(ir: IRBlueprint, L: Layout, smelt: str, fuel: str, hints: Dict[Tile, Set[str]],
+                 max_leaves: int) -> FlowResult:
+    """
+    The search for one layout: it picks the open constraint with the fewest options (see
+    _constraints), tries each (port, item) choice and simulates the layout once all constraints
+    are met. Among working assignments the best by _score wins. Without one, the result with the
+    fewest problems is returned with status 'inputs_unsolved', or 'inputs_ambiguous' when the
+    search ran out of MAX_LEAVES simulations.
+    """
     static = _Static(L)
     ports = input_ports(L)
     domains = _domains(L, ports, smelt, fuel, static)
+    # a chest filled by hand holds what the player puts in, several items too (the hub chest of a
+    # hand-fed starter base): one yes / no port ('chest', j, item) per candidate item
+    for p in [p for p in ports if p[0] == "chest"]:
+        ports.remove(p)
+        for x in domains.pop(p):
+            if x:
+                ports.append(("chest", p[1], x))
+                domains[("chest", p[1], x)] = [x, None]
     fluid_domains = _fluid_domains(L)
-    constraints = _constraints(L, ports, domains, static) + _fluid_constraints(L, fluid_domains)
+    constraints = _same_fuels(L, _constraints(L, ports, domains, static), hints) + _fluid_constraints(L, fluid_domains)
     ports += list(fluid_domains)
     domains.update(fluid_domains)
+    # no assignment can make the whole layout work: running out of budget is then not the reason
+    # (the search still runs: copies made to dock are judged on their middle one only)
+    doomed = _doomed(L, ports)
     solutions: List[FlowResult] = []
     tried: Set[FrozenSet[Tuple[Any, Optional[str]]]] = set()
     best_fail: List[Optional[FlowResult]] = [None]
@@ -1301,5 +1536,6 @@ def solve(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal", resource
             s.score = _score(L, s, smelt, fuel, hints)
         return _improve(ir, L, max(solutions, key=lambda s: s.score), domains, smelt, fuel, hints)
     result = best_fail[0] or check(ir, {p: (fluid_domains[p][0] if p in fluid_domains else None) for p in ports}, L)
-    result.status = "inputs_ambiguous" if leaves[0] >= max_leaves or steps[0] >= MAX_STEPS * max_leaves         else "inputs_unsolved"
+    ran_out = leaves[0] >= max_leaves or steps[0] >= MAX_STEPS * max_leaves
+    result.status = "inputs_ambiguous" if ran_out and not doomed else "inputs_unsolved"
     return result

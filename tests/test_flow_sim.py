@@ -145,6 +145,44 @@ class FlowSimReviewTest(unittest.TestCase):
         self.assertTrue(docked.ok, docked.problems)
 
 
+class FlowSimPartsTest(unittest.TestCase):
+    """Layouts of parts that share no flow are solved part by part."""
+
+    @staticmethod
+    def lines(n, dy=10):
+        return IRBlueprint([IREntity(e.name, e.x, e.y + k * dy, e.direction, e.extras)
+                            for k in range(n) for e in gear_line([E("small-electric-pole", 4, 3)]).entities])
+
+    def test_parts_share_no_flow(self):
+        from factoriollm.flow_sim import _parts
+        L = Layout(self.lines(3))
+        parts = _parts(L)
+        self.assertEqual(len(parts), 3)
+        self.assertFalse(any(L.ents[i].name == "small-electric-pole" for p in parts for i in p))  # no flow
+
+    def test_identical_parts_are_solved_once(self):
+        from unittest import mock
+        from factoriollm import flow_sim
+        with mock.patch.object(flow_sim, "_solve_whole", wraps=flow_sim._solve_whole) as whole:
+            r = solve(self.lines(4))
+        self.assertTrue(r.ok, r.problems)
+        self.assertEqual(whole.call_count, 1)
+        fed = {r.inputs.get(("lane", i, l)) for i, e in enumerate(self.lines(4).entities) if e.x == 0 and e.y % 10 == 0
+               for l in (0, 1)}
+        self.assertEqual(fed, {"iron-plate"})  # every line got the assignment found for the first one
+
+    def test_a_pipe_against_another_part_is_not_an_open_end(self):
+        from factoriollm.flow_sim import _part_blueprint, _parts
+        # a chemical plant's input pipe ends against a belt: blocked there, open only to the sides
+        ir = IRBlueprint([E("chemical-plant", 0, 2, 0, recipe="sulfur"), E("pipe", 0, 1)] + belts(-2, 3, 0, d=4))
+        L = Layout(ir)
+        part = next(p for p in _parts(L) if any(L.ents[i].name == "chemical-plant" for i in p))
+        sub, _, _, (ox, oy) = _part_blueprint(ir, L, part, {})
+        ends = lambda L, dx=0, dy=0: {(t[0] + dx, t[1] + dy) for _, t, _ in L.open_ends}  # noqa: E731
+        self.assertNotIn((0, 0), ends(L))
+        self.assertEqual(ends(Layout(sub), ox, oy), ends(L))
+
+
 class FlowSimRealDesignsTest(unittest.TestCase):
     """Player designs from the second in-game review of the template book."""
 
@@ -176,6 +214,21 @@ class FlowSimRealDesignsTest(unittest.TestCase):
         r = solve(fixture("blue_science_no_coal"))
         self.assertFalse(r.ok)
         self.assertTrue(any("coal" in p.message for p in r.problems if p.kind == "starved"))
+
+    def test_coal_liquefaction_works_once_primed(self):
+        # the refineries take back the heavy oil they make: players prime the loop once
+        r = solve(fixture("coal_liquefaction_primed"))
+        self.assertTrue(r.ok, r.problems[:3])
+        # a refinery whose heavy oil output is not piped back to its input cannot prime itself
+        lone = IRBlueprint([E("oil-refinery", 0, 0, 0, recipe="coal-liquefaction")])
+        self.assertTrue(any("heavy-oil" in p.message for p in check(lone, {}).problems))
+
+    def test_hand_fed_hub_chest_holds_two_items(self):
+        # one chest by hand feeds the gear, cable, circuit and red science machines: iron and copper
+        r = solve(fixture("hand_fed_hub_chest"))
+        self.assertTrue(r.ok, r.problems[:3])
+        hub = [p for p in r.ports if p.kind == "chest"]
+        self.assertEqual([p.items for p in hub], [frozenset({"iron-plate", "copper-plate"})])
 
     def test_ore_to_steel(self):
         r = solve(fixture("ore_to_steel_column"))
