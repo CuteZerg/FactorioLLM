@@ -171,9 +171,7 @@ class Template:
         """
         if segments < 1:
             raise ValueError("a template needs at least one segment")
-        ents = self._place({"head": self.head, "segment": self.segment, "tail": self.tail}, segments)
-        if belt or self.belt:
-            ents = retier(ents, belt or self.belt)
+        ents = self._place(self._tiered_parts(belt or self.belt), segments)
         if modules or modules_by_recipe:
             ents = _set_modules(ents, {**self.modules, **(modules or {})},
                                 {**self.modules_by_recipe, **(modules_by_recipe or {})})
@@ -184,9 +182,30 @@ class Template:
             ents += [e for k, e in enumerate(free) if len(ents) + k not in dark]
         return normalized(IRBlueprint(ents))
 
+    def _tiered_parts(self, belt: Optional[str]) -> Dict[str, List[IREntity]]:
+        """
+        Head, segment and tail at belt tier `belt` (see retier), decided once on three copies: an
+        underground pair may join two neighbouring copies (a weave between copies of a cell), which a
+        single copy does not show. The segment takes the tiers of the middle copy, so every build,
+        whatever its length, has the same tiers.
+        """
+        parts = {"head": self.head, "segment": self.segment, "tail": self.tail}
+        if not belt:
+            return parts
+        cache = self.__dict__.setdefault("_tier_cache", {})
+        if belt not in cache:
+            copies = 3
+            raw = self._place(parts, copies)
+            name_at = {(e.x, e.y): t.name for e, t in zip(raw, retier(raw, belt)) if e.name in _TIER}
+            shift = {"head": 0, "segment": self.period, "tail": (copies - self.repeats) * self.period}
+            cache[belt] = {part: [IREntity(name_at.get((e.x + shift[part], e.y), e.name) if e.name in _TIER else e.name,
+                                           e.x, e.y, e.direction, e.extras) for e in ents]
+                           for part, ents in parts.items()}
+        return cache[belt]
+
     def build_segment(self, belt: Optional[str] = None) -> IRBlueprint:
         """One segment on its own grid (relative snapping, cell = period x segment height), to tile in game."""
-        ents = retier(list(self.segment), belt or self.belt) if belt or self.belt else list(self.segment)
+        ents = list(self._tiered_parts(belt or self.belt)["segment"])
         y0 = min(e.y for e in ents)
         return IRBlueprint([IREntity(e.name, e.x, e.y - y0, e.direction, e.extras) for e in ents], snap=self.snap)
 
@@ -856,16 +875,18 @@ def add_port_labels(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal"
     from the flow simulator (see flow_sim.solve; `smelt`, `fuel`, `resource` are its preferences),
     not from the author:
     - an input belt gets one label at its start with its items (up to two, one per lane); a label per
-      lane on that lane's side only where the lanes matter: the design stops working with the lanes
-      swapped, or the other lane of the line carries products (a mixed belt: one lane in, one out);
+      lane, marked with the virtual signal L or R, only where the lanes matter: the design stops
+      working with the lanes swapped, or the other lane of the line carries products (a mixed belt:
+      one lane in, one out);
     - an output belt gets a label in front of its end with what leaves on it (per lane on a mixed belt);
     - each half of a splitter is a belt of its own;
     - a chest filled from outside and an open pipe end get a label next to them (fluid signals).
-    Labels go behind a start / in front of an end first, then to the sides; with inside_only the
-    bounding box is not left.
+    Labels go behind a start / in front of an end first, then to the sides, then to the nearest free
+    tile (designs walled in by beacons); with inside_only the bounding box is not left.
     """
     from factoriollm.flow_sim import Layout, check, solve
 
+    LABEL_REACH = 6
     ents = list(ir.entities)
     flow = flow or solve(ir, smelt=smelt, fuel=fuel, resource=resource)
     layout = Layout(ir, resource)
@@ -878,13 +899,19 @@ def add_port_labels(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal"
         return t not in used and (not inside_only or (min(xs) <= t[0] <= max(xs) and min(ys) <= t[1] <= max(ys)))
 
     def put(ring: List[Tuple[int, int]], signals: List[str]) -> bool:
-        for t in ring:
-            if free(t):
-                used.add(t)
-                labels.append(IREntity("constant-combinator", t[0], t[1], 0, (("signals", ";".join(
-                    f"{s}=1" for s in sorted(signals))),)))
-                return True
-        return False
+        """The first free tile of the ring, else the nearest free tile around it (beacons all round)."""
+        spot = next((t for t in ring if free(t)), None)
+        if spot is None and ring:
+            x0, y0 = ring[0]
+            around = sorted(((x0 + dx, y0 + dy) for dx in range(-LABEL_REACH, LABEL_REACH + 1)
+                             for dy in range(-LABEL_REACH, LABEL_REACH + 1)), key=lambda t: abs(t[0] - x0) + abs(t[1] - y0))
+            spot = next((t for t in around if free(t)), None)
+        if spot is None:
+            return False
+        used.add(spot)
+        labels.append(IREntity("constant-combinator", spot[0], spot[1], 0, (("signals", ";".join(
+            f"{s}=1" for s in sorted(signals))),)))
+        return True
 
     def tile_of(i: int, half: int) -> Tuple[int, int]:
         tiles = _tiles(ents[i])
@@ -916,15 +943,19 @@ def add_port_labels(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal"
         return any((q.kind, q.position) not in before for q in check(ir, swapped, layout).problems)
 
     def label_belt(i: int, half: int, by_lane: Dict[int, Set[str]], start: bool, mixed: bool) -> None:
+        """
+        One label in line with the belt end. Where the lane matters, one label per lane, each with the
+        virtual signal L or R (left / right lane in the direction of travel): a label beside a belt
+        reads as the label of the next belt.
+        """
         items = set().union(*by_lane.values())
         whole = belt_ring(i, half, start, None)
         same = len({frozenset(v) for v in by_lane.values()}) == 1
         if not mixed and (same or (start and not lanes_matter(i, half, by_lane))):
             put(whole, [f"item:{x}" for x in items])
             return
-        placed = all(put(belt_ring(i, half, start, lane), [f"item:{x}" for x in v]) for lane, v in sorted(by_lane.items()))
-        if not placed:  # no room on the sides: one label with everything
-            put(whole, [f"item:{x}" for x in items])
+        for lane, v in sorted(by_lane.items()):
+            put(whole, [f"item:{x}" for x in v] + ["virtual:signal-" + ("L" if lane % 2 == 0 else "R")])
 
     inputs: Dict[Tuple[int, int], Dict[int, Set[str]]] = {}
     outputs: Dict[Tuple[int, int], Dict[int, Set[str]]] = {}

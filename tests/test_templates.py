@@ -139,6 +139,27 @@ class TestSelfContained(unittest.TestCase):
                        "transport-belt")
         self.assertEqual(len({e.name for e in mixed}), 2)  # retier keeps the two directions on two tiers
 
+    def test_weave_between_copies_keeps_its_tiers(self):
+        # a fast pair from one copy to the next passes over the yellow pair of the next copy
+        seg = [ug("underground-belt", 0, True), ug("underground-belt", 1), ug("fast-underground-belt", 2, True),
+               ug("fast-underground-belt", 3), IREntity("transport-belt", 0, 1, 4)]
+        t = Template("labs", 4, [], seg, [], 1)
+        t.belt = "transport-belt"
+        for n in (1, 3):
+            names = {e.name for e in t.build(n).entities if "underground" in e.name}
+            self.assertEqual(names, {"underground-belt", "fast-underground-belt"}, n)
+        built = t.build(3).entities
+        self.assertIn((3, 6), {(built[i].x, built[j].x) for i, j in underground_pairs(built).items()})
+
+    def test_mixed_belt_labels_name_the_lane(self):
+        import json
+        from pathlib import Path
+        data = json.loads((Path(__file__).parent / "fixtures" / "flow" / "processing_units_mixed_belt.json").read_text())
+        ir = IRBlueprint([IREntity(n, x, y, d, tuple(sorted(ex.items()))) for n, x, y, d, ex in data["entities"]])
+        signals = [e.extras_dict["signals"] for e in add_port_labels(ir).entities if e.name == "constant-combinator"]
+        self.assertTrue(any("electronic-circuit" in s and "signal-" in s for s in signals), signals)
+        self.assertTrue(any("processing-unit" in s and "signal-" in s for s in signals), signals)
+
     def test_feeder_poles_are_pruned(self):
         lab = IREntity("lab", 0, 0)
         near = IREntity("medium-electric-pole", 3, 1)
