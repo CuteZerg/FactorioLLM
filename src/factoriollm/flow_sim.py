@@ -63,6 +63,7 @@ PASS_ON = frozenset({"lab", "boiler", "reactor"})
 MAX_LEAVES = 400      # full simulations per solve before giving up as ambiguous
 MAX_SOLUTIONS = 12    # working assignments compared by score
 MAX_EXTRA_LEAVES = 40  # simulations spent on alternatives after the first working assignment
+MAX_STEPS = 20        # search nodes per leaf budget (each node scans every constraint)
 
 
 @dataclass(frozen=True)
@@ -163,9 +164,12 @@ class Layout:
             (i, l): [] for i in self.belts for l in self.lanes_of[i]}
         self._build_lanes()
         self.incoming: Dict[Lane, int] = {}
+        self.reverse: Dict[Lane, List[Tuple[Lane, Optional[Tuple[str, str]]]]] = {k: [] for k in self.edges}
         for src, outs in self.edges.items():
-            for dst, _ in outs:
+            for dst, rule in outs:
                 self.incoming[dst] = self.incoming.get(dst, 0) + 1
+                self.reverse[dst].append((src, rule))
+        self._need: Optional[Dict[Lane, Optional[Set[str]]]] = None
         self.inserters = [i for i, t in enumerate(self.types) if t == "inserter"]
         self.links = [self._inserter(i) for i in self.inserters]
         self.drills = [(i, self._drop(self.ents[i], _point(self.ents[i], "vector_to_place_result")))
@@ -206,6 +210,46 @@ class Layout:
                 out = self.ents[side[0]].direction
         self._curves[j] = out
         return out
+
+    def lane_need(self) -> Dict[Lane, Optional[Set[str]]]:
+        """
+        Per lane: the items some inserter takes from it or from a lane it flows into (None: anything,
+        a chest or the ground takes all). Independent of the inputs, so computed once per layout.
+        """
+        if self._need is not None:
+            return self._need
+        picks = _picks(self)
+        need: Dict[Lane, Optional[Set[str]]] = {}
+        for k in self.edges:
+            p = picks.get(k[0], frozenset())
+            need[k] = None if p is ANY else set(p)
+        stack = list(self.edges)
+        while stack:  # push what a lane needs back to the lanes feeding it
+            dst = stack.pop()
+            for src, rule in self.reverse[dst]:
+                if need[src] is None:
+                    continue
+                if need[dst] is None:
+                    need[src] = None
+                    stack.append(src)
+                    continue
+                add = {x for x in need[dst] if _passes(rule, x)} - need[src]
+                if add:
+                    need[src] |= add
+                    stack.append(src)
+        self._need = need
+        return need
+
+    def upstream(self, lanes: Iterable[Lane]) -> Set[Lane]:
+        """These lanes and every lane that flows into them."""
+        seen = set(lanes)
+        stack = list(seen)
+        while stack:
+            for src, _ in self.reverse[stack.pop()]:
+                if src not in seen:
+                    seen.add(src)
+                    stack.append(src)
+        return seen
 
     def half(self, j: int, tile: Tile) -> int:
         """0 for the left half of splitter j (in its direction), 1 for the right half."""
@@ -720,36 +764,10 @@ def _verdict(L: Layout, lanes, received, ground, chests, working, inputs, needs_
             problems.append(Problem("dangling_inserter", f"{e.name} at {(e.x, e.y)} drops into nothing", (e.x, e.y)))
 
     # belts: clogs and mixed outputs
-    picks = _picks(L)
-    need: Dict[Lane, Optional[Set[str]]] = {}
-    for k in L.edges:
-        p = picks.get(k[0], frozenset())
-        need[k] = None if p is ANY else set(p)
-    changed = True
-    while changed:
-        changed = False
-        for k, outs in L.edges.items():
-            for dst, rule in outs:
-                if need[k] is None:
-                    continue
-                if need[dst] is None:
-                    need[k] = None
-                    changed = True
-                    continue
-                add = {x for x in need[dst] if _passes(rule, x)} - need[k]
-                if add:
-                    need[k] |= add
-                    changed = True
+    need = L.lane_need()
     terminals = [k for k, outs in L.edges.items() if not outs and lanes[k]]
     outputs = {k for k in terminals if lanes[k] & products}
-    leads_out: Set[Lane] = set(outputs)
-    changed = True
-    while changed:
-        changed = False
-        for k, outs in L.edges.items():
-            if k not in leads_out and any(dst in leads_out for dst, _ in outs):
-                leads_out.add(k)
-                changed = True
+    leads_out = L.upstream(outputs)
     reported: Set[Tuple[str, int]] = set()
     for k, items in lanes.items():
         n = need[k]
@@ -851,6 +869,18 @@ def _fluid_domains(L: Layout) -> Dict[Tuple[Any, ...], List[Optional[str]]]:
     return out
 
 
+def _reach_all(L: Layout, starts: Iterable[Lane]) -> Set[Lane]:
+    """Lanes reachable from any of these lanes."""
+    seen = set(starts)
+    stack = list(seen)
+    while stack:
+        for dst, _ in L.edges[stack.pop()]:
+            if dst not in seen:
+                seen.add(dst)
+                stack.append(dst)
+    return seen
+
+
 def _reach(L: Layout, k: Lane, item: Optional[str] = None) -> Set[Lane]:
     """Lanes reachable from lane k (for an item: through the splitter filters it passes)."""
     seen, stack = {k}, [k]
@@ -867,37 +897,13 @@ class _Static:
 
     def __init__(self, L: Layout):
         self.L = L
-        picks = _picks(L)
-        self.need: Dict[Lane, Optional[Set[str]]] = {}
-        for k in L.edges:
-            p = picks.get(k[0], frozenset())
-            self.need[k] = None if p is ANY else set(p)
-        changed = True
-        while changed:
-            changed = False
-            for k, outs in L.edges.items():
-                for dst, rule in outs:
-                    if self.need[k] is None:
-                        continue
-                    if self.need[dst] is None:
-                        self.need[k] = None
-                        changed = True
-                        continue
-                    add = {x for x in self.need[dst] if _passes(rule, x)} - self.need[k]
-                    if add:
-                        self.need[k] |= add
-                        changed = True
+        self.need = L.lane_need()
         # lanes that machines, drills or other inner sources put items on, and where those lead
         dropped = {dst[1] for src, dst in L.links if dst[0] == "lane" and src[0] != "belt"} | \
                   {ref for _, (kind, ref) in L.drills if kind == "lane"}
-        self.inner: Set[Lane] = set()
-        for k in dropped:
-            self.inner |= _reach(L, k)
+        self.inner: Set[Lane] = _reach_all(L, dropped)
         out_terms = {k for k in self.inner if not L.edges[k]}
-        self.leads_out: Set[Lane] = set()
-        for k in L.edges:
-            if _reach(L, k) & out_terms:
-                self.leads_out.add(k)
+        self.leads_out: Set[Lane] = L.upstream(out_terms)
         self.crafted: Set[str] = set()  # what recipes here make (never an input from outside)
         for j in range(len(L.ents)):
             r = recipe(L.ents[j].extras_dict.get("recipe") or "")
@@ -961,9 +967,14 @@ def _domains(L: Layout, ports: List[Tuple[Any, ...]], smelt: str, fuel: str, sta
         cands: List[str] = []
         if port[0] == "lane":
             start = (port[1], port[2])
+            by_item: Dict[str, Set[Lane]] = {}  # lanes an item from this port can reach (splitter filters)
             for k in _reach(L, start):
                 for idx in takers.get(k[0], []):
-                    cands += [x for x in _wants(L, L.links[idx][1], smelt, fuel) if k in _reach(L, start, x)]
+                    for x in _wants(L, L.links[idx][1], smelt, fuel):
+                        if x not in by_item:
+                            by_item[x] = _reach(L, start, x)
+                        if k in by_item[x]:
+                            cands.append(x)
             # what a machine here makes does not come from outside (cable in a circuit block)
             cands = [x for x in dict.fromkeys(cands) if x not in static.crafted and static.safe(start, x)]
         else:
@@ -1138,10 +1149,10 @@ def solve(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal", resource
 
     def simulate(assign: Dict[Tuple[Any, ...], str]) -> bool:
         key = frozenset(assign.items())
+        leaves[0] += 1  # a repeat counts too: the budget bounds the search, not only the simulations
         if key in tried:
             return False
         tried.add(key)
-        leaves[0] += 1
         result = check(ir, {p: assign.get(p) for p in ports}, L)
         if not result.problems:
             solutions.append(result)
@@ -1174,13 +1185,21 @@ def solve(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal", resource
             if simulate({**assign, **dict(zip(filled, combo))}):
                 return
 
+    visited: Set[FrozenSet[Tuple[Any, str]]] = set()  # partial assignments already searched (in any order)
+    steps = [0]
+
     def done() -> bool:
-        return leaves[0] >= max_leaves or len(solutions) >= MAX_SOLUTIONS or (
+        return leaves[0] >= max_leaves or len(solutions) >= MAX_SOLUTIONS or steps[0] >= MAX_STEPS * max_leaves or (
             first[0] is not None and leaves[0] - first[0] >= MAX_EXTRA_LEAVES)
 
     def search(assign: Dict[Tuple[Any, ...], str]) -> None:
         if done():
             return
+        state = frozenset(assign.items())
+        if state in visited:
+            return
+        visited.add(state)
+        steps[0] += 1
         open_ = []
         for options in constraints:
             if not any(assign.get(p) == x for p, x in options):
@@ -1201,5 +1220,5 @@ def solve(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal", resource
             s.score = _score(L, s, smelt, fuel, hints)
         return _improve(ir, L, max(solutions, key=lambda s: s.score), domains, smelt, fuel, hints)
     result = best_fail[0] or check(ir, {p: (fluid_domains[p][0] if p in fluid_domains else None) for p in ports}, L)
-    result.status = "inputs_ambiguous" if leaves[0] >= max_leaves else "inputs_unsolved"
+    result.status = "inputs_ambiguous" if leaves[0] >= max_leaves or steps[0] >= MAX_STEPS * max_leaves         else "inputs_unsolved"
     return result

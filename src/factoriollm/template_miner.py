@@ -441,6 +441,8 @@ def run_flow(ir: IRBlueprint, hints: Optional[Dict] = None, first: str = "iron-o
         if result.ok:
             return result, smelt
         found = found or (result, smelt)
+        if not any(p.kind == "starved" and "furnace" in p.message for p in result.problems):
+            break  # another smelting input only helps a furnace that got nothing
     return found
 
 
@@ -531,50 +533,98 @@ def is_simple(t: Template) -> bool:
             and not tr.get("weaving") and main_machine(t) != "assembling-machine-3")
 
 
-def mine(min_favorites: int = 10, per_category: int = 8, only: Optional[set] = None
+class _Collected:
+    """Rejections of one worker, light enough to send back (the problems, not the whole simulation)."""
+
+    def __init__(self):
+        self.items: List[Tuple[str, str, IRBlueprint, FlowResult]] = []
+
+    def add(self, why: str, name: str, ir: IRBlueprint, result: FlowResult) -> None:
+        self.items.append((why, name, ir, FlowResult(result.problems[:3], {}, {}, frozenset(), [], status=result.status)))
+
+
+def _mine_row(job: Tuple[Dict[str, Any], Optional[set]]) -> Tuple[Counter, list, List[Tuple[str, Template]]]:
+    """Every design of one corpus row (a blueprint or a book): counters, rejections, templates found."""
+    row, only = job
+    stats: Counter = Counter()
+    rejects = _Collected()
+    found: List[Tuple[str, Template]] = []
+    if not _vanilla(row["tags"]):
+        stats["modded"] += 1
+        return stats, [], []
+    try:
+        items = list(iter_blueprints(decode_blueprint_string(row["blueprint_string"])))
+    except BlueprintIRError:
+        stats["decode_error"] += 1
+        return stats, [], []
+    for path, bp, version in items:
+        if len(bp.get("entities") or []) > MAX_ENTITIES:
+            stats["too_large"] += 1
+            continue
+        try:
+            ir = parse_blueprint_dict(bp, version=version, book_path=path)
+        except BlueprintIRError as e:
+            stats[f"not_parsed: {_parse_reason(str(e))}"] += 1
+            continue
+        category = classify(ir)
+        if category is None:
+            if is_mall(products(ir)):
+                stats["mall"] += 1
+            continue
+        if only and category not in only:
+            continue
+        stats[f"candidates {category}"] += 1
+        name = (ir.label or row["title"] or "").strip()
+        template = _mine_design(ir, category, name, stats, rejects)
+        if template is None:
+            continue
+        template.source = {"key": row["key"], "book_path": path, "label": ir.label, "title": row["title"],
+                           "favorites": row["favorites"], "version": list(version)}
+        template.metrics.update(metrics(template))
+        template.metrics["kind"] = "segment" if template.head or template.repeats > 1 or template.tail else "cell"
+        if category == "multi":
+            template.metrics["products"] = products(ir)
+        template.metrics["traits"] = traits(template)
+        found.append((category, template))
+    return stats, rejects.items, found
+
+
+def mine(min_favorites: int = 10, per_category: int = 8, only: Optional[set] = None, workers: int = 0
          ) -> Tuple[Dict[str, List[Template]], Rejects]:
-    rows = asyncio.run(_load(min_favorites))
+    """
+    Mines the corpus rows in `workers` processes (0: all cores but one; 1: in this process). Results
+    come back in row order, so the catalog and the rejects sample do not depend on the worker count.
+    """
+    import multiprocessing
+    import time
+
+    from factoriollm import template_miner as this  # workers find _mine_row by its package path
+
+    rows = [{k: r[k] for k in ("key", "title", "favorites", "tags", "blueprint_string")}
+            for r in asyncio.run(_load(min_favorites))]
+    workers = workers or max(1, (multiprocessing.cpu_count() or 2) - 1)
     stats: Counter = Counter()
     rejects = Rejects()
     found: Dict[str, List[Template]] = {}
-    for row in rows:
-        if not _vanilla(row["tags"]):
-            stats["modded"] += 1
-            continue
-        try:
-            items = list(iter_blueprints(decode_blueprint_string(row["blueprint_string"])))
-        except BlueprintIRError:
-            stats["decode_error"] += 1
-            continue
-        for path, bp, version in items:
-            if len(bp.get("entities") or []) > MAX_ENTITIES:
-                stats["too_large"] += 1
-                continue
-            try:
-                ir = parse_blueprint_dict(bp, version=version, book_path=path)
-            except BlueprintIRError as e:
-                stats[f"not_parsed: {_parse_reason(str(e))}"] += 1
-                continue
-            category = classify(ir)
-            if category is None:
-                if is_mall(products(ir)):
-                    stats["mall"] += 1
-                continue
-            if only and category not in only:
-                continue
-            stats[f"candidates {category}"] += 1
-            name = (ir.label or row["title"] or "").strip()
-            template = _mine_design(ir, category, name, stats, rejects)
-            if template is None:
-                continue
-            template.source = {"key": row["key"], "book_path": path, "label": ir.label, "title": row["title"],
-                               "favorites": row["favorites"], "version": list(version)}
-            template.metrics.update(metrics(template))
-            template.metrics["kind"] = "segment" if template.head or template.repeats > 1 or template.tail else "cell"
-            if category == "multi":
-                template.metrics["products"] = products(ir)
-            template.metrics["traits"] = traits(template)
-            found.setdefault(category, []).append(template)
+    jobs = ((row, only) for row in rows)
+    start = time.time()
+
+    def collect(results) -> None:
+        for n, (row_stats, row_rejects, row_found) in enumerate(results, 1):
+            stats.update(row_stats)
+            for why, name, ir, result in row_rejects:
+                rejects.add(why, name, ir, result)
+            for category, template in row_found:
+                found.setdefault(category, []).append(template)
+            if n % 1000 == 0:
+                print(f"[*] {n}/{len(rows)} rows, {time.time() - start:.0f} s", flush=True)
+
+    if workers == 1:
+        collect(map(this._mine_row, jobs))
+    else:
+        with multiprocessing.get_context("spawn").Pool(workers) as pool:
+            collect(pool.imap(this._mine_row, jobs, chunksize=1))  # rows differ a lot (whole books)
+    print(f"[*] {len(rows)} rows mined in {time.time() - start:.0f} s with {workers} worker(s)")
     best: Dict[str, List[Template]] = {}
     for cat, ts in sorted(found.items()):
         unique: Dict[Any, Template] = {}
@@ -893,6 +943,7 @@ def main():
                         help="Rewrite the report and the book from the existing catalog (no mining)")
     parser.add_argument("--previous", type=Path, default=None,
                         help="Catalog to compare with (default: the catalog being replaced)")
+    parser.add_argument("--workers", type=int, default=0, help="Processes for mining (0: all cores but one)")
     parser.add_argument("--only", default="",
                         help="Comma-separated categories to mine again; the rest of the catalog is kept")
     args = parser.parse_args()
@@ -902,10 +953,10 @@ def main():
     if args.report_only:
         best = load_catalog()
     elif only:
-        best = {**load_catalog(), **mine(args.min_favorites, args.per_category, only)[0]}
+        best = {**load_catalog(), **mine(args.min_favorites, args.per_category, only, args.workers)[0]}
         previous = load_catalog(args.previous) if args.previous else {}
     else:
-        best, rejects = mine(args.min_favorites, args.per_category)
+        best, rejects = mine(args.min_favorites, args.per_category, workers=args.workers)
     stats = json.loads(STATS.read_text(encoding="utf-8")) if STATS.exists() else None
     write_outputs(best, previous, stats)
     write_book(best)
