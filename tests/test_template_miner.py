@@ -191,11 +191,13 @@ class CropKeepsInputsAtTheBorderTest(unittest.TestCase):
         from tests.test_golden_set import GOLDEN, load
         from factoriollm.template_miner import Rejects, _mine_design, inner_inputs, run_flow
         _, ir = load(GOLDEN / "battle_bots.json")
-        t = _mine_design(ir, "assembly_2in", "battle bots", Counter(), Rejects())
+        stats = Counter()
+        t = _mine_design(ir, "assembly_2in", "battle bots", stats, Rejects())
         build = t.build(1)
         flow, _ = run_flow(build, share_lanes=False)
         self.assertTrue(flow.ok, flow.problems[:3])
         self.assertEqual(inner_inputs(build, flow), [])
+        self.assertNotIn("crop step 0", stats)  # the cut of bus taps was refused
 
 
 class DensityTest(unittest.TestCase):

@@ -768,11 +768,15 @@ def mine(min_favorites: int = 10, per_category: int = 8, only: Optional[set] = N
     return best, rejects
 
 
+INNER_DEPTH = 3  # an input belt starting this many tiles inside the bounding box (against its flow) starts inside
+
+
 def inner_inputs(ir: IRBlueprint, flow: FlowResult) -> List[Tuple[int, int]]:
     """
-    Input belts that start inside the design: the tile behind their start lies within the bounding
-    box. A cut that removes a bus tap leaves the tapped column starting in the middle of the design,
-    where nobody can feed it and its label sits among the machines.
+    Input belts that start deep inside the design: more than INNER_DEPTH tiles from the edge of the
+    bounding box behind them and on both sides (a start is fed from behind or side-loaded). A cut that removes a bus tap can leave the tapped column starting in
+    the middle of the design, where nobody can feed it and its label sits among the machines (a
+    feed cut near the edge, past a pole or an inserter row, starts at the edge in all but name).
     """
     tiles = [(e.x + dx, e.y + dy) for e in ir.entities for dx in range(footprint(e.name, e.direction)[0])
              for dy in range(footprint(e.name, e.direction)[1])]
@@ -783,9 +787,44 @@ def inner_inputs(ir: IRBlueprint, flow: FlowResult) -> List[Tuple[int, int]]:
     for p in flow.ports:
         if p.kind == "lane" and p.role == "input":
             dx, dy = vec.get(p.direction % 16, (0, 0))
-            bx, by = p.tile[0] - dx, p.tile[1] - dy
-            if x0 <= bx <= x1 and y0 <= by <= y1:
+            x, y = p.tile
+            # a belt start is fed from behind or from either side (side-loading)
+            if dx:
+                depth = min(x - x0 if dx > 0 else x1 - x, y - y0, y1 - y)
+            else:
+                depth = min(y - y0 if dy > 0 else y1 - y, x - x0, x1 - x)
+            if depth > INNER_DEPTH:
                 out.append(p.tile)
+    return out
+
+
+def tapped_inputs(full: IRBlueprint, cut: IRBlueprint, flow: FlowResult) -> List[Tuple[int, int]]:
+    """
+    Input belts of a cut design that the author fed from a splitter the cut removed (a bus tap): the
+    tapped column now starts among the machines, cut off from the bus that still runs by (battle
+    bots: steel had to be put in the middle of the design).
+    """
+    from factoriollm.flow_sim import Layout
+    L = Layout(full)
+    kept = set(cut.entities)
+    at = {(e.x, e.y): i for i, e in enumerate(L.ents)}
+    out = []
+    for p in flow.ports:
+        if p.kind != "lane" or p.role != "input" or p.tile not in at:
+            continue
+        # upstream in the author's design through what the cut removed, to a removed splitter
+        start = [(at[p.tile], lane) for lane in L.lanes_of.get(at[p.tile], ())]
+        seen, stack = set(start), list(start)
+        while stack:
+            for src, _ in L.reverse.get(stack.pop(), []):
+                if src in seen or L.ents[src[0]] in kept:
+                    continue
+                if L.types[src[0]] == "splitter":
+                    out.append(p.tile)
+                    stack = []
+                    break
+                seen.add(src)
+                stack.append(src)
     return out
 
 
@@ -835,7 +874,8 @@ def _mine_design(ir: IRBlueprint, category: str, name: str, stats: Counter, reje
     for step_no, (margin, taps) in enumerate(CROP_STEPS):
         candidate = prepare(ir, margin, defense, taps) if margin is not None else full
         flow = verdict(candidate) if margin is not None else source_flow
-        if flow.ok and (margin is None or not inner_inputs(candidate, flow)):
+        # a cut bus tap whose column now starts inside the design: a gentler cut keeps the tap
+        if flow.ok and (margin is None or not set(tapped_inputs(full, candidate, flow)) & set(inner_inputs(candidate, flow))):
             cut, cut_flow = candidate, flow
             stats[f"crop step {step_no}"] += 1
             break
