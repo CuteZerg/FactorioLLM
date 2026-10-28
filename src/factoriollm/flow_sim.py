@@ -844,6 +844,13 @@ def _verdict(L: Layout, lanes, received, ground, chests, working, inputs, needs_
             missing += ["oil" if f == FLAMETHROWER else f for bs, f in needs_f.get(j, [])
                         if not _has_fluid(f, set().union(*(net_fluids.get(L.network[b], set()) for b in bs)) if bs else set())]
             problems.append(Problem("starved", f"{ents[j].name} at {pos(j)} lacks {', '.join(missing) or 'fluid'}", pos(j)))
+    # research needs every pack in every lab: a lab without a pack the other labs get idles
+    labs = [j for j in working if L.types[j] == "lab"]
+    every_pack = set().union(*(received.get(j, set()) for j in labs)) if labs else set()
+    for j in labs:
+        missing = sorted(every_pack - received.get(j, set()))
+        if missing:
+            problems.append(Problem("starved", f"lab at {pos(j)} lacks {', '.join(missing)}", pos(j)))
     taken_from = {src[1] for src, _ in L.links if src[0] == "entity"}
     for j in working:
         if L.types[j] in ("assembling-machine", "furnace") and L.products(j, frozenset(received.get(j, set()))) \

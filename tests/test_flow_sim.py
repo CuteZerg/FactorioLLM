@@ -154,6 +154,18 @@ class FlowSimReviewTest(unittest.TestCase):
         self.assertNotEqual(net[0], net[7])
         self.assertNotIn((1, 0), {t for _, t, _ in L.open_ends})
 
+    def test_lab_without_a_pack_the_others_get_idles(self):
+        # two labs on one belt; only the second lab's inserter also reaches a second belt with green
+        ir = IRBlueprint(belts(0, 7, 0) + belts(0, 7, 6) + [
+            E("inserter", 1, 1, 0), E("lab", 0, 2), E("inserter", 5, 1, 0), E("lab", 4, 2), E("inserter", 5, 5, 8)])
+        L = Layout(ir)
+        top = [p for p in input_ports(L) if L.ents[p[1]].y == 0]
+        bottom = [p for p in input_ports(L) if L.ents[p[1]].y == 6]
+        inputs = {**{p: "automation-science-pack" for p in top}, **{p: "logistic-science-pack" for p in bottom}}
+        r = check(ir, inputs, L)
+        self.assertTrue(any(p.kind == "starved" and "logistic" in p.message for p in r.problems), r.problems)
+        self.assertTrue(solve(ir).ok)  # red only on both: every lab gets every pack there is
+
     def test_design_made_to_dock(self):
         # the machine's input inserter takes from the belt of the copy to its left
         cell = IRBlueprint([E("inserter", 0, 1, 12), E("assembling-machine-1", 1, 0, recipe="iron-gear-wheel"),
