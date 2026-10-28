@@ -200,6 +200,22 @@ class CropKeepsInputsAtTheBorderTest(unittest.TestCase):
         self.assertNotIn("crop step 0", stats)  # the cut of bus taps was refused
 
 
+class PlainlyFedTemplatesTest(unittest.TestCase):
+    def test_unfinished_weave_is_no_template(self):
+        # the author did not run the steel underground to the last machine of each row (checked in
+        # game): it works only with steel mixed onto the gear lane, which a template must not need
+        import json
+        from collections import Counter
+        from pathlib import Path
+        from factoriollm.template_miner import Rejects, _mine_design
+        data = json.loads((Path(__file__).parent / "fixtures" / "flow" / "engines_unfinished_weave.json").read_text(encoding="utf-8"))
+        ir = IRBlueprint([IREntity(n, x, y, d, tuple(sorted(ex.items()))) for n, x, y, d, ex in data["entities"]],
+                         version=tuple(data["version"]))
+        rejects = Rejects()
+        self.assertIsNone(_mine_design(ir, "assembly_3in", "Engines", Counter(), rejects))
+        self.assertIn("template: starved", rejects.seen)
+
+
 class DensityTest(unittest.TestCase):
     def test_a_long_feed_with_poles_is_too_sparse(self):
         from factoriollm.template_miner import MIN_DENSITY, density
