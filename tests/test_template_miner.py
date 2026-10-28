@@ -180,6 +180,24 @@ class TestMinerParts(unittest.TestCase):
         self.assertEqual(len(rejects.kept["clog"]), 2)
 
 
+class CropKeepsInputsAtTheBorderTest(unittest.TestCase):
+    def test_bus_tap_kept_when_cutting_it_leaves_an_inner_input(self):
+        # the battle bots block feeds a column from the bus through a splitter tap; cutting the tap
+        # leaves the column starting in the middle of the design, so a gentler cut must be used
+        import sys
+        from collections import Counter
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from tests.test_golden_set import GOLDEN, load
+        from factoriollm.template_miner import Rejects, _mine_design, inner_inputs, run_flow
+        _, ir = load(GOLDEN / "battle_bots.json")
+        t = _mine_design(ir, "assembly_2in", "battle bots", Counter(), Rejects())
+        build = t.build(1)
+        flow, _ = run_flow(build, share_lanes=False)
+        self.assertTrue(flow.ok, flow.problems[:3])
+        self.assertEqual(inner_inputs(build, flow), [])
+
+
 class DensityTest(unittest.TestCase):
     def test_a_long_feed_with_poles_is_too_sparse(self):
         from factoriollm.template_miner import MIN_DENSITY, density

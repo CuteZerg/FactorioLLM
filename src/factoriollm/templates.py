@@ -966,8 +966,8 @@ def add_port_labels(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal"
       stops working with the lanes swapped, or the line also carries products (a mixed belt: one lane
       in, one out; a belt passing its inputs on to the next block is not mixed);
     - an output belt gets a label in front of its end with what leaves on it (per lane on a mixed belt
-      and where the belt passes on input lanes that matter); what machines here also consume (spare
-      gears handed on to a neighbouring module) is not labelled next to the real products;
+      and where the belt passes on input lanes that matter); what machines take off the line on its
+      way to the output is left over there (spare gears handed on to a neighbouring module): not labelled;
     - each half of a splitter is a belt of its own;
     - a chest filled from outside and an open pipe end get a label next to them (fluid signals).
     Labels go behind a start / in front of an end first, then to the sides, then to the nearest free
@@ -977,7 +977,7 @@ def add_port_labels(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal"
 
     LABEL_REACH = 6
     ents = list(ir.entities)
-    flow = flow or solve(ir, smelt=smelt, fuel=fuel, resource=resource)
+    flow = flow or solve(ir, smelt=smelt, fuel=fuel, resource=resource, share_lanes=False)
     layout = Layout(ir, resource)
     used = {t for e in ents for t in _tiles(e)}
     xs, ys = [t[0] for t in used], [t[1] for t in used]
@@ -1061,16 +1061,18 @@ def add_port_labels(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal"
         if p.kind == "lane":
             group = inputs if p.role == "input" else outputs
             group.setdefault((p.entity, p.lane // 2), {}).setdefault(p.lane, set()).update(p.items)
-    # semi-finished goods leaving next to the real products (spare gears a module of the author's book
-    # hands on to the next one) get no label: they are no output of the design
-    consumed = set().union(*flow.machines.values()) if flow.machines else set()
-    if set().union(*(v for lanes_ in outputs.values() for v in lanes_.values())) - consumed:
-        for key in list(outputs):
-            lanes_ = {lane: v - consumed for lane, v in outputs[key].items() if v - consumed}
-            if lanes_:
-                outputs[key] = lanes_
-            else:
-                del outputs[key]
+    # spare goods get no label: what machines take off the line on its way to the output is left over
+    # there (spare gears a module of the author's book hands on to the next one); goods nobody takes
+    # on the way are made for the output (iron plates of a smelting block that also makes steel)
+    before = layout.taken_before()
+    for key in list(outputs):
+        i = key[0]
+        lanes_ = {lane: v - (before.get((i, lane)) or set()) for lane, v in outputs[key].items()}
+        lanes_ = {lane: v for lane, v in lanes_.items() if v}
+        if lanes_:
+            outputs[key] = lanes_
+        else:
+            del outputs[key]
     port_tiles ={tile_of(i, half) for i, half in list(inputs) + list(outputs)} | \
         {p.tile for p in flow.ports if p.kind == "fluid"} | {(ents[p.entity].x, ents[p.entity].y) for p in flow.ports
                                                              if p.kind == "chest"}

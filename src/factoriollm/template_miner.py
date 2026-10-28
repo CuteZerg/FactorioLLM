@@ -470,13 +470,18 @@ def author_hints(ir: IRBlueprint) -> Dict[Tuple[int, int], set]:
     return out
 
 
-def run_flow(ir: IRBlueprint, hints: Optional[Dict] = None, first: str = "iron-ore") -> Tuple[FlowResult, str]:
-    """The flow simulator's verdict; designs with furnaces are tried with each smelting input in turn."""
+def run_flow(ir: IRBlueprint, hints: Optional[Dict] = None, first: str = "iron-ore",
+             share_lanes: bool = True) -> Tuple[FlowResult, str]:
+    """
+    The flow simulator's verdict; designs with furnaces are tried with each smelting input in turn.
+    An author's design may carry two items on one input lane; a template build must not
+    (share_lanes=False): its labels must be plain, and a build that needs it misses a part.
+    """
     furnaces = any(entity_type(e.name) == "furnace" for e in ir.entities)
     choices = [first] + [s for s in SMELT_CHOICES if s != first] if furnaces else [first]
     found: Optional[Tuple[FlowResult, str]] = None
     for smelt in choices:
-        result = solve(ir, smelt=smelt, hints=hints)
+        result = solve(ir, smelt=smelt, hints=hints, share_lanes=share_lanes)
         if result.ok:
             return result, smelt
         found = found or (result, smelt)
@@ -516,7 +521,7 @@ def _at_edge(ir: IRBlueprint, result: FlowResult, axis: int) -> bool:
 
 
 def middle_flow(ir: IRBlueprint, step: Tuple[int, int], hints: Optional[Dict] = None,
-                first: str = "iron-ore") -> Optional[Tuple[FlowResult, str]]:
+                first: str = "iron-ore", share_lanes: bool = True) -> Optional[Tuple[FlowResult, str]]:
     """
     The verdict for a design made to dock with copies of itself (its grid says how far apart): three
     copies, and only the problems of the middle one count - the outer copies miss their own outer
@@ -525,7 +530,7 @@ def middle_flow(ir: IRBlueprint, step: Tuple[int, int], hints: Optional[Dict] = 
     tiled = copies(ir, step)
     if tiled is None:
         return None
-    result, smelt = run_flow(tiled, hints, first)
+    result, smelt = run_flow(tiled, hints, first, share_lanes)
     axis = 0 if step[0] else 1
     lo = min((e.x, e.y)[axis] for e in ir.entities) + step[axis]
     middle = [p for p in result.problems if lo <= p.position[axis] < lo + step[axis]]
@@ -763,6 +768,27 @@ def mine(min_favorites: int = 10, per_category: int = 8, only: Optional[set] = N
     return best, rejects
 
 
+def inner_inputs(ir: IRBlueprint, flow: FlowResult) -> List[Tuple[int, int]]:
+    """
+    Input belts that start inside the design: the tile behind their start lies within the bounding
+    box. A cut that removes a bus tap leaves the tapped column starting in the middle of the design,
+    where nobody can feed it and its label sits among the machines.
+    """
+    tiles = [(e.x + dx, e.y + dy) for e in ir.entities for dx in range(footprint(e.name, e.direction)[0])
+             for dy in range(footprint(e.name, e.direction)[1])]
+    x0, x1 = min(t[0] for t in tiles), max(t[0] for t in tiles)
+    y0, y1 = min(t[1] for t in tiles), max(t[1] for t in tiles)
+    vec = {0: (0, -1), 4: (1, 0), 8: (0, 1), 12: (-1, 0)}
+    out = []
+    for p in flow.ports:
+        if p.kind == "lane" and p.role == "input":
+            dx, dy = vec.get(p.direction % 16, (0, 0))
+            bx, by = p.tile[0] - dx, p.tile[1] - dy
+            if x0 <= bx <= x1 and y0 <= by <= y1:
+                out.append(p.tile)
+    return out
+
+
 def author_verdict(ir: IRBlueprint, category: Optional[str] = None
                    ) -> Tuple[IRBlueprint, FlowResult, str, Optional[Tuple[int, int]]]:
     """
@@ -809,7 +835,7 @@ def _mine_design(ir: IRBlueprint, category: str, name: str, stats: Counter, reje
     for step_no, (margin, taps) in enumerate(CROP_STEPS):
         candidate = prepare(ir, margin, defense, taps) if margin is not None else full
         flow = verdict(candidate) if margin is not None else source_flow
-        if flow.ok:
+        if flow.ok and (margin is None or not inner_inputs(candidate, flow)):
             cut, cut_flow = candidate, flow
             stats[f"crop step {step_no}"] += 1
             break
@@ -855,14 +881,14 @@ def _mine_design(ir: IRBlueprint, category: str, name: str, stats: Counter, reje
     build_flow = None
     if dock:  # a docking cell works in a row of copies: judge the middle one of three
         build = template.build(1)
-        docked = middle_flow(build, (template.period, 0), None, smelt)
+        docked = middle_flow(build, (template.period, 0), None, smelt, share_lanes=False)
         build_flow, smelt = docked if docked else (FlowResult([], {}, {}, frozenset(), [], status="collide"), smelt)
         if not build_flow.ok:
             rejects.add(f"template: {reason(build_flow)}", name, template.build(3), build_flow)
             return None
     for n in () if dock else (1, 2) if segment else (1,):
         build = template.build(n)
-        build_flow, smelt = run_flow(build, first=smelt)
+        build_flow, smelt = run_flow(build, first=smelt, share_lanes=False)  # plainly fed, see run_flow
         if not build_flow.ok:
             rejects.add(f"template: {reason(build_flow)}", name, build, build_flow)
             return None

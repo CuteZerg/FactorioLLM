@@ -1150,9 +1150,14 @@ def _demand(L: Layout, smelt: str, fuel: str) -> Dict[Tuple[Any, ...], Dict[str,
                 targets = [("lane", lane) for lane in L.belt_lanes(src[1])]
             elif src[0] == "ground" or (src[0] == "entity" and L.storage[src[1]]):
                 targets = [src]
-            elif src[0] == "entity" and dst_takes_passed(idx):
+            elif src[0] == "entity" and dst_takes_passed(idx) and L.passes_on(src[1]) & set(wanted):
                 acc = L.passes_on(src[1]) & L.accepts(src[1])
                 wanted = {x: r for x, r in wanted.items() if x in acc}
+                targets = [src]
+            elif src[0] == "entity" and L.types[src[1]] == "furnace":
+                # a furnace makes what it is fed: steel wanted from it means iron plates wanted in it,
+                # ahead of its own preferences (stone into the brick column, plates into the steel one)
+                wanted = {x: r - 100 for y, r in wanted.items() for x, made in SMELTING.items() if made == y}
                 targets = [src]
             else:
                 targets = []
@@ -1476,9 +1481,11 @@ def _part_blueprint(ir: IRBlueprint, L: Layout, part: List[int], hints: Dict[Til
 
 
 def solve(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal", resource: str = "iron-ore",
-          hints: Optional[Dict[Tile, Set[str]]] = None, max_leaves: int = MAX_LEAVES) -> FlowResult:
+          hints: Optional[Dict[Tile, Set[str]]] = None, max_leaves: int = MAX_LEAVES,
+          share_lanes: bool = True) -> FlowResult:
     """
-    Finds the input assignment under which the layout works (no problems), see _solve_whole. A
+    Finds the input assignment under which the layout works (no problems), see _solve_whole
+    (share_lanes=False: never two items on one input lane - templates must be fed plainly). A
     layout made of parts that share no flow (furnace columns side by side, separate lines of a
     book page) is solved part by part, each with the full search budget, and identical parts only
     once: one search over all of them at once runs out of budget long before it tries every
@@ -1491,7 +1498,7 @@ def solve(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal", resource
                                                        if L.network[b] in fluid_nets}
     parts = [p for p in _parts(L) if at_ports.intersection(p)]
     if len(parts) <= 1:
-        return _solve_whole(ir, L, smelt, fuel, hints, max_leaves)
+        return _solve_whole(ir, L, smelt, fuel, hints, max_leaves, allow_shared=share_lanes)
     box_of = {(j, k): b for b, (j, k, _, _) in enumerate(L.boxes)}
     solved: Dict[Any, Tuple[Layout, FlowResult]] = {}
     inputs: Dict[Any, Optional[str]] = {}
@@ -1501,7 +1508,7 @@ def solve(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal", resource
         key = (tuple(sub.entities), tuple(sorted((t, tuple(sorted(v))) for t, v in near.items())))
         if key not in solved:
             S = Layout(sub, resource)
-            solved[key] = (S, _solve_whole(sub, S, smelt, fuel, near, max_leaves))
+            solved[key] = (S, _solve_whole(sub, S, smelt, fuel, near, max_leaves, allow_shared=share_lanes))
         S, res = solved[key]
         ambiguous |= res.status == "inputs_ambiguous"
         for port, item in res.inputs.items():
@@ -1520,10 +1527,11 @@ def solve(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal", resource
 
 
 MAX_LANE_ITEMS = 2  # items one input lane may carry when one is not enough (a bus lane with two items)
+REPAIR_ROUNDS = 30  # simulations of the greedy start (see _search_inputs.repair)
 
 
 def _solve_whole(ir: IRBlueprint, L: Layout, smelt: str, fuel: str, hints: Dict[Tile, Set[str]],
-                 max_leaves: int, shared_lanes: bool = False) -> FlowResult:
+                 max_leaves: int, shared_lanes: bool = False, allow_shared: bool = True) -> FlowResult:
     """
     The search for one layout: it picks the open constraint with the fewest options (see
     _constraints), tries each (port, item) choice and simulates the layout once all constraints
@@ -1534,7 +1542,7 @@ def _solve_whole(ir: IRBlueprint, L: Layout, smelt: str, fuel: str, hints: Dict[
     lane of a bus.
     """
     result = _search_inputs(ir, L, smelt, fuel, hints, max_leaves, shared_lanes)
-    if result.ok or shared_lanes or result.status == "doomed":
+    if result.ok or shared_lanes or not allow_shared or result.status == "doomed":
         if result.status == "doomed":
             result.status = "inputs_unsolved"
         return result
@@ -1585,6 +1593,7 @@ def _search_inputs(ir: IRBlueprint, L: Layout, smelt: str, fuel: str, hints: Dic
         tried.add(key)
         leaves[0] += 1
         result = check(ir, {p: assign.get(p) for p in ports}, L)
+        last[0] = result
         if not result.problems:
             solutions.append(result)
             first[0] = first[0] if first[0] is not None else leaves[0]
@@ -1592,6 +1601,63 @@ def _search_inputs(ir: IRBlueprint, L: Layout, smelt: str, fuel: str, hints: Dic
         if best_fail[0] is None or len(result.problems) < len(best_fail[0].problems):
             best_fail[0] = result
         return False
+
+    last: List[Optional[FlowResult]] = [None]
+
+    def repair() -> None:
+        """
+        A greedy fallback when the exhaustive search found nothing: every input gets its best-ranked candidate, then
+        each machine still starved gets what it lacks through an input that reaches it, round after
+        round. Most designs feed each input what is most wanted downstream of it, and the search
+        alone can spend its whole budget on the first constraints' other options.
+        """
+        serves: Dict[int, List[Tuple[Tuple[Any, ...], str]]] = {}
+        for port in ports:
+            if port in fluid_domains:
+                continue
+            for x in domains[port]:
+                if x is None:
+                    continue
+                if port[0] == "lane":
+                    reach = _reach(L, (port[1], port[2]), x)
+                    idxs = [i for i, (src, _) in enumerate(L.links)
+                            if src[0] == "belt" and any(k in reach for k in L.belt_lanes(src[1]))]
+                else:
+                    idxs = [i for i, (src, _) in enumerate(L.links) if src == ("entity", port[1])]
+                for i in idxs:
+                    dst = L.links[i][1]
+                    if dst[0] == "entity" and L.moves(i, {x}):
+                        serves.setdefault(dst[1], []).append((port, x))
+        assign: Dict[Tuple[Any, ...], Optional[str]] = {p: domains[p][0] for p in ports if p not in fluid_domains}
+        for p in fluid_domains:
+            assign[p] = fluid_domains[min(fluid_group[p])][0] if fluid_domains[min(fluid_group[p])][0] in fluid_domains[p] \
+                else fluid_domains[p][0]
+        moves = Counter()
+        for _ in range(REPAIR_ROUNDS):
+            if done() or simulate(assign) is not False:
+                return
+            result = last[0]
+            changed = False
+            for j in range(len(L.ents)):
+                if j in result.working or not L.is_machine(j):
+                    continue
+                got = result.machines.get(j, frozenset())
+                for need in L.needs(j):
+                    if need & got:
+                        continue
+                    options = sorted((o for o in serves.get(j, []) if o[1] in need and assign.get(o[0]) != o[1]),
+                                     key=lambda o: (assign.get(o[0]) is not None, moves[o[0]], domains[o[0]].index(o[1])))
+                    if not options:
+                        continue
+                    port, x = options[0]
+                    assign[port] = x
+                    moves[port] += 1
+                    other = ("lane", port[1], port[2] ^ 1) if port[0] == "lane" else None
+                    if other in port_set and assign.get(other) is None:
+                        assign[other] = x  # a whole belt; else the other lane keeps its item (a lane-split belt)
+                    changed = True
+            if not changed:
+                return
 
     def leaf(assign: Dict[Tuple[Any, ...], str]) -> None:
         # an input belt is a whole belt: a lane next to a loaded input lane carries the same item
@@ -1653,6 +1719,11 @@ def _search_inputs(ir: IRBlueprint, L: Layout, smelt: str, fuel: str, hints: Dic
                 return
 
     search({})
+    if not solutions and not shared_lanes and not doomed:
+        budget = max_leaves
+        max_leaves = leaves[0] + REPAIR_ROUNDS  # the fallback gets its own simulations
+        repair()
+        max_leaves = budget
     if solutions:
         for s in solutions:
             s.score = _score(L, s, smelt, fuel, hints)
