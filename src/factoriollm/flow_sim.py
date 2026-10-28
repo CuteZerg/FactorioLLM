@@ -898,6 +898,8 @@ def _verdict(L: Layout, lanes, received, ground, chests, working, inputs, needs_
     for idx, (k, (src, dst)) in enumerate(zip(L.inserters, L.links)):
         e = ents[k]
         items = _taken(L, idx, lanes, received, ground, chests, working)
+        if not items and dst[0] == "entity" and dst[1] in working and L.is_machine(dst[1]):
+            continue  # an idle spare inserter of a machine that works anyway (its feed comes another way)
         if not items:
             problems.append(Problem("dangling_inserter", f"{e.name} at {(e.x, e.y)} has nothing to pick", (e.x, e.y)))
         elif dst[0] == "ground" and not any(s == ("ground", dst[1]) for s, _ in L.links):
@@ -1295,7 +1297,8 @@ def _same_fuels(L: Layout, constraints: List[List[Tuple[Tuple[Any, ...], str]]],
         seen: Set[Tuple[Any, ...]] = set()
         kept = []
         for p, x in options:
-            key = (p[:2] if p[0] == "chest" else p, "<fuel>") if x in all_fuels() and x not in named else (p, x)
+            port = p[:-1] if len(p) == (3 if p[0] == "chest" else 4) else p  # a yes / no port of a chest or lane
+            key = (port, "<fuel>") if x in all_fuels() and x not in named else (p, x)
             if key not in seen:
                 seen.add(key)
                 kept.append((p, x))
@@ -1516,26 +1519,44 @@ def solve(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal", resource
     return result
 
 
+MAX_LANE_ITEMS = 2  # items one input lane may carry when one is not enough (a bus lane with two items)
+
+
 def _solve_whole(ir: IRBlueprint, L: Layout, smelt: str, fuel: str, hints: Dict[Tile, Set[str]],
-                 max_leaves: int) -> FlowResult:
+                 max_leaves: int, shared_lanes: bool = False) -> FlowResult:
     """
     The search for one layout: it picks the open constraint with the fewest options (see
     _constraints), tries each (port, item) choice and simulates the layout once all constraints
     are met. Among working assignments the best by _score wins. Without one, the result with the
     fewest problems is returned with status 'inputs_unsolved', or 'inputs_ambiguous' when the
-    search ran out of MAX_LEAVES simulations.
+    search ran out of MAX_LEAVES simulations. If one item per input lane cannot work, the search
+    runs again with up to MAX_LANE_ITEMS items on a lane (shared_lanes): players run two items on one
+    lane of a bus.
     """
+    result = _search_inputs(ir, L, smelt, fuel, hints, max_leaves, shared_lanes)
+    if result.ok or shared_lanes or result.status == "doomed":
+        if result.status == "doomed":
+            result.status = "inputs_unsolved"
+        return result
+    shared = _search_inputs(ir, L, smelt, fuel, hints, max_leaves, True)
+    return shared if shared.ok else result
+
+
+def _search_inputs(ir: IRBlueprint, L: Layout, smelt: str, fuel: str, hints: Dict[Tile, Set[str]],
+                   max_leaves: int, shared_lanes: bool) -> FlowResult:
+    """One run of the search of _solve_whole (status 'doomed' when no assignment can work)."""
     static = _Static(L)
     ports = input_ports(L)
     domains = _domains(L, ports, smelt, fuel, static)
     # a chest filled by hand holds what the player puts in, several items too (the hub chest of a
-    # hand-fed starter base): one yes / no port ('chest', j, item) per candidate item
-    for p in [p for p in ports if p[0] == "chest"]:
+    # hand-fed starter base): one yes / no port ('chest', j, item) per candidate item; with
+    # shared lanes the same for belt lanes ('lane', i, lane, item)
+    for p in [p for p in ports if p[0] == "chest" or (shared_lanes and p[0] == "lane")]:
         ports.remove(p)
         for x in domains.pop(p):
             if x:
-                ports.append(("chest", p[1], x))
-                domains[("chest", p[1], x)] = [x, None]
+                ports.append(p + (x,))
+                domains[p + (x,)] = [x, None]
     fluid_domains = _fluid_domains(L)
     # open pipe networks that pumps carry into one network (pumps unloading fluid wagons side by side)
     # must bring one fluid: they get it together
@@ -1577,6 +1598,9 @@ def _solve_whole(ir: IRBlueprint, L: Layout, smelt: str, fuel: str, hints: Dict[
         # (or another one the search chose), never nothing - unless products are put on that lane
         # further on (a mixed belt: one lane in, the other out)
         assign = dict(assign)
+        if shared_lanes and max(Counter(p[1:3] for p, x in assign.items() if p[0] == "lane" and x).values(),
+                                default=0) > MAX_LANE_ITEMS:
+            return
         filled = []
         for p, x in list(assign.items()):
             other = ("lane", p[1], p[2] ^ 1) if p[0] == "lane" else None
@@ -1635,5 +1659,5 @@ def _solve_whole(ir: IRBlueprint, L: Layout, smelt: str, fuel: str, hints: Dict[
         return _improve(ir, L, max(solutions, key=lambda s: s.score), domains, smelt, fuel, hints)
     result = best_fail[0] or check(ir, {p: (fluid_domains[p][0] if p in fluid_domains else None) for p in ports}, L)
     ran_out = leaves[0] >= max_leaves or steps[0] >= MAX_STEPS * max_leaves
-    result.status = "inputs_ambiguous" if ran_out and not doomed else "inputs_unsolved"
+    result.status = "doomed" if doomed else "inputs_ambiguous" if ran_out else "inputs_unsolved"
     return result
