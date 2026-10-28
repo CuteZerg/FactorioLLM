@@ -33,16 +33,11 @@ _DIRECTION_VECTORS = {0: (0, -1), 4: (1, 0), 8: (0, 1), 12: (-1, 0)}
 
 BELT_TYPES = frozenset({"transport-belt", "underground-belt", "splitter", "loader", "loader-1x1", "linked-belt"})
 
-# Entity types an inserter can take items from / put items into.
-INVENTORY_TYPES = frozenset({
-    "transport-belt", "underground-belt", "splitter", "loader", "loader-1x1", "linked-belt",
-    "container", "logistic-container", "infinity-container", "linked-container",
-    "furnace", "assembling-machine", "lab", "rocket-silo", "roboport",
-    "ammo-turret", "artillery-turret",
-    "car", "cargo-wagon", "artillery-wagon", "locomotive",
-})
-# Types that only accept items when they burn fuel (e.g. a heat exchanger is a "boiler" without fuel).
-FUELED_TYPES = frozenset({"boiler", "reactor", "mining-drill", "burner-generator", "inserter"})
+# Prototype fields that give an entity an inventory an inserter can reach (chests, wagons, crafting
+# machines, labs, roboports, turrets, the rocket silo); besides, a burner takes fuel. A heat exchanger
+# is a "boiler" without fuel: no inventory.
+_INVENTORY_FIELDS = ("inventory_size", "source_inventory_size", "result_inventory_size", "crafting_categories",
+                     "inputs", "robot_slots_count", "automated_ammo_count", "rocket_parts_required")
 
 _CONSUMER_PRIORITIES = frozenset({"lamp", "primary-input", "secondary-input"})
 
@@ -90,10 +85,13 @@ def is_electric_consumer(name: str) -> bool:
 
 
 def has_item_interface(name: str) -> bool:
-    etype = entity_type(name)
-    if etype in INVENTORY_TYPES:
+    """Whether an inserter can take from / put into the entity: belts, an inventory, or a burner's fuel (from its prototype)."""
+    if entity_type(name) in BELT_TYPES:
         return True
-    return etype in FUELED_TYPES and _energy(name)[0] == "burner" and etype != "inserter"
+    proto = _prototype(name) or {}
+    if proto.get("type") == "inserter":
+        return False
+    return any(key in proto for key in _INVENTORY_FIELDS) or _energy(name)[0] == "burner"
 
 
 def _rotate(vec: Tuple[float, float], direction: int) -> Tuple[float, float]:

@@ -31,22 +31,46 @@ MACHINE_TYPES = frozenset({
     "furnace", "assembling-machine", "lab", "mining-drill", "solar-panel", "accumulator", "boiler",
     "generator", "reactor", "rocket-silo", "beacon",
 })
-# Cosmetic entities: not compared when looking for the repeating part. Lamps become an optional
-# layer of the template; author labels and radars are removed by prepare().
-DECOR = frozenset({"small-lamp", "constant-combinator", "display-panel"})
+# Kinds of entities by prototype type (so entities of mods fall into place):
+# cosmetic entities are not compared when looking for the repeating part (lamps become an optional
+# layer of the template; author labels and radars are removed by prepare()); the author's defence
+# around a production block is removed too (defence is a layer of its own, `defense` category).
+DECOR_TYPES = frozenset({"lamp", "constant-combinator", "display-panel"})
+AUTHOR_ONLY_TYPES = frozenset({"radar", "constant-combinator", "display-panel"})
+DEFENSE_TYPES = frozenset({"wall", "gate", "ammo-turret", "electric-turret", "fluid-turret", "artillery-turret",
+                           "land-mine"})
+PIPE_TYPES = frozenset({"pipe", "pipe-to-ground", "storage-tank", "pump"})
 LAMP = "small-lamp"
-AUTHOR_ONLY = frozenset({"radar", "constant-combinator", "display-panel"})
-# The author's defence around a production block: removed (defence is a layer of its own, `defense` category).
-DEFENSE = frozenset({"stone-wall", "gate", "gun-turret", "laser-turret", "flamethrower-turret", "artillery-turret",
-                     "land-mine"})
-PIPE_LIKE = frozenset({"pipe", "pipe-to-ground", "storage-tank", "pump"})
 MIN_RUN_COVERAGE = 0.4  # the repeating part must hold at least this share of the entities
 # Belt and pipe tiles kept in front of an input / behind an output once the author's surroundings
 # (bus taps, mains, long feeds) are cut.
 CROP_MARGIN = 2
-BELT_TIERS = (("transport-belt", "underground-belt", "splitter"),
-              ("fast-transport-belt", "fast-underground-belt", "fast-splitter"),
-              ("express-transport-belt", "express-underground-belt", "express-splitter"))
+
+
+def is_decor(name: str) -> bool:
+    return entity_type(name) in DECOR_TYPES
+
+
+def is_defense(name: str) -> bool:
+    return entity_type(name) in DEFENSE_TYPES
+
+
+def is_pipe(name: str) -> bool:
+    return entity_type(name) in PIPE_TYPES
+
+
+def _belt_tiers() -> Tuple[Tuple[str, str, str], ...]:
+    """(belt, underground, splitter) per tier, slowest first, by the belts' speed in the game data."""
+    from factoriollm.base_game import ENTITIES
+    by_speed: Dict[float, Dict[str, str]] = {}
+    for name, e in ENTITIES.items():
+        if e["type"] in ("transport-belt", "underground-belt", "splitter") and e.get("speed"):
+            by_speed.setdefault(e["speed"], {})[e["type"]] = name
+    return tuple((t["transport-belt"], t["underground-belt"], t["splitter"]) for _, t in sorted(by_speed.items())
+                 if len(t) == 3)
+
+
+BELT_TIERS = _belt_tiers()
 _TIER = {name: (tier, kind) for tier, names in enumerate(BELT_TIERS) for kind, name in enumerate(names)}
 _DIRS = {0: (0, -1), 4: (1, 0), 8: (0, 1), 12: (-1, 0)}
 # Validator categories that are never allowed in a template, whatever the source had.
@@ -63,7 +87,7 @@ def _span(e: IREntity) -> Tuple[int, int]:
 
 
 def _structural(ir: IRBlueprint) -> List[IREntity]:
-    return [e for e in ir.entities if e.name not in DECOR]
+    return [e for e in ir.entities if not is_decor(e.name)]
 
 
 def _is_belt(e: IREntity) -> bool:
@@ -333,7 +357,7 @@ def extract(ir: IRBlueprint, category: str, period: Optional[int] = None) -> Opt
                           key=lambda e: (e.y, e.x)),
         "tail": _shifted((e for e in lamps if e.x >= end), -start),
     }
-    kept = normalized(ir.with_entities([e for e in solid if e.name not in DECOR or e.x < start or e.x >= end]))
+    kept = normalized(ir.with_entities([e for e in solid if not is_decor(e.name) or e.x < start or e.x >= end]))
     rebuilt = template.build(len(run)).canonical_set()
     if not kept.canonical_set() <= rebuilt or any(not _is_belt(e) for e in rebuilt - kept.canonical_set()):
         return None  # the cut must rebuild the source; only belt tiles closing a line may be added
@@ -690,7 +714,7 @@ def prepare(ir: IRBlueprint, margin: Optional[int] = CROP_MARGIN, keep_defense: 
     defence). Belts and pipes are cut by flow, not by a rectangle (see _trim_tails); margin=None keeps
     them all. Lamps stay; templates keep them as an optional layer. See CROP_STEPS for gentler cuts.
     """
-    ents = [e for e in ir.entities if e.name not in AUTHOR_ONLY and (keep_defense or e.name not in DEFENSE)]
+    ents = [e for e in ir.entities if entity_type(e.name) not in AUTHOR_ONLY_TYPES and (keep_defense or not is_defense(e.name))]
     if margin is not None and ents:
         ents = _trim_tails(ents, margin, cut_taps)
     return ir.with_entities(ents)
@@ -720,7 +744,7 @@ def strip_unused(ir: IRBlueprint) -> IRBlueprint:
         | {L.network[b] for ms in makes_f.values() for b, _ in ms}
     piped = {L.boxes[b][0] for b in range(len(L.boxes)) if L.network[b] in used_nets}
     keep = [e for i, e in enumerate(ents)
-            if not (i in L.belts and i not in useful) and not (e.name in PIPE_LIKE and i not in piped)]
+            if not (i in L.belts and i not in useful) and not (is_pipe(e.name) and i not in piped)]
     return ir.with_entities(prune_poles(keep))
 
 
@@ -828,7 +852,7 @@ def _trim_tails(ents: List[IREntity], margin: int, cut_taps: bool = True) -> Lis
     keep_belts |= {i for i in L.belts if L.types[i] == "underground-belt" and i not in paired
                    and belt_adj.get(i, set()) & keep_belts}
 
-    pipes = {i for i, e in enumerate(ents) if e.name in PIPE_LIKE}
+    pipes = {i for i, e in enumerate(ents) if is_pipe(e.name)}
     pipe_adj: Dict[int, Set[int]] = {}
     pipe_core: Set[int] = set()
     for a, b in L.pipe_links:

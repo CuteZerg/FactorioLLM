@@ -246,6 +246,17 @@ class FlowSimRealDesignsTest(unittest.TestCase):
         self.assertFalse(r.ok)
         self.assertTrue(any("coal" in p.message for p in r.problems if p.kind == "starved"))
 
+    def test_reactors_pass_fuel_cells_on(self):
+        # a requester chest feeds one reactor; an inserter hands fuel cells on to the next reactor
+        ir = IRBlueprint([E("requester-chest", 2, 0, requests="uranium-fuel-cell=10"), E("inserter", 2, 1, 0),
+                          E("nuclear-reactor", 0, 2), E("inserter", 5, 4, 12), E("nuclear-reactor", 6, 2)])
+        r = check(ir, {}, Layout(ir))
+        self.assertEqual(r.problems, [])
+        # a boiler hands no coal onto a belt (only to the next burner)
+        boiler = IRBlueprint([E("boiler", 0, 0, 0), E("inserter", 3, 0, 12)] + belts(4, 6, 0))
+        r = check(boiler, {}, Layout(boiler))
+        self.assertTrue(all(not v for v in r.lanes.values()))
+
     def test_coal_liquefaction_works_once_primed(self):
         # the refineries take back the heavy oil they make: players prime the loop once
         r = solve(fixture("coal_liquefaction_primed"))

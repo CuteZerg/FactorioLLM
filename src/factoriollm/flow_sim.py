@@ -39,30 +39,19 @@ from functools import lru_cache
 from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 
 from factoriollm.blueprint_ir import IRBlueprint, IREntity, _prototype, entity_type, footprint
-from factoriollm.game_data import SMELTING, recipe
+from factoriollm.game_data import entity as game_entity
+from factoriollm.game_data import (SMELTING, all_ammo, all_fuels, ammo_items, burnt_result, craftable_inputs,
+                                   fuel_items, inserter_rate, is_burner, is_storage, keeps_burnt_result, lab_inputs,
+                                   made_by_recipe, recipe, robot_items, turret_fluids)
 from factoriollm.validator import _DIRECTION_VECTORS, _center, _occupied_tiles as _tiles, _rotate
 
 Tile = Tuple[int, int]
 Lane = Tuple[int, int]  # (entity index, 0 = left / 1 = right)
 
 BELT_LIKE = frozenset({"transport-belt", "underground-belt", "splitter"})
-CONTAINERS = frozenset({"container", "logistic-container"})
-FUELS = ("coal", "wood", "solid-fuel", "rocket-fuel", "nuclear-fuel")
-SCIENCE_PACKS = ("automation-science-pack", "logistic-science-pack", "military-science-pack", "chemical-science-pack",
-                 "production-science-pack", "utility-science-pack", "space-science-pack")
-AMMO = {"ammo-turret": ("firearm-magazine", "piercing-rounds-magazine", "uranium-rounds-magazine"),
-        "artillery-turret": ("artillery-shell",)}
-FLAMETHROWER_FLUIDS = ("light-oil", "heavy-oil", "crude-oil")
-ROBOPORT_ITEMS = ("logistic-robot", "construction-robot", "repair-pack")
-# Items per second of one inserter moving single items between a belt and a machine (rough, for ranking only).
-INSERTER_RATE = {"burner-inserter": 0.6, "inserter": 0.83, "long-handed-inserter": 1.2, "fast-inserter": 2.31,
-                 "bulk-inserter": 4.6}
 ANY = None  # "accepts any item" (chests, belts, the ground)
-# Entities an inserter takes items back out of, to hand them on along a chain of inserters: labs
-# pass science packs on, boilers fuel, turrets ammunition. (Reactors give out spent fuel cells.)
-PASS_ON = {"lab": frozenset(SCIENCE_PACKS), "boiler": frozenset(FUELS),
-           "ammo-turret": frozenset(AMMO["ammo-turret"]), "artillery-turret": frozenset(AMMO["artillery-turret"])}
-GIVES_OUT = frozenset(PASS_ON) | {"reactor"}  # inserters take from these whether or not they "work"
+# Burner entities that are no machine of a design (they burn fuel to move, not to make anything)
+NOT_MACHINES = frozenset({"inserter", "car", "locomotive", "spider-vehicle"})
 MAX_LEAVES = 400      # full simulations per solve before giving up as ambiguous
 MAX_SOLUTIONS = 12    # working assignments compared by score
 MAX_EXTRA_LEAVES = 40  # simulations spent on alternatives after the first working assignment
@@ -123,8 +112,14 @@ def _type(name: str) -> str:
     return entity_type(name)
 
 
-def _burner(name: str) -> bool:
-    return ((_prototype(name) or {}).get("energy_source") or {}).get("type") == "burner"
+def _any_of(fluids: Iterable[str]) -> str:
+    """A fluid need met by any of these fluids (a flamethrower turret fires several)."""
+    return "<any:" + "|".join(fluids) + ">"
+
+
+def _choices(fluid: str) -> List[str]:
+    """The fluids that meet a need: one, or those of an _any_of need."""
+    return fluid[5:-1].split("|") if fluid.startswith("<any:") else [fluid]
 
 
 def _point(e: IREntity, key: str) -> Optional[Tuple[float, float]]:
@@ -148,6 +143,7 @@ class Layout:
         self.resource = resource
         self.tiles: Dict[Tile, int] = {t: i for i, e in enumerate(self.ents) for t in _tiles(e)}
         self.types = [_type(e.name) for e in self.ents]
+        self.storage = [t not in BELT_LIKE and is_storage(e.name) for e, t in zip(self.ents, self.types)]
         self.belts = [i for i, t in enumerate(self.types) if t in BELT_LIKE]
         self._pairs = self._underground_pairs()
         self.into: Dict[Tile, List[int]] = {}
@@ -380,70 +376,73 @@ class Layout:
         return out
 
     def accepts(self, j: int) -> Optional[FrozenSet[str]]:
-        """Items an inserter may put into entity j (ANY for chests)."""
-        e, t = self.ents[j], self.types[j]
-        if t in CONTAINERS or t in ("car", "cargo-wagon"):
+        """
+        Items an inserter may put into entity j, from what the entity is (its prototype): anything
+        for storage (chests, wagons); ingredients of a crafting machine's recipe (a furnace: whatever
+        it can smelt); a lab's science packs; a turret's ammunition; a roboport's robots and repair
+        packs; and the fuel of any burner (boilers, stone furnaces, reactors, burner drills).
+        """
+        if self.storage[j]:
             return ANY
+        e, t = self.ents[j], self.types[j]
+        out = set(fuel_items(e.name)) | set(lab_inputs(e.name)) | set(ammo_items(e.name))
         r = recipe(e.extras_dict.get("recipe") or "")
         if t == "assembling-machine":
-            return frozenset(set(r.ingredients) - r.fluids) if r else frozenset()
-        if t == "rocket-silo":
+            out |= set(r.ingredients) - r.fluids if r else set()
+        elif t == "rocket-silo":
             part = recipe("rocket-part")
-            return frozenset(set(part.ingredients) | {"satellite"}) if part else frozenset()
-        fuel = frozenset(FUELS) if _burner(e.name) else frozenset()
-        if t == "furnace":
-            return frozenset(SMELTING) | fuel
-        if t == "lab":
-            return frozenset(SCIENCE_PACKS)
-        if t == "reactor":
-            return frozenset({"uranium-fuel-cell"})
-        if t in AMMO:
-            return frozenset(AMMO[t])
-        if t == "roboport":
-            return frozenset(ROBOPORT_ITEMS)
-        if t in ("boiler", "mining-drill"):
-            return fuel
-        return frozenset()
+            out |= set(part.ingredients) | {"satellite"} if part else set()
+        elif t == "furnace":
+            out |= craftable_inputs(e.name)
+        elif t == "roboport":
+            out |= robot_items()
+        return frozenset(out)
 
     def needs(self, j: int) -> List[FrozenSet[str]]:
-        """Item requirements of a machine: each set must be met by at least one of its items."""
+        """Item requirements of a machine: each set must be met by at least one of its items (fuel: any it burns)."""
         e, t = self.ents[j], self.types[j]
-        r = recipe(e.extras_dict.get("recipe") or "")
-        fuel = [frozenset(FUELS)] if _burner(e.name) and t != "reactor" else []
+        fuel = [fuel_items(e.name)] if is_burner(e.name) else []
         if t == "assembling-machine":
-            return [frozenset({i}) for i in sorted(set(r.ingredients) - r.fluids)] if r else [frozenset({"<recipe>"})]
+            r = recipe(e.extras_dict.get("recipe") or "")
+            return ([frozenset({i}) for i in sorted(set(r.ingredients) - r.fluids)] if r else [frozenset({"<recipe>"})]) + fuel
         if t == "rocket-silo":
             part = recipe("rocket-part")
             return [frozenset({i}) for i in sorted(part.ingredients)] if part else []
         if t == "furnace":
-            return [frozenset(SMELTING)] + fuel
+            return [craftable_inputs(e.name)] + fuel
         if t == "lab":
-            return [frozenset(SCIENCE_PACKS)]
-        if t in ("boiler", "mining-drill"):
-            return fuel
-        return []
+            return [frozenset(lab_inputs(e.name))]
+        return fuel
 
     def products(self, j: int, received: FrozenSet[str]) -> FrozenSet[str]:
+        """What entity j puts out: recipe results, smelted goods, burnt fuel (spent fuel cells), a chest's content."""
         e, t = self.ents[j], self.types[j]
-        r = recipe(e.extras_dict.get("recipe") or "")
-        if t == "assembling-machine" and r:
-            return frozenset(set(r.results) - r.fluids)
-        if t == "furnace":
-            return frozenset(SMELTING[i] for i in received if i in SMELTING)
-        if t in PASS_ON:
-            return frozenset(received & PASS_ON[t])
-        if t == "reactor":
-            return frozenset({"depleted-uranium-fuel-cell"}) if "uranium-fuel-cell" in received else frozenset()
-        if t in CONTAINERS:
+        if self.storage[j]:
             return received
-        return frozenset()
+        out: Set[str] = set()
+        if t == "assembling-machine":
+            r = recipe(e.extras_dict.get("recipe") or "")
+            out |= set(r.results) - r.fluids if r else set()
+        elif t == "furnace":
+            out |= {SMELTING[i] for i in received if i in SMELTING}
+        if keeps_burnt_result(e.name):
+            out |= {burnt_result(i) for i in received if burnt_result(i)}
+        return frozenset(out)
+
+    def passes_on(self, j: int) -> FrozenSet[str]:
+        """
+        What an inserter may take back out of entity j to hand on to the next entity that takes it
+        (never onto a belt or into a chest): a burner's fuel (boiler to boiler, reactor to reactor),
+        a lab's science packs, a turret's ammunition.
+        """
+        name = self.ents[j].name
+        return fuel_items(name) | frozenset(lab_inputs(name)) | ammo_items(name)
 
     def is_machine(self, j: int) -> bool:
+        """Crafting machines, labs, the rocket silo and burners that run on fuel to work (not inserters or vehicles)."""
         t = self.types[j]
-        if t == "mining-drill":
-            return _burner(self.ents[j].name)
-        return t in ("assembling-machine", "furnace", "lab", "rocket-silo", "boiler") and not (
-            t == "boiler" and not _burner(self.ents[j].name))
+        return t in ("assembling-machine", "furnace", "lab", "rocket-silo") or (
+            is_burner(self.ents[j].name) and t not in NOT_MACHINES)
 
     # --- fluids ---------------------------------------------------------------------------
 
@@ -579,9 +578,6 @@ def _passes(rule: Optional[Tuple[str, str]], item: str) -> bool:
     return item == x if kind == "only" else item != x
 
 
-FLAMETHROWER = "<flamethrower>"  # any of FLAMETHROWER_FLUIDS
-
-
 def _fluid_roles(L: Layout) -> Tuple[Dict[int, List[Tuple[List[int], str]]], Dict[int, List[Tuple[int, str]]]]:
     """
     Per machine: [(input boxes, fluid)] the fluid may come through and [(output box, fluid)] it puts
@@ -618,17 +614,18 @@ def _fluid_roles(L: Layout) -> Tuple[Dict[int, List[Tuple[List[int], str]]], Dic
                 makes[j] = [((linked or outs)[0], fout[0])]
             else:
                 makes[j] = _boxes_for(fout, outs, r.box_out, lambda b, f: (b, f))
+        # other machines: the fluid their prototype's boxes are filtered to
         elif t == "boiler":
             needs[j] = [(ins, L.boxes[ins[0]][3] or "water")] if ins else []
             makes[j] = [(b, L.boxes[b][3] or "steam") for b in outs]
         elif t == "generator":
-            needs[j] = [(bs, "steam")]
+            needs[j] = [(bs, L.boxes[bs[0]][3] or "steam")]
         elif t == "offshore-pump":
-            makes[j] = [(b, "water") for b in bs]
-        elif t == "mining-drill" and e.name == "pumpjack":
-            makes[j] = [(b, "crude-oil") for b in bs]
-        elif t == "fluid-turret":
-            needs[j] = [(bs, FLAMETHROWER)]
+            makes[j] = [(b, L.boxes[b][3] or "water") for b in bs]
+        elif t == "mining-drill":  # a drill with an output fluid box pumps oil from the ground
+            makes[j] = [(b, L.boxes[b][3] or "crude-oil") for b in (outs or bs)]
+        elif t == "fluid-turret" and turret_fluids(e.name):
+            needs[j] = [(bs, _any_of(turret_fluids(e.name)))]
     L._roles = (needs, makes)
     return needs, makes
 
@@ -646,7 +643,7 @@ def _boxes_for(fluids: List[str], boxes: List[int], index: Dict[str, int], make)
 
 
 def _has_fluid(fluid: str, have: Set[str]) -> bool:
-    return bool(have & set(FLAMETHROWER_FLUIDS)) if fluid == FLAMETHROWER else fluid in have
+    return bool(have & set(_choices(fluid)))
 
 
 def check(ir: IRBlueprint, inputs: Dict[Any, Optional[str]], layout: Optional[Layout] = None,
@@ -668,7 +665,7 @@ def _simulate(L: Layout, inputs: Dict[Any, Optional[str]]) -> FlowResult:
     result = _fixpoint(L, inputs, frozenset())
     if getattr(L, "_priming", None) is None:
         needs_f, makes_f = _fluid_roles(L)
-        needed = {(L.network[b], f) for ns in needs_f.values() for bs, f in ns for b in bs if f != FLAMETHROWER}
+        needed = {(L.network[b], f) for ns in needs_f.values() for bs, f in ns for b in bs if len(_choices(f)) == 1}
         makers: Dict[Tuple[int, str], Set[int]] = {}
         for j, made in makes_f.items():
             for b, f in made:
@@ -693,8 +690,8 @@ def _fixpoint(L: Layout, inputs: Dict[Any, Optional[str]], primed: FrozenSet[Tup
     received: Dict[int, Set[str]] = {}
     ground: Dict[Tile, Set[str]] = {}
     chests: Dict[int, Set[str]] = {}
-    for j, t in enumerate(L.types):
-        if t in CONTAINERS:
+    for j in range(len(ents)):
+        if L.storage[j]:
             req = ents[j].extras_dict.get("requests") or ""
             chests[j] = {p.split("=")[0] for p in req.split(";") if p}
     for key, item in inputs.items():
@@ -715,9 +712,7 @@ def _fixpoint(L: Layout, inputs: Dict[Any, Optional[str]], primed: FrozenSet[Tup
 
     def works(j: int) -> bool:
         got = received.get(j, set())
-        if L.types[j] in ("offshore-pump",) or (L.types[j] == "mining-drill" and not _burner(ents[j].name)):
-            return True
-        if any(not (need & got) for need in L.needs(j)):
+        if any(not (need & got) for need in L.needs(j)):  # electric drills, offshore pumps: no needs
             return False
         for bs, fluid in needs_f.get(j, []):
             have = set().union(*(net_fluids.get(L.network[b], set()) for b in bs)) if bs else set()
@@ -729,18 +724,8 @@ def _fixpoint(L: Layout, inputs: Dict[Any, Optional[str]], primed: FrozenSet[Tup
                 return False  # a fluid recipe in a machine without fluid boxes
         return True
 
-    def source_items(src: Tuple[str, Any]) -> Set[str]:
-        kind, ref = src
-        if kind == "belt":
-            return set().union(*(lanes[k] for k in L.belt_lanes(ref)))
-        if kind == "ground":
-            return ground.get(ref, set())
-        if kind == "entity":
-            if L.types[ref] in CONTAINERS:
-                return chests.get(ref, set())
-            return set(L.products(ref, frozenset(received.get(ref, set())))) if ref in working or L.types[ref] in GIVES_OUT \
-                else set()
-        return set()
+    def source_items(idx: int) -> Set[str]:
+        return _taken(L, idx, lanes, received, ground, chests, working)
 
     changed = True
     rounds = 0
@@ -765,10 +750,7 @@ def _fixpoint(L: Layout, inputs: Dict[Any, Optional[str]], primed: FrozenSet[Tup
                 changed |= _put(L, kind, ref, {L.resource}, lanes, received, ground, chests)
         # inserters
         for idx, (src, dst) in enumerate(L.links):
-            items = source_items(src)
-            if not items:
-                continue
-            items = L.moves(idx, items)
+            items = source_items(idx)
             if items:
                 changed |= _put(L, dst[0], dst[1], items, lanes, received, ground, chests)
         # machines and fluids
@@ -786,13 +768,38 @@ def _fixpoint(L: Layout, inputs: Dict[Any, Optional[str]], primed: FrozenSet[Tup
     return _verdict(L, lanes, received, ground, chests, working, inputs, needs_f, makes_f, net_fluids)
 
 
+def _taken(L: Layout, idx: int, lanes, received, ground, chests, working) -> Set[str]:
+    """
+    What inserter number idx moves: what its pickup holds (belt lanes, ground, a chest, a working
+    machine's products, spent fuel cells) and, into an entity that takes them (not a belt or a chest),
+    what the pickup entity passes on (fuel, science packs, ammunition); then its filter and target.
+    """
+    src, dst = L.links[idx]
+    kind, ref = src
+    if kind == "belt":
+        items = set().union(*(lanes[k] for k in L.belt_lanes(ref)))
+    elif kind == "ground":
+        items = set(ground.get(ref, set()))
+    elif kind == "entity":
+        got = frozenset(received.get(ref, set()))
+        if L.storage[ref]:
+            items = set(chests.get(ref, set()))
+        else:
+            items = set(L.products(ref, got)) if ref in working or keeps_burnt_result(L.ents[ref].name) else set()
+            if dst[0] == "entity" and not L.storage[dst[1]]:
+                items |= got & L.passes_on(ref)
+    else:
+        items = set()
+    return L.moves(idx, items) if items else items
+
+
 def _put(L: Layout, kind: str, ref: Any, items: Set[str], lanes, received, ground, chests) -> bool:
     if kind == "lane":
         target = lanes[ref]
     elif kind == "ground":
         target = ground.setdefault(ref, set())
     elif kind == "entity":
-        target = chests.setdefault(ref, set()) if L.types[ref] in CONTAINERS else received.setdefault(ref, set())
+        target = chests.setdefault(ref, set()) if L.storage[ref] else received.setdefault(ref, set())
     else:
         return False
     new = items - target
@@ -825,7 +832,7 @@ def _verdict(L: Layout, lanes, received, ground, chests, working, inputs, needs_
     # what is produced inside (machine products that reach somewhere)
     products: Set[str] = set()
     for j in working:
-        products |= set(L.products(j, frozenset(received.get(j, set())))) if L.types[j] not in CONTAINERS else set()
+        products |= set(L.products(j, frozenset(received.get(j, set())))) if not L.storage[j] else set()
     for j, _ in L.drills:
         if j in working:
             products.add(L.resource)
@@ -841,7 +848,7 @@ def _verdict(L: Layout, lanes, received, ground, chests, working, inputs, needs_
         if j not in working:
             got = received.get(j, set())
             missing = [sorted(n)[0] if len(n) == 1 else "/".join(sorted(n)[:2]) for n in L.needs(j) if not n & got]
-            missing += ["oil" if f == FLAMETHROWER else f for bs, f in needs_f.get(j, [])
+            missing += ["/".join(_choices(f)) for bs, f in needs_f.get(j, [])
                         if not _has_fluid(f, set().union(*(net_fluids.get(L.network[b], set()) for b in bs)) if bs else set())]
             problems.append(Problem("starved", f"{ents[j].name} at {pos(j)} lacks {', '.join(missing) or 'fluid'}", pos(j)))
     # research needs every pack in every lab: a lab without a pack the other labs get idles
@@ -860,17 +867,7 @@ def _verdict(L: Layout, lanes, received, ground, chests, working, inputs, needs_
     # inserters
     for idx, (k, (src, dst)) in enumerate(zip(L.inserters, L.links)):
         e = ents[k]
-        kind, ref = src
-        if kind == "belt":
-            items = set().union(*(lanes[k] for k in L.belt_lanes(ref)))
-        elif kind == "ground":
-            items = ground.get(ref, set())
-        elif kind == "entity":
-            items = chests.get(ref, set()) if L.types[ref] in CONTAINERS else \
-                set(L.products(ref, frozenset(received.get(ref, set())))) if ref in working or L.types[ref] in GIVES_OUT else set()
-        else:
-            items = set()
-        items = L.moves(idx, items)
+        items = _taken(L, idx, lanes, received, ground, chests, working)
         if not items:
             problems.append(Problem("dangling_inserter", f"{e.name} at {(e.x, e.y)} has nothing to pick", (e.x, e.y)))
         elif dst[0] == "ground" and not any(s == ("ground", dst[1]) for s, _ in L.links):
@@ -958,8 +955,8 @@ def input_ports(L: Layout) -> List[Tuple[Any, ...]]:
             continue  # the free half of a splitter that a belt feeds is not an extra input
         ports.append(("lane", k[0], k[1]))
     filled = {dst[1] for _, dst in L.links if dst[0] == "entity"}
-    for j, t in enumerate(L.types):
-        if t in CONTAINERS and j not in filled and not L.ents[j].extras_dict.get("requests") \
+    for j in range(len(L.ents)):
+        if L.storage[j] and j not in filled and not L.ents[j].extras_dict.get("requests") \
                 and any(src == ("entity", j) for src, _ in L.links):
             ports.append(("chest", j))
     return ports
@@ -968,8 +965,8 @@ def input_ports(L: Layout) -> List[Tuple[Any, ...]]:
 def _fluid_domains(L: Layout) -> Dict[Tuple[Any, ...], List[Optional[str]]]:
     """
     Pipe networks with an open end and no producer inside are input ports: candidates are the fluids
-    the machines on the network, or past the pumps it feeds, need (the most wanted first;
-    flamethrowers take light oil). A network a pump fills is not an input.
+    the machines on the network, or past the pumps it feeds, need (the most wanted first; a
+    flamethrower turret: any fluid it fires). A network a pump fills is not an input.
     """
     needs_f, makes_f = _fluid_roles(L)
     produced = {L.network[b] for made in makes_f.values() for b, _ in made} | {b for _, b in L.pumped}
@@ -977,9 +974,9 @@ def _fluid_domains(L: Layout) -> Dict[Tuple[Any, ...], List[Optional[str]]]:
     for j, ns in needs_f.items():
         for bs, fluid in ns:
             for net in {L.network[b] for b in bs}:
-                f = "light-oil" if fluid == FLAMETHROWER else fluid
                 for up in [n for n in set(L.network) if net in L.downstream_nets(n)]:
-                    wanted.setdefault(up, {})[f] = wanted.setdefault(up, {}).get(f, 0) + 1
+                    for f in _choices(fluid):
+                        wanted.setdefault(up, {})[f] = wanted.setdefault(up, {}).get(f, 0) + 1
     out: Dict[Tuple[Any, ...], List[Optional[str]]] = {}
     for b, _, _ in L.open_ends:
         net = L.network[b]
@@ -1059,28 +1056,24 @@ def _wants(L: Layout, dst: Tuple[str, Any], smelt: str, fuel: str) -> List[str]:
     j = dst[1]
     out: List[str] = []
     for need in L.needs(j):
-        if need == frozenset(SMELTING):
-            out += [smelt] + sorted(set(SMELTING) - {smelt})
-        elif need == frozenset(FUELS):
-            out += [fuel] + [f for f in FUELS if f != fuel]
-        elif need == frozenset(SCIENCE_PACKS):
-            out += [x for x in SCIENCE_PACKS if x != "space-science-pack"]  # rocket launches bring that one
-        else:
-            out += sorted(need)
-    if L.types[j] in AMMO:
-        out += list(AMMO[L.types[j]])
+        # alternatives (what a furnace smelts, what a burner burns): the preferred one first; items no
+        # recipe makes come from elsewhere than a belt (the space science pack from rocket launches)
+        first = [x for x in (smelt, fuel) if x in need and len(need) > 1]
+        out += first + sorted(x for x in need - set(first) if len(need) == 1 or made_by_recipe(x) or x in all_fuels()
+                              or x in SMELTING)
+    out += sorted(ammo_items(L.ents[j].name))
     acc = L.accepts(j)
-    if not out and acc:  # reactors, roboports: what they take
+    if not out and acc:  # roboports: what they take
         out = sorted(acc)
-    return out
+    return list(dict.fromkeys(out))
 
 
 def _demand(L: Layout, smelt: str, fuel: str) -> Dict[Tuple[Any, ...], Dict[str, int]]:
     """
     What could be of use arriving at each place of the flow graph, with a preference rank (lower is
     better): ('lane', lane), ('entity', j) and ('ground', tile). Machines want their ingredients; a
-    chest, the ground or an entity that passes items on (PASS_ON) wants what the inserters taking
-    from it deliver onward; a lane wants what is taken from it or from the lanes it flows into. So a
+    chest, the ground or an entity that passes items on (Layout.passes_on) wants what the inserters
+    taking from it deliver onward; a lane wants what is taken from it or from the lanes it flows into. So a
     manual chest feeding a belt, an inserter moving coal from one belt to another or ammunition
     passed from turret to turret all get their candidates.
     """
@@ -1099,6 +1092,10 @@ def _demand(L: Layout, smelt: str, fuel: str) -> Dict[Tuple[Any, ...], Dict[str,
         own = _wants(L, ("entity", j), smelt, fuel)
         if own:
             add(("entity", j), {x: r for r, x in enumerate(own)})
+    def dst_takes_passed(idx: int) -> bool:  # passed-on items go only into an entity that takes them
+        dst = L.links[idx][1]
+        return dst[0] == "entity" and not L.storage[dst[1]]
+
     into: Dict[Tuple[Any, ...], List[int]] = {}  # node -> inserters putting items there
     for idx, (_, dst) in enumerate(L.links):
         into.setdefault(("lane", dst[1]) if dst[0] == "lane" else dst, []).append(idx)
@@ -1117,9 +1114,11 @@ def _demand(L: Layout, smelt: str, fuel: str) -> Dict[Tuple[Any, ...], Dict[str,
                 continue
             if src[0] == "belt":
                 targets = [("lane", lane) for lane in L.belt_lanes(src[1])]
-            elif src[0] == "ground" or (src[0] == "entity" and (L.types[src[1]] in CONTAINERS or L.types[src[1]] in PASS_ON)):
-                acc = L.accepts(src[1]) if src[0] == "entity" and L.types[src[1]] in PASS_ON else ANY
-                wanted = {x: r for x, r in wanted.items() if acc is ANY or x in acc}
+            elif src[0] == "ground" or (src[0] == "entity" and L.storage[src[1]]):
+                targets = [src]
+            elif src[0] == "entity" and dst_takes_passed(idx):
+                acc = L.passes_on(src[1]) & L.accepts(src[1])
+                wanted = {x: r for x, r in wanted.items() if x in acc}
                 targets = [src]
             else:
                 targets = []
@@ -1171,7 +1170,7 @@ def _constraints(L: Layout, ports: List[Tuple[Any, ...]], domains, static: _Stat
     for idx, (src, dst) in enumerate(L.links):
         if src[0] == "belt" and any(k in static.inner for k in L.belt_lanes(src[1])):
             inner_fed.add(idx)
-        elif src[0] == "ground" or (src[0] == "entity" and L.types[src[1]] not in CONTAINERS):
+        elif src[0] == "ground" or (src[0] == "entity" and not L.storage[src[1]]):
             inner_fed.add(idx)
         elif src[0] == "entity" and any(d == ("entity", src[1]) for _, d in L.links):
             inner_fed.add(idx)
@@ -1226,7 +1225,7 @@ def _doomed(L: Layout, ports: List[Tuple[Any, ...]]) -> bool:
     for a, b in L.pumped:
         out_of.setdefault(("net", a), []).append(("net", b))
     starts = [("entity", p[1]) if p[0] != "fluid" else ("net", p[1]) for p in ports]
-    starts += [("entity", j) for j, t in enumerate(L.types) if t in CONTAINERS and L.ents[j].extras_dict.get("requests")]
+    starts += [("entity", j) for j in range(len(L.ents)) if L.storage[j] and L.ents[j].extras_dict.get("requests")]
     starts += [("entity", j) for j, _ in L.drills] + [("entity", j) for j in makes_f if j not in needs_f]
     seen = set(starts)
     stack = list(starts)
@@ -1264,7 +1263,7 @@ def _same_fuels(L: Layout, constraints: List[List[Tuple[Tuple[Any, ...], str]]],
         seen: Set[Tuple[Any, ...]] = set()
         kept = []
         for p, x in options:
-            key = (p[:2] if p[0] == "chest" else p, "<fuel>") if x in FUELS and x not in named else (p, x)
+            key = (p[:2] if p[0] == "chest" else p, "<fuel>") if x in all_fuels() and x not in named else (p, x)
             if key not in seen:
                 seen.add(key)
                 kept.append((p, x))
@@ -1284,10 +1283,10 @@ def _fluid_constraints(L: Layout, fluid_domains) -> List[List[Tuple[Tuple[Any, .
         for bs, fluid in ns:
             own = {L.network[b] for b in bs}
             nets = {n for n in set(L.network) if L.downstream_nets(n) & own}
-            if any((n, fluid) in made for n in nets) or (fluid == FLAMETHROWER and any(n in nets for n, _ in made)):
+            if any((n, f) in made for n in nets for f in _choices(fluid)):
                 continue
-            f = "light-oil" if fluid == FLAMETHROWER else fluid
-            out.append([(("fluid", n), f) for n in sorted(nets) if f in fluid_domains.get(("fluid", n), [])])
+            out.append([(("fluid", n), f) for n in sorted(nets) for f in _choices(fluid)
+                        if f in fluid_domains.get(("fluid", n), [])])
     return out
 
 
@@ -1311,11 +1310,11 @@ def _score(L: Layout, result: FlowResult, smelt: str, fuel: str, hints: Dict[Til
         if src[0] != "belt" or dst[0] != "entity":
             continue
         for x in L.moves(idx, set().union(*(result.lanes[lane] for lane in L.belt_lanes(src[1])))):
-            supply[x] = supply.get(x, 0.0) + INSERTER_RATE.get(L.ents[k].name, 1.0)
+            supply[x] = supply.get(x, 0.0) + inserter_rate(L.ents[k].name)
     for j in result.working:
         r = recipe(L.ents[j].extras_dict.get("recipe") or "")
         if r and r.time:
-            speed = float((_prototype(L.ents[j].name) or {}).get("crafting_speed") or 1)
+            speed = float(game_entity(L.ents[j].name).get("crafting_speed") or 1)
             for x, n in r.ingredients.items():
                 demand[x] = demand.get(x, 0.0) + n * speed / r.time
     ratios = [supply[x] / demand[x] for x in demand if x in supply and demand[x] > 0]
@@ -1339,7 +1338,7 @@ def _improve(ir: IRBlueprint, L: Layout, best: FlowResult, domains, smelt: str, 
     pack on every lane; alternatives such as fuels do not count), or the score improves otherwise.
     """
     # fuels, ammunition and smelting inputs are alternatives: one is enough, more is no better
-    alternatives = set(FUELS) | {a for kinds in AMMO.values() for a in kinds} | set(SMELTING)
+    alternatives = all_fuels() | all_ammo() | set(SMELTING)
 
     labs = [j for j, t in enumerate(L.types) if t == "lab"]
 

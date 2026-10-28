@@ -316,6 +316,93 @@ def recipes_of(tag: str) -> Dict[str, Dict[str, Any]]:
     return out
 
 
+def _known(value: Any) -> Any:
+    """The value unless the reader could not evaluate it (or any part of it)."""
+    if value is UNKNOWN:
+        return None
+    if isinstance(value, list):
+        return None if any(v is UNKNOWN for v in value) else value
+    return value
+
+
+def item_records(protos: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Per item: its prototype type, the entity it places, fuel category, burnt result, ammunition category."""
+    out = {}
+    for p in protos:
+        if p.get("type") not in ITEM_TYPES:
+            continue
+        rec = {"type": p["type"]}
+        for key, field in (("places", "place_result"), ("fuel_category", "fuel_category"),
+                           ("burnt_result", "burnt_result"), ("ammo_category", "ammo_category")):
+            value = _known(p.get(field))
+            if isinstance(value, str) and value:
+                rec[key] = value
+        attack = _known(p.get("attack_parameters"))  # a gun (the artillery turret's cannon) fires one category
+        if p["type"] == "gun" and isinstance(attack, dict) and isinstance(_known(attack.get("ammo_category")), str):
+            rec["ammo_category"] = attack["ammo_category"]
+        out[p["name"]] = rec
+    return out
+
+
+def entity_records(protos: List[Dict[str, Any]], items: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    Per buildable entity (one some item places): the properties the flow simulator and the validator
+    work from instead of lists of names - energy source and the fuel it burns, inventories, what a
+    crafting machine can craft, what a lab or a turret takes (a turret with a gun: the gun's), belt
+    and inserter speeds.
+    """
+    placed = {r["places"] for r in items.values() if "places" in r}
+    out = {}
+    for p in protos:
+        name = p.get("name")
+        if name not in placed or not isinstance(p.get("type"), str):
+            continue
+        rec: Dict[str, Any] = {"type": p["type"]}
+        energy = _known(p.get("energy_source"))
+        if isinstance(energy, dict) and isinstance(_known(energy.get("type")), str):
+            rec["energy"] = energy["type"]
+            cats = _known(energy.get("fuel_categories")) or ([energy["fuel_category"]] if isinstance(
+                _known(energy.get("fuel_category")), str) else None)
+            if energy["type"] == "burner":
+                rec["fuel_categories"] = cats or ["chemical"]  # the game's default fuel category
+                if isinstance(_known(energy.get("burnt_inventory_size")), (int, float)) and energy["burnt_inventory_size"]:
+                    rec["burnt_inventory"] = int(energy["burnt_inventory_size"])
+        attack = _known(p.get("attack_parameters"))
+        if isinstance(attack, dict):
+            ammo = _known(attack.get("ammo_categories")) or ([attack["ammo_category"]] if isinstance(
+                _known(attack.get("ammo_category")), str) else None)
+            if ammo:
+                rec["ammo_categories"] = ammo
+            fluids = _known(attack.get("fluids"))
+            if isinstance(fluids, list):
+                rec["fluids"] = [f["type"] for f in fluids if isinstance(f, dict) and isinstance(f.get("type"), str)]
+        gun = _known(p.get("gun"))
+        if isinstance(gun, str) and "ammo_category" in items.get(gun, {}):
+            rec["ammo_categories"] = [items[gun]["ammo_category"]]
+        for key, field in (("crafting_categories", "crafting_categories"), ("lab_inputs", "inputs"),
+                           ("resource_categories", "resource_categories")):
+            value = _known(p.get(field))
+            if isinstance(value, list) and all(isinstance(v, str) for v in value):
+                rec[key] = value
+        for key, field in (("inventory", "inventory_size"), ("source_inventory", "source_inventory_size"),
+                           ("result_inventory", "result_inventory_size"), ("module_slots", "module_slots"),
+                           ("crafting_speed", "crafting_speed"), ("speed", "speed"), ("max_distance", "max_distance"),
+                           ("rotation_speed", "rotation_speed")):
+            value = _known(p.get(field))
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                rec[key] = round(float(value), 6) if isinstance(value, float) else value
+        if p.get("bulk") is True:
+            rec["bulk"] = True
+        out[name] = rec
+    return out
+
+
+def prototype_paths(tag: str, folder: str) -> List[str]:
+    with urllib.request.urlopen(TREE.format(tag=tag), timeout=60) as response:
+        tree = json.loads(response.read().decode("utf-8"))["tree"]
+    return sorted(n["path"] for n in tree if n["path"].startswith(folder) and n["path"].endswith(".lua"))
+
+
 def changed(old: Dict[str, Dict[str, Any]], new: Dict[str, Dict[str, Any]]) -> List[str]:
     """Recipes of both versions whose ingredients or results differ by name."""
     return sorted(name for name, r in old.items() if name in new
@@ -330,8 +417,11 @@ def main():
 
     recipes = recipes_of(args.tag)
     recipes.update(barrel_recipes())
-    items = sorted({p["name"] for p in prototypes(fetch(args.tag, "base/prototypes/item.lua")) if p["type"] in ITEM_TYPES}
-                   | {f"{fluid}-barrel" for fluid in BASE_FLUIDS})
+    item_protos = prototypes(fetch(args.tag, "base/prototypes/item.lua"))
+    items = sorted({p["name"] for p in item_protos if p["type"] in ITEM_TYPES} | {f"{fluid}-barrel" for fluid in BASE_FLUIDS})
+    item_props = item_records(item_protos)
+    entity_protos = [p for path in prototype_paths(args.tag, "base/prototypes/entity/") for p in prototypes(fetch(args.tag, path))]
+    entities = entity_records(entity_protos, item_props)
     fluids = sorted(p["name"] for p in prototypes(fetch(args.tag, "base/prototypes/fluid.lua")) if p["type"] == "fluid")
     signals = sorted(p["name"] for p in prototypes(fetch(args.tag, "base/prototypes/signal.lua"))
                      if p["type"] == "virtual-signal")
@@ -354,8 +444,14 @@ def main():
     for version, names in changes.items():
         lines.append(f"    {version!r}: frozenset({names!r}),")
     lines.append("}")
+    lines += ["", "# item -> prototype type, entity it places, fuel category, burnt result, ammunition category",
+              "ITEM_PROPERTIES = {"] + [f"    {k!r}: {item_props[k]!r}," for k in sorted(item_props)] + ["}"]
+    lines += ["", "# buildable entity -> prototype type, energy source and fuel categories, inventories, crafting",
+              "# categories, lab inputs, ammunition categories, speeds", "ENTITIES = {"]
+    lines += [f"    {k!r}: {entities[k]!r}," for k in sorted(entities)] + ["}"]
     OUT.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"[*] {len(recipes)} recipes, {len(items)} items, {len(fluids)} fluids, {len(signals)} virtual signals -> {OUT}")
+    print(f"[*] {len(recipes)} recipes, {len(items)} items, {len(fluids)} fluids, {len(signals)} virtual signals, "
+          f"{len(entities)} entities -> {OUT}")
 
 
 if __name__ == "__main__":

@@ -41,6 +41,39 @@ class BaseGameDataTest(unittest.TestCase):
             self.assertNotIn("electronic-circuit", changes)
 
 
+class EntityPropertiesTest(unittest.TestCase):
+    """What entities can do comes from their prototypes, not from lists of names."""
+
+    def test_burners_and_their_fuel(self):
+        from factoriollm.game_data import burnt_result, fuel_items, is_burner, keeps_burnt_result
+        self.assertEqual(fuel_items("nuclear-reactor"), {"uranium-fuel-cell"})
+        self.assertEqual(fuel_items("boiler"), {"coal", "wood", "solid-fuel", "rocket-fuel", "nuclear-fuel"})
+        self.assertEqual(fuel_items("electric-furnace"), frozenset())
+        self.assertTrue(is_burner("burner-mining-drill") and not is_burner("electric-mining-drill"))
+        self.assertTrue(keeps_burnt_result("nuclear-reactor") and not keeps_burnt_result("boiler"))
+        self.assertEqual(burnt_result("uranium-fuel-cell"), "depleted-uranium-fuel-cell")
+
+    def test_labs_turrets_furnaces(self):
+        from factoriollm.game_data import SMELTING, ammo_items, craftable_inputs, lab_inputs, turret_fluids
+        self.assertEqual(len(lab_inputs("lab")), 7)
+        self.assertEqual(ammo_items("gun-turret"), {"firearm-magazine", "piercing-rounds-magazine", "uranium-rounds-magazine"})
+        self.assertEqual(ammo_items("artillery-turret"), {"artillery-shell"})  # through its gun
+        self.assertIn("light-oil", turret_fluids("flamethrower-turret"))
+        self.assertEqual(craftable_inputs("stone-furnace"), set(SMELTING))
+        self.assertEqual(SMELTING, {"iron-ore": "iron-plate", "copper-ore": "copper-plate", "stone": "stone-brick",
+                                    "iron-plate": "steel-plate"})
+
+    def test_storage_and_item_interfaces(self):
+        from factoriollm.game_data import is_storage
+        from factoriollm.validator import has_item_interface
+        self.assertTrue(is_storage("wooden-chest") and is_storage("requester-chest") and is_storage("cargo-wagon"))
+        self.assertFalse(is_storage("gun-turret") or is_storage("assembling-machine-1"))
+        for name in ("lab", "nuclear-reactor", "boiler", "gun-turret", "roboport", "rocket-silo", "steel-chest"):
+            self.assertTrue(has_item_interface(name), name)
+        for name in ("heat-exchanger", "electric-mining-drill", "beacon", "pipe", "inserter"):
+            self.assertFalse(has_item_interface(name), name)
+
+
 class BaseGamePolicyTest(unittest.TestCase):
     def test_legacy_recipe_rejected(self):
         bp = _bp({"name": "assembling-machine-2", "position": {"x": 1.5, "y": 1.5}, "recipe": "military-science-pack"})

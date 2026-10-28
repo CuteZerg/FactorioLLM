@@ -36,9 +36,11 @@ from factoriollm.blueprint_ir import (
 )
 from factoriollm.flow_sim import FlowResult, solve
 from factoriollm.game_data import final_products, places_entity, recipe
+from factoriollm.base_game import ENTITIES
 from factoriollm.templates import (
     CROP_STEPS,
-    DEFENSE,
+    DEFENSE_TYPES,
+    PIPE_TYPES,
     Template,
     add_port_labels,
     along_x,
@@ -62,20 +64,29 @@ REJECTS_BOOK = Path("outputs/templates/rejects_book.txt")
 REJECTS_PER_REASON = 5
 MAX_ENTITIES = 3000
 
-ASSEMBLERS = ("assembling-machine-1", "assembling-machine-2", "assembling-machine-3")
+# Entity kinds from the game data: assemblers craft the "crafting" category; every assembling-machine
+# type (chemical plants, refineries, centrifuges too) has its recipe in the blueprint; defence and
+# fluid handling by prototype type.
+ASSEMBLERS = tuple(sorted(n for n, e in ENTITIES.items()
+                          if e["type"] == "assembling-machine" and "crafting" in e.get("crafting_categories", ())))
+DEFENSE = frozenset(n for n, e in ENTITIES.items() if e["type"] in DEFENSE_TYPES)
+TURRET_KINDS = {n: {"ammo-turret": "gun", "electric-turret": "laser", "fluid-turret": "flame",
+                    "artillery-turret": "artillery"}[e["type"]]
+                for n, e in ENTITIES.items() if e["type"] in ("ammo-turret", "electric-turret", "fluid-turret", "artillery-turret")}
+# Categories of the catalog named after the vanilla furnaces (a policy, not a property)
 FURNACES = {"stone-furnace": "smelting_stone", "steel-furnace": "smelting_steel", "electric-furnace": "smelting_electric"}
 SCIENCE = {"automation-science-pack": "science_red", "logistic-science-pack": "science_green",
            "military-science-pack": "science_military", "chemical-science-pack": "science_blue",
            "production-science-pack": "science_purple", "utility-science-pack": "science_yellow"}
 # Machines with a recipe in the blueprint (furnaces pick theirs from the input).
-RECIPE_MACHINES = {*ASSEMBLERS, "chemical-plant", "oil-refinery", "centrifuge"}
+RECIPE_MACHINES = {n for n, e in ENTITIES.items() if e["type"] == "assembling-machine"}
 # Single final product -> category. Products that need a layout of their own: circuits (direct
 # insertion, lane tricks), plastic, science. Every other product goes to a family by the shape of
 # its recipe (see recipe_family): gears, pipes, rods are instances of "1 solid input".
 PRODUCT_CATEGORIES = {"electronic-circuit": "green_circuits", "advanced-circuit": "red_circuits",
                       "processing-unit": "blue_circuits", "plastic-bar": "plastic", **SCIENCE}
 MULTI_MAX_PRODUCTS = 3  # more final products than this is a mall: no tileable segment, not mined
-FLUID_ENTITIES = {"offshore-pump", "pump", "pipe", "pipe-to-ground", "storage-tank"}
+FLUID_ENTITIES = {n for n, e in ENTITIES.items() if e["type"] in PIPE_TYPES or e["type"] == "offshore-pump"}
 
 
 # Machines that make up each category; a module must consist mostly of them.
@@ -97,7 +108,6 @@ MIN_PURITY = 0.6
 AREA_PURITY = {"nuclear": 0.4, "steam": 0.5, "solar": 0.5, "mining": 0.5, "defense": 0.5}
 AREA_FAMILIES = {**FAMILIES, "mining": {"electric-mining-drill", "beacon"}}  # beaconed mining is still mining
 FAMILY_CATEGORIES = ("assembly_1in", "assembly_2in", "assembly_3in", "assembly_fluid", "chemistry", "oil", "uranium")
-TURRET_KINDS = {"gun-turret": "gun", "laser-turret": "laser", "flamethrower-turret": "flame", "artillery-turret": "artillery"}
 
 
 def products(ir: IRBlueprint) -> List[str]:
@@ -150,8 +160,9 @@ def _producers(product: str) -> List[str]:
 
 def _category(names: Counter, ir: IRBlueprint) -> Optional[str]:
     furnaces = {k: names[k] for k in FURNACES}
-    turrets = sum(n for name, n in names.items() if name in DEFENSE and name.endswith("turret"))
-    if (turrets or names["stone-wall"] >= 8) and area_share(ir, DEFENSE) >= AREA_PURITY["defense"] \
+    turrets = sum(n for name, n in names.items() if name in TURRET_KINDS)
+    walls = sum(n for name, n in names.items() if name in DEFENSE and name not in TURRET_KINDS)
+    if (turrets or walls >= 8) and area_share(ir, DEFENSE) >= AREA_PURITY["defense"] \
             and area_share(ir, PRODUCTION) <= 0.1:  # not a production block behind its walls
         return "defense"
     if names["nuclear-reactor"]:
