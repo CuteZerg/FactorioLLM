@@ -588,11 +588,16 @@ def straight_wall(t: Template) -> bool:
     A piece of defence to repeat along the line: a segment form with walls in most columns of the
     segment (MIN_WALL_COVER), all within one band at most MAX_WALL_THICKNESS thick, and the head and tail walls inside
     that band too (dragon's teeth are fine; two walls far apart, or caps across the line, are a ring
-    or a perimeter; a thicker band repeats across the wall, not along it).
+    or a perimeter; a thicker band repeats across the wall, not along it). Without walls (a row of
+    turrets meant to stand behind one) the turrets take the test, except the cover: turrets stand
+    apart. So a corner or an outpost ring of turrets is not a straight piece either.
     """
     if not (t.head or t.repeats > 1 or t.tail):
         return False
     walls = ("stone-wall", "gate")
+    cover = MIN_WALL_COVER
+    if not any(e.name in walls for e in t.head + t.segment + t.tail):
+        walls, cover = tuple(TURRET_KINDS), 0.0
     rows: Dict[int, set] = {}
     for e in t.segment:
         if e.name in walls:
@@ -600,12 +605,12 @@ def straight_wall(t: Template) -> bool:
             for dx in range(w):
                 rows.setdefault((e.x + dx) % t.period, set()).update(range(e.y, e.y + h))
     if not rows:
-        return True  # a row of turrets meant to stand behind a wall
+        return False
     every = set().union(*rows.values())
     lo, hi = min(every), max(every)
     ends = [y for e in t.head + t.tail if e.name in walls for y in range(e.y, e.y + footprint(e.name, e.direction)[1])]
     gap = max((b - a - 1 for a, b in zip(sorted(every), sorted(every)[1:])), default=0)
-    return (len(rows) >= MIN_WALL_COVER * t.period and hi - lo + 1 <= MAX_WALL_THICKNESS
+    return (len(rows) >= cover * t.period and hi - lo + 1 <= MAX_WALL_THICKNESS
             and gap <= MAX_WALL_GAP  # two walls with room between them are the sides of a ring
             and all(lo <= y <= hi for y in ends))  # the caps of a ring stick out of the band
 

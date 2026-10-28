@@ -259,6 +259,28 @@ class TestSelfContained(unittest.TestCase):
         inside = add_port_labels(furnace_row(3), inside_only=True)
         self.assertTrue(all(e.x >= 0 and e.y >= 0 for e in inside.entities))
 
+    def test_crop_keeps_the_underground_copies_join_at(self):
+        # a yellow pair weaves from one copy of the cell into the next: in one copy its exit has no
+        # entrance, but it is the author's joint, not surroundings to cut
+        import json
+        from pathlib import Path
+        from factoriollm.templates import prepare
+        data = json.loads((Path(__file__).parent / "fixtures" / "flow" / "engines_weave_cell.json").read_text())
+        ir = IRBlueprint([IREntity(n, x, y, d, tuple(sorted(ex.items()))) for n, x, y, d, ex in data["entities"]])
+        lone = [(e.x, e.y) for e in ir.entities if e.name == "underground-belt" and e.extras_dict.get("io_type") == "output"]
+        kept = {(e.x, e.y) for e in prepare(ir, 2).entities}
+        self.assertTrue(lone and all(t in kept for t in lone), lone)
+
+    def test_spare_semi_finished_goods_get_no_label(self):
+        # gears are made for the belt machine; the gears it leaves on the output belt are no product
+        ir = IRBlueprint([IREntity("transport-belt", x, y, 4) for x in range(8) for y in (0, 6)] + [
+            IREntity("inserter", 1, 1, 0), IREntity("assembling-machine-2", 0, 2, 0, (("recipe", "iron-gear-wheel"),)),
+            IREntity("inserter", 1, 5, 0), IREntity("inserter", 5, 1, 0), IREntity("inserter", 4, 5, 8),
+            IREntity("assembling-machine-2", 4, 2, 0, (("recipe", "transport-belt"),)), IREntity("inserter", 6, 5, 0)])
+        labels = [e.extras_dict["signals"] for e in add_port_labels(ir).entities if e.name == "constant-combinator"]
+        self.assertTrue(any("item:transport-belt" in s for s in labels), labels)
+        self.assertFalse(any("iron-gear-wheel" in s for s in labels), labels)
+
     def test_pass_through_belt_is_not_mixed(self):
         # the coal belt runs past the boilers on to the next block: the line has an input and an
         # output, but nothing is added to it, so each end gets one label without L / R

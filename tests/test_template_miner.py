@@ -180,5 +180,18 @@ class TestMinerParts(unittest.TestCase):
         self.assertEqual(len(rejects.kept["clog"]), 2)
 
 
+class StraightTurretRowTest(unittest.TestCase):
+    def test_turrets_without_walls_must_be_one_band(self):
+        from factoriollm.template_miner import straight_wall
+        from factoriollm.templates import Template
+        row = Template("defense", 4, [], [IREntity("gun-turret", 0, 0)], [], 3)
+        self.assertTrue(straight_wall(row))
+        corner = Template("defense", 4, [IREntity("gun-turret", -2, y) for y in range(2, 12, 2)],
+                          [IREntity("gun-turret", 0, 0)], [], 3)  # the column of the corner leaves the band
+        self.assertFalse(straight_wall(corner))
+        ring = Template("defense", 4, [], [IREntity("laser-turret", 0, 0), IREntity("laser-turret", 0, 20)], [], 3)
+        self.assertFalse(straight_wall(ring))
+
+
 if __name__ == "__main__":
     unittest.main()
