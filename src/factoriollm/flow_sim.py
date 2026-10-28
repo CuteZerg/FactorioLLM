@@ -240,6 +240,36 @@ class Layout:
         self._need = need
         return need
 
+    def taken_before(self) -> Dict[Lane, Optional[Set[str]]]:
+        """
+        Per lane: the items some inserter takes from it or from a lane flowing into it (None: anything).
+        What machines take on the way is eaten as it passes; whether some is left at a belt's end is
+        a matter of rates, which the simulator does not count.
+        """
+        if getattr(self, "_taken_before", None) is not None:
+            return self._taken_before
+        picks = _picks(self)
+        before: Dict[Lane, Optional[Set[str]]] = {}
+        for k in self.edges:
+            p = picks.get(k[0], frozenset())
+            before[k] = None if p is ANY else set(p)
+        stack = list(self.edges)
+        while stack:  # push what is taken on to the lanes downstream
+            src = stack.pop()
+            for dst, _ in self.edges[src]:
+                if before[dst] is None:
+                    continue
+                if before[src] is None:
+                    before[dst] = None
+                    stack.append(dst)
+                    continue
+                add = before[src] - before[dst]
+                if add:
+                    before[dst] |= add
+                    stack.append(dst)
+        self._taken_before = before
+        return before
+
     def upstream(self, lanes: Iterable[Lane]) -> Set[Lane]:
         """These lanes and every lane that flows into them."""
         seen = set(lanes)
@@ -875,24 +905,26 @@ def _verdict(L: Layout, lanes, received, ground, chests, working, inputs, needs_
         elif dst[0] == "none" or (dst[0] == "entity" and not L.accepts(dst[1]) and L.accepts(dst[1]) is not ANY):
             problems.append(Problem("dangling_inserter", f"{e.name} at {(e.x, e.y)} drops into nothing", (e.x, e.y)))
 
-    # belts: clogs and mixed outputs
+    # belts: clogs and mixed outputs. An item that inserters take on the way (furnaces eating ore off
+    # the belt their plates go onto) is used up as it passes: what is left at the end is a matter of rates
     need = L.lane_need()
+    before = L.taken_before()
     terminals = [k for k, outs in L.edges.items() if not outs and lanes[k]]
     outputs = {k for k in terminals if lanes[k] & products}
     leads_out = L.upstream(outputs)
     reported: Set[Tuple[str, int]] = set()
     for k, items in lanes.items():
         n = need[k]
-        if not items or n is None or k in leads_out:
+        if not items or n is None or k in leads_out or before[k] is None:
             continue
-        stuck = items - n
+        stuck = items - n - before[k]
         if stuck and items & n:
             for x in sorted(stuck):
                 if (x, k[0]) not in reported:
                     reported.add((x, k[0]))
                     problems.append(Problem("clog", f"{x} blocks the belt at {pos(k[0])}", pos(k[0])))
     for k in outputs:
-        mixed = (lanes[k] & input_items) - products
+        mixed = (lanes[k] & input_items) - products - (before[k] or set()) if before[k] is not None else set()
         if mixed:
             problems.append(Problem("output_mixed", f"{', '.join(sorted(mixed))} leaves with the products at {pos(k[0])}",
                                     pos(k[0])))
@@ -1505,6 +1537,11 @@ def _solve_whole(ir: IRBlueprint, L: Layout, smelt: str, fuel: str, hints: Dict[
                 ports.append(("chest", p[1], x))
                 domains[("chest", p[1], x)] = [x, None]
     fluid_domains = _fluid_domains(L)
+    # open pipe networks that pumps carry into one network (pumps unloading fluid wagons side by side)
+    # must bring one fluid: they get it together
+    fluid_group: Dict[Tuple[Any, ...], List[Tuple[Any, ...]]] = {}
+    for p in fluid_domains:
+        fluid_group[p] = [q for q in fluid_domains if (L.downstream_nets(p[1]) - {p[1]}) & (L.downstream_nets(q[1]) - {q[1]})] or [p]
     constraints = _same_fuels(L, _constraints(L, ports, domains, static), hints) + _fluid_constraints(L, fluid_domains)
     ports += list(fluid_domains)
     domains.update(fluid_domains)
@@ -1546,8 +1583,11 @@ def _solve_whole(ir: IRBlueprint, L: Layout, smelt: str, fuel: str, hints: Dict[
             if x and other in port_set and other not in assign and not _reach(L, (p[1], p[2] ^ 1)) & static.inner:
                 assign[other] = x
                 filled.append(other)
-        for p in fluid_domains:  # a pipe network the search did not need still gets its fluid
-            assign.setdefault(p, fluid_domains[p][0])
+        for p in fluid_domains:  # a pipe network the search did not need gets the fluid of its pump group
+            if p not in assign:
+                mates = [assign[q] for q in fluid_group[p] if assign.get(q)]
+                first = fluid_domains[min(fluid_group[p])][0]
+                assign[p] = next((f for f in mates + [first] if f in fluid_domains[p]), fluid_domains[p][0])
         if simulate(assign) is not False or not filled:  # works, or seen before: its variants too
             return
         # the same item on both lanes does not work: try other items on the filled lanes (lane-split
