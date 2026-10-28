@@ -135,6 +135,25 @@ class FlowSimReviewTest(unittest.TestCase):
         self.assertEqual(first(plain), (0, 0))
         self.assertEqual(first(flipped), (2, 0))
 
+    def test_pump_passes_fluid_one_way(self):
+        # pipe -> pump facing south -> pipe: water put in above reaches below, not the other way
+        ir = IRBlueprint([E("pipe", 0, 0), E("pump", 0, 1, 8), E("pipe", 0, 3)])
+        L = Layout(ir)
+        (up, down), = L.pumped
+        top, bottom = 0, 2
+        self.assertIn("water", check(ir, {("fluid", up): "water"}, L).fluids[bottom])
+        self.assertNotIn("water", check(ir, {("fluid", down): "water"}, L).fluids.get(top, frozenset()))
+
+    def test_underground_pipe_has_one_partner(self):
+        # two pipes-to-ground face east, one faces west two tiles past the second: the near two pair,
+        # the far one is a dead end (not joined, not an input from outside)
+        ir = IRBlueprint([E("pipe-to-ground", 0, 0, 12), E("pipe-to-ground", 5, 0, 12), E("pipe-to-ground", 7, 0, 4)])
+        L = Layout(ir)
+        net = {L.ents[j].x: L.network[b] for b, (j, _, _, _) in enumerate(L.boxes)}
+        self.assertEqual(net[5], net[7])
+        self.assertNotEqual(net[0], net[7])
+        self.assertNotIn((1, 0), {t for _, t, _ in L.open_ends})
+
     def test_design_made_to_dock(self):
         # the machine's input inserter takes from the belt of the copy to its left
         cell = IRBlueprint([E("inserter", 0, 1, 12), E("assembling-machine-1", 1, 0, recipe="iron-gear-wheel"),

@@ -464,6 +464,12 @@ class Layout:
                 if key == "input_fluid_box" and t == "mining-drill":
                     continue  # mining fluid (uranium) is out of scope
                 boxes.append(box)
+        if t == "pump" and boxes:
+            # a pump passes fluid one way: its input and output sides are boxes of two networks
+            conns = boxes[0].get("pipe_connections") or []
+            boxes = [{"production_type": f"pump-{side}", "pipe_connections": [c for c in conns
+                                                                               if c.get("flow_direction") == side]}
+                     for side in ("input", "output")]
         out = []
         cx, cy = _center(e)
         mirror = e.extras_dict.get("mirror") == "true"  # 2.0: flipped left-right before rotating
@@ -514,16 +520,26 @@ class Layout:
             at.setdefault((inside, d, ug), []).append(b)
         self.open_ends: List[Tuple[int, Tile, int]] = []  # (box, free tile, direction)
         self.pipe_links: List[Tuple[int, int]] = []        # entities joined by a fluid connection
-        for b, inside, d, ug, dist in conns:
+        # an underground pipe has one partner: the first one facing it within reach, and only if it
+        # is that one's first too (a pipe-to-ground between them facing the same way does not count;
+        # a pair two tiles apart leaves a farther one facing it unpaired, as authors use to keep two
+        # lines in one row apart)
+        ug_at = {(inside, d): n for n, (_, inside, d, ug, _) in enumerate(conns) if ug}
+        first: Dict[int, Optional[int]] = {}
+        for n, (b, inside, d, ug, dist) in enumerate(conns):
+            if ug:
+                dx, dy = _vec(d)
+                first[n] = next((ug_at[t] for t in (((inside[0] + k * dx, inside[1] + k * dy), (d + 8) % 16)
+                                                    for k in range(1, dist + 1)) if t in ug_at), None)
+        for n, (b, inside, d, ug, dist) in enumerate(conns):
             dx, dy = _vec(d)
             if ug:
-                for k in range(1, dist + 1):
-                    hit = at.get(((inside[0] + k * dx, inside[1] + k * dy), (d + 8) % 16, True))
-                    if hit:
-                        parent[root(b)] = root(hit[0])
-                        self.pipe_links.append((self.boxes[b][0], self.boxes[hit[0]][0]))
-                        break
-                else:  # an underground pipe without a partner brings fluid from outside
+                m = first[n]
+                if m is not None and first.get(m) == n:
+                    if n < m:
+                        parent[root(b)] = root(conns[m][0])
+                        self.pipe_links.append((self.boxes[b][0], self.boxes[conns[m][0]][0]))
+                elif m is None:  # an underground pipe without a partner brings fluid from outside
                     self.open_ends.append((b, (inside[0] + dx, inside[1] + dy), d))
                 continue
             nbr = (inside[0] + dx, inside[1] + dy)
@@ -535,6 +551,23 @@ class Layout:
             elif nbr not in self.tiles:
                 self.open_ends.append((b, nbr, d))
         self.network = [root(b) for b in range(len(self.boxes))]
+        # pumps: (network on the input side, network on the output side)
+        sides: Dict[int, Dict[str, int]] = {}
+        for b, (j, _, ptype, _) in enumerate(self.boxes):
+            if ptype.startswith("pump-"):
+                sides.setdefault(j, {})[ptype] = self.network[b]
+        self.pumped = [(s["pump-input"], s["pump-output"]) for s in sides.values() if len(s) == 2]
+
+    def downstream_nets(self, net: int) -> Set[int]:
+        """This network and every network pumps carry its fluid on to."""
+        seen, stack = {net}, [net]
+        while stack:
+            n = stack.pop()
+            for a, b in self.pumped:
+                if a == n and b not in seen:
+                    seen.add(b)
+                    stack.append(b)
+        return seen
 
 
 # --- Simulation -----------------------------------------------------------------------------
@@ -639,7 +672,7 @@ def _simulate(L: Layout, inputs: Dict[Any, Optional[str]]) -> FlowResult:
         makers: Dict[Tuple[int, str], Set[int]] = {}
         for j, made in makes_f.items():
             for b, f in made:
-                if (L.network[b], f) in needed:
+                if any((n, f) in needed for n in L.downstream_nets(L.network[b])):  # there or past pumps
                     makers.setdefault((L.network[b], f), set()).add(j)
         L._priming = makers
     makers = L._priming
@@ -745,6 +778,11 @@ def _fixpoint(L: Layout, inputs: Dict[Any, Optional[str]], primed: FrozenSet[Tup
                 changed = True
                 for b, fluid in makes_f.get(j, []):
                     net_fluids.setdefault(L.network[b], set()).add(fluid)
+        for a, b in L.pumped:  # one way, from the input side to the output side
+            new = net_fluids.get(a, set()) - net_fluids.get(b, set())
+            if new:
+                net_fluids.setdefault(b, set()).update(new)
+                changed = True
     return _verdict(L, lanes, received, ground, chests, working, inputs, needs_f, makes_f, net_fluids)
 
 
@@ -923,16 +961,18 @@ def input_ports(L: Layout) -> List[Tuple[Any, ...]]:
 def _fluid_domains(L: Layout) -> Dict[Tuple[Any, ...], List[Optional[str]]]:
     """
     Pipe networks with an open end and no producer inside are input ports: candidates are the fluids
-    the machines on the network need (the most wanted first; flamethrowers take light oil).
+    the machines on the network, or past the pumps it feeds, need (the most wanted first;
+    flamethrowers take light oil). A network a pump fills is not an input.
     """
     needs_f, makes_f = _fluid_roles(L)
-    produced = {L.network[b] for made in makes_f.values() for b, _ in made}
+    produced = {L.network[b] for made in makes_f.values() for b, _ in made} | {b for _, b in L.pumped}
     wanted: Dict[int, Dict[str, int]] = {}
     for j, ns in needs_f.items():
         for bs, fluid in ns:
             for net in {L.network[b] for b in bs}:
                 f = "light-oil" if fluid == FLAMETHROWER else fluid
-                wanted.setdefault(net, {})[f] = wanted.setdefault(net, {}).get(f, 0) + 1
+                for up in [n for n in set(L.network) if net in L.downstream_nets(n)]:
+                    wanted.setdefault(up, {})[f] = wanted.setdefault(up, {}).get(f, 0) + 1
     out: Dict[Tuple[Any, ...], List[Optional[str]]] = {}
     for b, _, _ in L.open_ends:
         net = L.network[b]
@@ -1176,6 +1216,8 @@ def _doomed(L: Layout, ports: List[Tuple[Any, ...]]) -> bool:
         out_of.setdefault(("net", L.network[b]), []).append(("entity", j))
     for j, made in makes_f.items():
         out_of.setdefault(("entity", j), []).extend(("net", L.network[b]) for b, _ in made)
+    for a, b in L.pumped:
+        out_of.setdefault(("net", a), []).append(("net", b))
     starts = [("entity", p[1]) if p[0] != "fluid" else ("net", p[1]) for p in ports]
     starts += [("entity", j) for j, t in enumerate(L.types) if t in CONTAINERS and L.ents[j].extras_dict.get("requests")]
     starts += [("entity", j) for j, _ in L.drills] + [("entity", j) for j in makes_f if j not in needs_f]
@@ -1224,14 +1266,18 @@ def _same_fuels(L: Layout, constraints: List[List[Tuple[Tuple[Any, ...], str]]],
 
 
 def _fluid_constraints(L: Layout, fluid_domains) -> List[List[Tuple[Tuple[Any, ...], str]]]:
-    """Every fluid a machine needs must come through one of its input networks (unless made inside)."""
+    """
+    Every fluid a machine needs must come through one of its input networks, or one that pumps
+    feed them from (unless made inside).
+    """
     needs_f, makes_f = _fluid_roles(L)
     made = {(L.network[b], f) for ms in makes_f.values() for b, f in ms}
     out = []
     for j, ns in needs_f.items():
         for bs, fluid in ns:
-            nets = {L.network[b] for b in bs}
-            if any((n, fluid) in made for n in nets) or (fluid == FLAMETHROWER and any(n for n, f in made if n in nets)):
+            own = {L.network[b] for b in bs}
+            nets = {n for n in set(L.network) if L.downstream_nets(n) & own}
+            if any((n, fluid) in made for n in nets) or (fluid == FLAMETHROWER and any(n in nets for n, _ in made)):
                 continue
             f = "light-oil" if fluid == FLAMETHROWER else fluid
             out.append([(("fluid", n), f) for n in sorted(nets) if f in fluid_domains.get(("fluid", n), [])])
@@ -1288,9 +1334,13 @@ def _improve(ir: IRBlueprint, L: Layout, best: FlowResult, domains, smelt: str, 
     # fuels, ammunition and smelting inputs are alternatives: one is enough, more is no better
     alternatives = set(FUELS) | {a for kinds in AMMO.values() for a in kinds} | set(SMELTING)
 
+    labs = [j for j, t in enumerate(L.types) if t == "lab"]
+
     def key(r: FlowResult) -> Tuple[Any, ...]:
         distinct = len({x for k, x in r.inputs.items() if x and k[0] != "fluid" and x not in alternatives})
-        return (r.score[0], r.score[1], distinct) + tuple(r.score[2:])  # then whole belts, supply, fewer lanes
+        # research needs every pack in every lab: the worst-fed lab first (a copy left with red only)
+        poorest = min((len(r.machines.get(j, ())) for j in labs), default=0)
+        return (r.score[0], r.score[1], poorest, distinct) + tuple(r.score[2:])  # then whole belts, supply, fewer lanes
 
     budget = MAX_IMPROVE
     improved = True
