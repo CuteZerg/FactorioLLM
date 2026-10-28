@@ -706,15 +706,45 @@ def _underground_clusters(ents: List[IREntity]) -> List[List[Tuple[int, ...]]]:
     return clusters
 
 
+def author_signs(ir: IRBlueprint) -> List[Tuple[IREntity, Tuple[int, int], FrozenSet[str]]]:
+    """
+    Filter inserters an author set up as signs: the inserter picks from an empty tile nothing ever
+    drops onto, so it can never move anything, and drops onto a belt (often right next to it), the
+    ground or something without an inventory; its filter names the item of the belt by it. (One
+    dropping into a chest may load from a wagon at a station: not a sign.) Returns (inserter, drop
+    tile, items).
+    """
+    from factoriollm.flow_sim import Layout
+    from factoriollm.validator import has_item_interface
+
+    if not any(e.extras_dict.get("filters") for e in ir.entities):
+        return []
+    L = Layout(ir)
+    dropped = {dst for _, dst in L.links if dst[0] == "ground"}
+    out = []
+    for idx, (k, (src, dst)) in enumerate(zip(L.inserters, L.links)):
+        flt = L.filters[idx]
+        if flt is None or not flt[0] or src[0] != "ground" or ("ground", src[1]) in dropped:
+            continue
+        if dst[0] == "entity" and has_item_interface(L.ents[dst[1]].name):
+            continue
+        at = L.ents[dst[1][0]] if dst[0] == "lane" else L.ents[k]  # the belt it names, else the sign itself
+        out.append((L.ents[k], (at.x, at.y), flt[1]))
+    return out
+
+
 def prepare(ir: IRBlueprint, margin: Optional[int] = CROP_MARGIN, keep_defense: bool = False,
             cut_taps: bool = True) -> IRBlueprint:
     """
-    A self-contained copy of a player's design. Radars and author labels go (new labels come from the
-    flow simulator, see add_port_labels), and so does the author's defence (unless the design is
-    defence). Belts and pipes are cut by flow, not by a rectangle (see _trim_tails); margin=None keeps
-    them all. Lamps stay; templates keep them as an optional layer. See CROP_STEPS for gentler cuts.
+    A self-contained copy of a player's design. Radars and author labels go (signs made of filter
+    inserters too, see author_signs; new labels come from the flow simulator, see add_port_labels),
+    and so does the author's defence (unless the design is defence). Belts and pipes are cut by flow,
+    not by a rectangle (see _trim_tails); margin=None keeps them all. Lamps stay; templates keep them
+    as an optional layer. See CROP_STEPS for gentler cuts.
     """
-    ents = [e for e in ir.entities if entity_type(e.name) not in AUTHOR_ONLY_TYPES and (keep_defense or not is_defense(e.name))]
+    signs = {e for e, _, _ in author_signs(ir)}
+    ents = [e for e in ir.entities if entity_type(e.name) not in AUTHOR_ONLY_TYPES and e not in signs
+            and (keep_defense or not is_defense(e.name))]
     if margin is not None and ents:
         ents = _trim_tails(ents, margin, cut_taps)
     return ir.with_entities(ents)

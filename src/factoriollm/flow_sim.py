@@ -1519,10 +1519,11 @@ def _solve_whole(ir: IRBlueprint, L: Layout, smelt: str, fuel: str, hints: Dict[
 
     port_set = set(ports)
 
-    def simulate(assign: Dict[Tuple[Any, ...], str]) -> bool:
+    def simulate(assign: Dict[Tuple[Any, ...], str]) -> Optional[bool]:
+        """Whether the assignment works; None if it was simulated before."""
         key = frozenset(assign.items())
         if key in tried:
-            return False
+            return None
         tried.add(key)
         leaves[0] += 1
         result = check(ir, {p: assign.get(p) for p in ports}, L)
@@ -1547,10 +1548,11 @@ def _solve_whole(ir: IRBlueprint, L: Layout, smelt: str, fuel: str, hints: Dict[
                 filled.append(other)
         for p in fluid_domains:  # a pipe network the search did not need still gets its fluid
             assign.setdefault(p, fluid_domains[p][0])
-        if simulate(assign) or not filled:
+        if simulate(assign) is not False or not filled:  # works, or seen before: its variants too
             return
-        # the same item on both lanes does not work: try other items on the filled lanes (lane-split belts)
-        options = [[x for x in domains[p] if x] for p in filled]
+        # the same item on both lanes does not work: try other items on the filled lanes (lane-split
+        # belts), and the lane left empty (products go onto it further on, or the item must stay on one lane)
+        options = [[x for x in domains[p] if x] + [None] for p in filled]
         for combo in itertools.islice(itertools.product(*options), 16):
             if done():
                 return

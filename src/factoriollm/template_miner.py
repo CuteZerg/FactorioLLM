@@ -44,6 +44,7 @@ from factoriollm.templates import (
     Template,
     add_port_labels,
     along_x,
+    author_signs,
     extract,
     extract_cell,
     has_weaving,
@@ -443,8 +444,8 @@ SIMPLE_QUOTA = 3  # simple designs kept per category besides the best-ranked one
 
 
 def author_hints(ir: IRBlueprint) -> Dict[Tuple[int, int], set]:
-    """What the author's labels name (combinator signals, display panel icons), by label tile."""
-    out: Dict[Tuple[int, int], set] = {}
+    """What the author's labels name (combinator signals, display panel icons, signs made of filter inserters), by tile."""
+    out: Dict[Tuple[int, int], set] = {tile: set(items) for _, tile, items in author_signs(ir)}
     for e in ir.entities:
         ex = e.extras_dict
         names = {part.split("=")[0].split(":", 1)[1] for part in (ex.get("signals") or "").split(";")

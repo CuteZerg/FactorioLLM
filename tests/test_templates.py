@@ -271,6 +271,21 @@ class TestSelfContained(unittest.TestCase):
         kept = {(e.x, e.y) for e in prepare(ir, 2).entities}
         self.assertTrue(lone and all(t in kept for t in lone), lone)
 
+    def test_filter_inserters_as_signs(self):
+        from factoriollm.templates import author_signs, prepare
+        # a filter inserter right next to a belt start, picking from empty ground: the author's sign
+        sign = IREntity("fast-inserter", 0, 1, 8, (("filters", "iron-plate"),))  # picks from (0, 2), drops on (0, 0)
+        belt = [IREntity("transport-belt", x, 0, 4) for x in range(4)]
+        # one loading a chest from outside (a wagon at a station) is no sign
+        loader = IREntity("fast-inserter", 6, 1, 8, (("filters", "coal"),))
+        chest = IREntity("wooden-chest", 6, 0)
+        ir = IRBlueprint(belt + [sign, loader, chest])
+        signs = author_signs(ir)
+        self.assertEqual([(e, tile, set(items)) for e, tile, items in signs], [(sign, (0, 0), {"iron-plate"})])
+        kept = prepare(ir, margin=None).entities
+        self.assertNotIn(sign, kept)
+        self.assertIn(loader, kept)
+
     def test_spare_semi_finished_goods_get_no_label(self):
         # gears are made for the belt machine; the gears it leaves on the output belt are no product
         ir = IRBlueprint([IREntity("transport-belt", x, y, 4) for x in range(8) for y in (0, 6)] + [
