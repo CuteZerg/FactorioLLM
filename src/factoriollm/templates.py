@@ -961,19 +961,19 @@ def add_port_labels(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal"
     Labels every port of a design with a constant combinator showing what goes in or comes out,
     from the flow simulator (see flow_sim.solve; `smelt`, `fuel`, `resource` are its preferences),
     not from the author:
-    - an input belt gets one label at its start with its items (up to two, one per lane); a label per
-      lane, marked with the virtual signal L or R, only where the lanes differ and matter: the design
-      stops working with the lanes swapped, or the line also carries products (a mixed belt: one lane
-      in, one out; a belt passing its inputs on to the next block is not mixed);
-    - an output belt gets a label in front of its end with what leaves on it (per lane on a mixed belt
-      and where the belt passes on input lanes that matter); what machines take off the line on its
-      way to the output is left over there (spare gears handed on to a neighbouring module): not labelled;
+    - an input belt gets one label at its start with its item; a label per lane, marked with the
+      virtual signal L or R, where the lanes carry different items, or one lane on a line that also
+      carries products (a mixed belt: one lane in, one out; a belt passing its inputs on to the next
+      block is not mixed);
+    - an output belt gets a label in front of its end with what leaves on it (per lane likewise);
+      what machines take off the line on its way to the output is left over there (spare gears
+      handed on to a neighbouring module): not labelled;
     - each half of a splitter is a belt of its own;
     - a chest filled from outside and an open pipe end get a label next to them (fluid signals).
     Labels go behind a start / in front of an end first, then to the sides, then to the nearest free
     tile (designs walled in by beacons); with inside_only the bounding box is not left.
     """
-    from factoriollm.flow_sim import Layout, check, solve
+    from factoriollm.flow_sim import Layout, solve
 
     LABEL_REACH = 6
     ents = list(ir.entities)
@@ -1026,21 +1026,13 @@ def add_port_labels(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal"
         return [behind, (x + lx, y + ly), (x - lx, y - ly), (behind[0] + lx, behind[1] + ly),
                 (behind[0] - lx, behind[1] - ly)]
 
-    def lanes_matter(i: int, half: int, by_lane: Dict[int, Set[str]]) -> bool:
-        """Whether the design stops working with the two lanes' items swapped."""
-        a, b = 2 * half, 2 * half + 1
-        if a not in by_lane or b not in by_lane:
-            return False
-        swapped = dict(flow.inputs)
-        swapped[("lane", i, a)], swapped[("lane", i, b)] = flow.inputs.get(("lane", i, b)), flow.inputs.get(("lane", i, a))
-        before = {(q.kind, q.position) for q in flow.problems}
-        return any((q.kind, q.position) not in before for q in check(ir, swapped, layout).problems)
-
     def label_belt(i: int, half: int, by_lane: Dict[int, Set[str]], start: bool, mixed: bool) -> bool:
         """
-        One label in line with the belt end. Where the lane matters, one label per lane, each with the
-        virtual signal L or R (left / right lane in the direction of travel): a label beside a belt
-        reads as the label of the next belt. Returns whether the lanes got labels of their own.
+        One label in line with the belt end. Where the lanes carry different items, one label per
+        lane, each with the virtual signal L or R (left / right lane in the direction of travel): one
+        label with two items reads as both on either lane (the in-game review of 28.10), and a label
+        beside a belt reads as the label of the next belt. Returns whether the lanes got labels of
+        their own.
         """
         items = set().union(*by_lane.values())
         whole = belt_ring(i, half, start)
@@ -1048,7 +1040,7 @@ def add_port_labels(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal"
         # both lanes carry the same: L / R tell nothing, even on a mixed line; a single lane on a
         # mixed line still needs its side
         same = len(by_lane) == 2 and len({frozenset(v) for v in by_lane.values()}) == 1
-        if same or (not mixed and (len(by_lane) < 2 or not start or not lanes_matter(i, half, by_lane))):
+        if same or (len(by_lane) < 2 and not mixed):
             put(whole, [f"item:{x}" for x in items], home)
             return False
         for lane, v in sorted(by_lane.items()):

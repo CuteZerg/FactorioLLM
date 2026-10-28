@@ -250,12 +250,12 @@ class TestSelfContained(unittest.TestCase):
         self.assertTrue(has_weaving(weave))
         self.assertFalse(has_weaving([ug("underground-belt", 0), ug("underground-belt", 4, True)]))
 
-    def test_one_label_when_lanes_do_not_matter(self):
-        # iron plates (steel) and coal on the two lanes of the input belt; the furnaces take both from
-        # either lane, so the lanes do not matter: one label with both items
+    def test_lanes_with_different_items_get_a_label_each(self):
+        # iron plates (steel) and coal on the two lanes of the input belt: even where the furnaces take
+        # both from either lane, one label with two items reads as both on each lane (review of 28.10)
         ir = add_port_labels(furnace_row(3), smelt="iron-plate")
         labels = sorted(e.extras_dict["signals"] for e in ir.entities if e.name == "constant-combinator")
-        self.assertEqual(labels, ["item:coal=1;item:iron-plate=1"])
+        self.assertEqual(labels, ["item:coal=1;virtual:signal-L=1", "item:iron-plate=1;virtual:signal-R=1"])
         inside = add_port_labels(furnace_row(3), inside_only=True)
         self.assertTrue(all(e.x >= 0 and e.y >= 0 for e in inside.entities))
 
