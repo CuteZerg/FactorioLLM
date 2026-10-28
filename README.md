@@ -98,10 +98,12 @@ The adapter is taken from `--adapter`, `$FACTORIOLLM_ADAPTER`, the newest folder
 
 Blueprints are parsed into an integer **tile-grid IR** (`blueprint_ir.py`): every entity is stored by its
 top-left tile, and 1.x (and 0.15+) strings are converted to 2.0 (renames, 8 → 16 directions, half-tile origin
-shift). Only Factorio 2.0 **base-game** content is kept: entities, recipes, items, signals and quality are
+shift). Only Factorio **base-game** content is kept: entities, recipes, items, signals and quality are
 checked against `base_game.py`, generated from the base mod of
-[wube/factorio-data](https://github.com/wube/factorio-data) (draftsman's own data includes Space Age).
-Recipes whose ingredients differed in the blueprint's game version (0.15 ... 1.1) are rejected, and so are
+[wube/factorio-data](https://github.com/wube/factorio-data) 2.1 (draftsman's own data includes Space Age).
+The same data holds what each entity can do (energy source and fuel, inventories, crafting categories, lab
+inputs, ammunition, speeds): the simulator and the validator ask `game_data.py`, not lists of names.
+Recipes whose ingredients differed in the blueprint's game version (0.15 ... 2.0) are rejected, and so are
 inserters with their own pickup / drop positions (mods). Grid snapping, unwired label combinators / display
 panels, splitter settings, modules, logistic requests, inserter filters and the 2.0 `mirror` flag are preserved.
 
@@ -122,10 +124,14 @@ uv run python -m factoriollm.dataset_builder export                      # data/
 
 `flow_sim.py` answers "does this layout work on its own?" without running the game. It tracks which items can
 reach every belt lane (side-loading, curves, underground pairs, both halves of a splitter and its filter),
-what inserters move (with their filters, over the ground, through chests, from lab to lab, boiler to boiler
-or turret to turret), what machines make and which fluids fill each pipe network. `solve()` searches the items
-to feed into the inputs so that every machine gets its ingredients, products leave, no lane clogs and no
-fluids mix; problems are reported with their positions.
+what inserters move (with their filters, over the ground, through chests; a burner hands its fuel on to the
+next burner, a lab its science packs, a turret its ammunition), what machines make and which fluids fill each
+pipe network (one-way pumps, paired pipes-to-ground, loops primed once). `solve()` searches the items to feed
+into the inputs so that every machine gets its ingredients, products leave, no lane clogs and no fluids mix;
+problems are reported with their positions.
+
+A **golden set** (`tests/fixtures/golden/`) of player designs checked in game ("works" / "broken") keeps the
+simulator honest: `test_golden_set` fails when it disagrees with the game.
 
 ## Layout templates mined from player blueprints
 
@@ -147,7 +153,7 @@ Outputs:
 uv run python -m factoriollm.template_miner --min-favorites 10   # ~20 min on 11 processes
 uv run python -m factoriollm.template_miner --only defense,labs  # re-mine some categories into the catalog
 uv run python tools/extract_balancers.py          # balancer templates (Raynquist's book first) -> helpers.py
-uv run python tools/extract_game_data.py         # base-game recipes, items, signals, recipe history
+uv run python tools/extract_game_data.py         # base-game recipes, items, signals, entity properties, recipe history
 ```
 
 ## Training and evaluation
@@ -176,6 +182,7 @@ geometry into templates and modules.
 
 ```bash
 uv run python -m unittest discover tests     # all (test_sandbox needs Docker; test_inference_eval needs a GPU)
+uv run python -m unittest tests.test_golden_set   # the simulator against designs checked in game
 ```
 
 ---
@@ -189,6 +196,7 @@ uv run python -m unittest discover tests     # all (test_sandbox needs Docker; t
 - [x] Template fixes after the in-game reviews (product-based categories, modules and logistic requests,
       self-contained templates, computed grids, strict power checks, density-first defaults)
 - [x] Flow simulator; only working templates; labels per lane; base-game data and recipe history; defence
+- [x] Simulator checked against in-game verdicts (golden set); entity properties from the game data (2.1)
 - [ ] Generic templates (assembler rows by number of input lanes, fluid rows, furnace lines) for any recipe
 - [ ] Modules API on top of templates; synthetic and repair examples; dataset v5; fine-tuning
 - [ ] Iterative refinement (edit a generated blueprint by instruction); mod support via game data dumps
