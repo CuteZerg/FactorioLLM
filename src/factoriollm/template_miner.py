@@ -362,8 +362,21 @@ def sanity(t: Template) -> Optional[str]:
     elif cat == "green_circuits":
         if recipes["copper-cable"] and not 1.2 <= recipes["copper-cable"] / max(recipes["electronic-circuit"], 1) <= 1.8:
             return "cable / circuit machines far from 3:2"
+    if density(ir) < MIN_DENSITY:
+        return "too sparse: mostly the author's feeds and poles"
     # production categories come from the recipe graph: the product is right by construction
     return None
+
+
+MIN_DENSITY = 0.2  # share of the bounding box entities cover; catalog median 0.75, small wall pieces 0.24
+
+
+def density(ir: IRBlueprint) -> float:
+    """Share of the design's bounding box its entities cover (a long feed with a line of poles is mostly air)."""
+    tiles = [(e.x + dx, e.y + dy) for e in ir.entities for dx in range(footprint(e.name, e.direction)[0])
+             for dy in range(footprint(e.name, e.direction)[1])]
+    xs, ys = [t[0] for t in tiles], [t[1] for t in tiles]
+    return len(set(tiles)) / max((max(xs) - min(xs) + 1) * (max(ys) - min(ys) + 1), 1)
 
 
 def draftsman_overlaps(t: Template) -> bool:
@@ -1027,7 +1040,9 @@ def write_book(best: Dict[str, List[Template]], path: Path = Path("outputs/templ
             label = f"{name[:40]} | {'DEFAULT ' if t is top else ''}{variant(t)}"  # the name first: labels are cut at 100
             builds = [(label, lambda t=t, n=segments: labelled(t, t.build(n, lamps=True)))]
             if t is top:
-                builds.append((f"{name[:40]} | SEGMENT {t.snap[0]}x{t.snap[1]}", t.build_segment))
+                # a cell is a whole design copies of which stand side by side on its grid; a segment repeats inside one
+                form = "CELL" if t.metrics["kind"] == "cell" else "SEGMENT"
+                builds.append((f"{name[:40]} | {form} {t.snap[0]}x{t.snap[1]}", t.build_segment))
             for text, build in builds:
                 try:
                     sub.blueprints.append(get_blueprintable_from_string(blueprint_string(build(), text)))

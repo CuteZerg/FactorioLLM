@@ -180,6 +180,16 @@ class TestMinerParts(unittest.TestCase):
         self.assertEqual(len(rejects.kept["clog"]), 2)
 
 
+class DensityTest(unittest.TestCase):
+    def test_a_long_feed_with_poles_is_too_sparse(self):
+        from factoriollm.template_miner import MIN_DENSITY, density
+        block = [IREntity("assembling-machine-2", 3 * i, 0) for i in range(4)]
+        self.assertGreater(density(IRBlueprint(block)), MIN_DENSITY)
+        feed = [IREntity("transport-belt", 12, y, 0) for y in range(3, 60)] + \
+               [IREntity("medium-electric-pole", 11, y) for y in range(3, 60, 9)]
+        self.assertLess(density(IRBlueprint(block + feed)), MIN_DENSITY)
+
+
 class StraightTurretRowTest(unittest.TestCase):
     def test_turrets_without_walls_must_be_one_band(self):
         from factoriollm.template_miner import straight_wall
