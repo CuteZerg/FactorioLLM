@@ -203,7 +203,8 @@ class CropKeepsInputsAtTheBorderTest(unittest.TestCase):
 class PlainlyFedTemplatesTest(unittest.TestCase):
     def test_unfinished_weave_is_no_template(self):
         # the author did not run the steel underground to the last machine of each row (checked in
-        # game): it works only with steel mixed onto the gear lane, which a template must not need
+        # game): it works only with steel mixed onto the gear lane, and a mixed lane is never acceptable
+        # (it jams as soon as one item is taken slower): the author's design is refused already
         import json
         from collections import Counter
         from pathlib import Path
@@ -213,7 +214,7 @@ class PlainlyFedTemplatesTest(unittest.TestCase):
                          version=tuple(data["version"]))
         rejects = Rejects()
         self.assertIsNone(_mine_design(ir, "assembly_3in", "Engines", Counter(), rejects))
-        self.assertIn("template: needs_shared_lane", rejects.seen)
+        self.assertEqual(set(rejects.seen), {"author: needs_shared_lane"})
 
 
 class AmbiguousRetryTest(unittest.TestCase):

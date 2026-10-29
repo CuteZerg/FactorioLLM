@@ -477,8 +477,9 @@ def run_flow(ir: IRBlueprint, hints: Optional[Dict] = None, first: str = "iron-o
              share_lanes: bool = True) -> Tuple[FlowResult, str]:
     """
     The flow simulator's verdict; designs with furnaces are tried with each smelting input in turn.
-    An author's design may carry two items on one input lane; a template build must not
-    (share_lanes=False): its labels must be plain (see needs_shared_lane). A search that runs out
+    For an author's design the search may put two items on one input lane, as the game would run
+    it (the golden set judges this way; the miner then rejects the design, see shares_a_lane); a
+    template build is searched with one item per lane only (share_lanes=False). A search that runs out
     of budget runs once more with AMBIGUOUS_RETRY times the budget: big designs with many input
     lanes need it, and only those pay for it.
     """
@@ -554,6 +555,16 @@ def reason(result: FlowResult) -> str:
     kinds = {p.kind for p in result.problems}
     # the cause before its consequences: a starved machine leaves its inserters with nothing to move
     return next((k for k in REASON_ORDER if k in kinds), next(iter(kinds), result.status))
+
+
+def shares_a_lane(result: FlowResult) -> bool:
+    """
+    Whether the inputs put two items on one belt lane. The simulator allows it to judge an author's
+    design as the game would; the miner never takes such a design: a mixed lane jams as soon as one
+    of its items is taken slower than the other (a belt carries two items at most, one per lane).
+    """
+    per_lane = Counter(k[1:3] for k, v in result.inputs.items() if k[0] == "lane" and v)
+    return any(n > 1 for n in per_lane.values())
 
 
 def build_reason(build: IRBlueprint, result: FlowResult, smelt: str, dock: Optional[Tuple[int, int]] = None) -> str:
@@ -888,15 +899,20 @@ def _mine_design(ir: IRBlueprint, category: str, name: str, stats: Counter, reje
     full, source_flow, smelt, dock = author_verdict(ir, category)
     if dock:
         stats["works docked to its copies"] += 1
-    if not source_flow.ok:
-        rejects.add(f"author: {reason(source_flow)}", name, full, source_flow)
+    if not source_flow.ok or shares_a_lane(source_flow):
+        why = reason(source_flow) if not source_flow.ok else "needs_shared_lane"
+        rejects.add(f"author: {why}", name, full, source_flow)
         return None
 
     def verdict(design: IRBlueprint) -> FlowResult:
         if not dock:
-            return run_flow(design, hints, smelt)[0]
-        docked = middle_flow(design, dock, hints, smelt)
-        return docked[0] if docked else FlowResult([], {}, {}, frozenset(), [], status="copies_collide")
+            flow = run_flow(design, hints, smelt)[0]
+        else:
+            docked = middle_flow(design, dock, hints, smelt)
+            flow = docked[0] if docked else FlowResult([], {}, {}, frozenset(), [], status="copies_collide")
+        if flow.ok and shares_a_lane(flow):  # a cut that works only with a mixed lane is no good either
+            flow.status = "needs_shared_lane"
+        return flow
 
     cut, cut_flow = full, source_flow
     for step_no, (margin, taps) in enumerate(CROP_STEPS):
