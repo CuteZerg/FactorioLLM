@@ -34,7 +34,7 @@ from factoriollm.blueprint_ir import (
     parse_blueprint_dict,
     rotated,
 )
-from factoriollm.flow_sim import FlowResult, solve
+from factoriollm.flow_sim import MAX_LEAVES, FlowResult, solve
 from factoriollm.game_data import final_products, places_entity, recipe
 from factoriollm.base_game import ENTITIES
 from factoriollm.templates import (
@@ -470,18 +470,26 @@ def author_hints(ir: IRBlueprint) -> Dict[Tuple[int, int], set]:
     return out
 
 
+AMBIGUOUS_RETRY = 10  # times the search budget for a second search when the first ran out
+
+
 def run_flow(ir: IRBlueprint, hints: Optional[Dict] = None, first: str = "iron-ore",
              share_lanes: bool = True) -> Tuple[FlowResult, str]:
     """
     The flow simulator's verdict; designs with furnaces are tried with each smelting input in turn.
     An author's design may carry two items on one input lane; a template build must not
-    (share_lanes=False): its labels must be plain, and a build that needs it misses a part.
+    (share_lanes=False): its labels must be plain (see needs_shared_lane). A search that runs out
+    of budget runs once more with AMBIGUOUS_RETRY times the budget: big designs with many input
+    lanes need it, and only those pay for it.
     """
     furnaces = any(entity_type(e.name) == "furnace" for e in ir.entities)
     choices = [first] + [s for s in SMELT_CHOICES if s != first] if furnaces else [first]
     found: Optional[Tuple[FlowResult, str]] = None
     for smelt in choices:
         result = solve(ir, smelt=smelt, hints=hints, share_lanes=share_lanes)
+        if result.status == "inputs_ambiguous":
+            result = solve(ir, smelt=smelt, hints=hints, share_lanes=share_lanes,
+                           max_leaves=MAX_LEAVES * AMBIGUOUS_RETRY)
         if result.ok:
             return result, smelt
         found = found or (result, smelt)
@@ -546,6 +554,17 @@ def reason(result: FlowResult) -> str:
     kinds = {p.kind for p in result.problems}
     # the cause before its consequences: a starved machine leaves its inserters with nothing to move
     return next((k for k in REASON_ORDER if k in kinds), next(iter(kinds), result.status))
+
+
+def build_reason(build: IRBlueprint, result: FlowResult, smelt: str, dock: Optional[Tuple[int, int]] = None) -> str:
+    """
+    Why a template build fed one item per lane fails: 'needs_shared_lane' when it works only with
+    two items on an input lane (the author's mixed lane, copper and plastic for low density
+    structures, or a part the author left unfinished: a weave short of the last machine), else
+    reason().
+    """
+    shared = middle_flow(build, dock, None, smelt) if dock else run_flow(build, first=smelt)
+    return "needs_shared_lane" if shared and shared[0].ok else reason(result)
 
 
 def furnace_input(result: FlowResult) -> str:
@@ -924,13 +943,14 @@ def _mine_design(ir: IRBlueprint, category: str, name: str, stats: Counter, reje
         docked = middle_flow(build, (template.period, 0), None, smelt, share_lanes=False)
         build_flow, smelt = docked if docked else (FlowResult([], {}, {}, frozenset(), [], status="collide"), smelt)
         if not build_flow.ok:
-            rejects.add(f"template: {reason(build_flow)}", name, template.build(3), build_flow)
+            why = build_reason(build, build_flow, smelt, (template.period, 0))
+            rejects.add(f"template: {why}", name, template.build(3), build_flow)
             return None
     for n in () if dock else (1, 2) if segment else (1,):
         build = template.build(n)
         build_flow, smelt = run_flow(build, first=smelt, share_lanes=False)  # plainly fed, see run_flow
         if not build_flow.ok:
-            rejects.add(f"template: {reason(build_flow)}", name, build, build_flow)
+            rejects.add(f"template: {build_reason(build, build_flow, smelt)}", name, build, build_flow)
             return None
     template.metrics = {"source_warnings": check["source_warnings"], "smelt": smelt, "docks": bool(dock)}
     if category.startswith("smelting_"):

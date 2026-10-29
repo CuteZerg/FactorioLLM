@@ -213,7 +213,24 @@ class PlainlyFedTemplatesTest(unittest.TestCase):
                          version=tuple(data["version"]))
         rejects = Rejects()
         self.assertIsNone(_mine_design(ir, "assembly_3in", "Engines", Counter(), rejects))
-        self.assertIn("template: starved", rejects.seen)
+        self.assertIn("template: needs_shared_lane", rejects.seen)
+
+
+class AmbiguousRetryTest(unittest.TestCase):
+    def test_a_search_out_of_budget_runs_again_with_more(self):
+        # a big utility science block: the first search spends its budget on other inputs
+        import json
+        from pathlib import Path
+        from unittest import mock
+        from factoriollm import template_miner
+        data = json.loads((Path(__file__).parent / "fixtures" / "flow" / "utility_science_big_search.json").read_text(encoding="utf-8"))
+        ir = IRBlueprint([IREntity(n, x, y, d, tuple(sorted(ex.items()))) for n, x, y, d, ex in data["entities"]],
+                         data["label"] or "", tuple(data["version"]), snap=tuple(data["snap"]) if data["snap"] else None)
+        with mock.patch.object(template_miner, "AMBIGUOUS_RETRY", 1):
+            _, flow, _, _ = template_miner.author_verdict(ir, "science_yellow")
+        self.assertEqual(flow.status, "inputs_ambiguous")
+        _, flow, _, _ = template_miner.author_verdict(ir, "science_yellow")
+        self.assertTrue(flow.ok, flow.problems[:3])
 
 
 class DensityTest(unittest.TestCase):
