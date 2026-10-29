@@ -798,11 +798,23 @@ def check(ir: IRBlueprint, inputs: Dict[Any, Optional[str]], layout: Optional[La
     return result
 
 
+def mixed_lane_keys(L: Layout, result: FlowResult) -> Set[Lane]:
+    """
+    Lanes that carry two items where it can jam: anywhere, except products alone on their way out
+    of the design (uranium-235 and -238 from the centrifuges, modules of two tiers): a mixed
+    output is sorted further on, as players do (the user's rule, 29.10).
+    """
+    inputs = {x for x in result.inputs.values() if x}
+    leads_out = L.upstream({(p.entity, p.lane) for p in result.ports if p.kind == "lane" and p.role == "output"})
+    return {k for k, items in result.lanes.items() if len(items) > 1 and (items & inputs or k not in leads_out)}
+
+
 def mixed_lanes(L: Layout, result: FlowResult) -> List[Problem]:
-    """A problem per belt that carries two items on one lane."""
+    """A problem per belt that carries two items on one lane (see mixed_lane_keys)."""
     out = []
+    keys = mixed_lane_keys(L, result)
     for i in L.belts:
-        mixed = sorted({x for k in L.belt_lanes(i) if len(result.lanes.get(k, ())) > 1 for x in result.lanes[k]})
+        mixed = sorted({x for k in L.belt_lanes(i) if k in keys for x in result.lanes[k]})
         if mixed:
             e = L.ents[i]
             out.append(Problem("lane_mixed", f"{' and '.join(mixed)} share a lane at {(e.x, e.y)}", (e.x, e.y)))

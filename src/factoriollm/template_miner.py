@@ -34,7 +34,7 @@ from factoriollm.blueprint_ir import (
     parse_blueprint_dict,
     rotated,
 )
-from factoriollm.flow_sim import MAX_LEAVES, FlowResult, solve
+from factoriollm.flow_sim import MAX_LEAVES, FlowResult, Layout, mixed_lane_keys, solve
 from factoriollm.game_data import final_products, places_entity, recipe
 from factoriollm.base_game import ENTITIES
 from factoriollm.templates import (
@@ -558,15 +558,18 @@ def reason(result: FlowResult) -> str:
     return next((k for k in REASON_ORDER if k in kinds), next(iter(kinds), result.status))
 
 
-def shares_a_lane(result: FlowResult) -> bool:
+def shares_a_lane(design: IRBlueprint, result: FlowResult) -> bool:
     """
-    Whether two items share a belt lane anywhere: put onto one input lane, side-loaded together onto
-    one lane, a product put onto a lane of ingredients. The simulator allows it to judge an author's
-    design as the game would; the miner never takes such a design: a mixed lane jams as soon as one
-    of its items is taken slower than the other (a belt carries two items at most, one per lane).
+    Whether two items share a belt lane where it can jam: put onto one input lane, side-loaded
+    together onto one lane, a product put onto a lane of ingredients (mixed products on their way
+    out are fine, see flow_sim.mixed_lane_keys). The simulator allows it to judge an author's design
+    as the game would; the miner never takes such a design: a mixed lane jams as soon as one of its
+    items is taken slower than the other (a belt carries two items at most, one per lane).
     """
     per_lane = Counter(k[1:3] for k, v in result.inputs.items() if k[0] == "lane" and v)
-    return any(n > 1 for n in per_lane.values()) or any(len(items) > 1 for items in result.lanes.values())
+    if any(n > 1 for n in per_lane.values()):
+        return True
+    return any(len(items) > 1 for items in result.lanes.values()) and bool(mixed_lane_keys(Layout(design), result))
 
 
 def build_reason(build: IRBlueprint, result: FlowResult, smelt: str, dock: Optional[Tuple[int, int]] = None) -> str:
@@ -913,13 +916,13 @@ def _mine_design(ir: IRBlueprint, category: str, name: str, stats: Counter, reje
         else:
             docked = middle_flow(design, dock, hints, smelt, share_lanes=share_lanes, outside_only=False)
             flow = docked[0] if docked else FlowResult([], {}, {}, frozenset(), [], status="copies_collide")
-        if share_lanes and flow.ok and shares_a_lane(flow):
+        if share_lanes and flow.ok and shares_a_lane(copies(design, dock) if dock else design, flow):
             flow = verdict(design, share_lanes=False)
             if not flow.ok:
                 flow.status = "needs_shared_lane"
         return flow
 
-    if source_flow.ok and shares_a_lane(source_flow):
+    if source_flow.ok and shares_a_lane(copies(full, dock) if dock else full, source_flow):
         source_flow = verdict(full)
     if not source_flow.ok:
         rejects.add(f"author: {reason(source_flow)}", name, full, source_flow)

@@ -234,6 +234,15 @@ class TemplateFeedTest(unittest.TestCase):
         self.assertTrue(r.ok, r.problems)
         self.assertTrue(all(len(items) <= 1 for items in r.lanes.values()), r.inputs)
 
+    def test_mixed_products_may_leave_together(self):
+        # gears and pipes dropped onto the same lane of the output belt: sorted further on, no jam
+        ir = IRBlueprint(belts(0, 6, 0) + [E("inserter", 1, 1, 0), E("assembling-machine-1", 0, 2, recipe="iron-gear-wheel"),
+                                            E("inserter", 4, 1, 0), E("assembling-machine-1", 3, 2, recipe="pipe"),
+                                            E("inserter", 1, 5, 0), E("inserter", 4, 5, 0)] + belts(0, 6, 6))
+        r = solve(ir, share_lanes=False)
+        self.assertTrue(r.ok, r.problems)
+        self.assertIn(frozenset({"iron-gear-wheel", "pipe"}), set(r.lanes.values()))
+
     def test_a_walled_belt_start_is_no_template_input(self):
         # walls behind the belt start and beside both its lanes: nothing can be brought to it
         walls = [E("stone-wall", -1, 0), E("stone-wall", 0, -1), E("stone-wall", 0, 1)]
