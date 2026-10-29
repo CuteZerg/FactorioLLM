@@ -214,6 +214,35 @@ class FlowSimPartsTest(unittest.TestCase):
         self.assertEqual(ends(Layout(sub), ox, oy), ends(L))
 
 
+class TemplateFeedTest(unittest.TestCase):
+    """A template is fed by the player: one item per belt lane anywhere, inputs only where a belt can reach."""
+
+    def circuit_line(self):
+        # main belt east along row 0; a one-tile belt facing south side-loads onto it from the north,
+        # so both its lanes land on the main belt's left lane; an assembler makes green circuits
+        return IRBlueprint(belts(0, 4, 0) + [E("transport-belt", 2, -1, 8), E("inserter", 3, 1, 0),
+                                              E("assembling-machine-1", 2, 2, recipe="electronic-circuit"),
+                                              E("inserter", 3, 5, 0)] + belts(2, 5, 6))
+
+    def test_side_loaded_lanes_must_not_mix(self):
+        ir = self.circuit_line()
+        L = Layout(ir)
+        stub = next(i for i, e in enumerate(L.ents) if (e.x, e.y) == (2, -1))
+        mixed = check(ir, {("lane", stub, 0): "iron-plate", ("lane", stub, 1): "copper-cable"}, L, one_per_lane=True)
+        self.assertIn("lane_mixed", {p.kind for p in mixed.problems})
+        r = solve(ir, share_lanes=False)
+        self.assertTrue(r.ok, r.problems)
+        self.assertTrue(all(len(items) <= 1 for items in r.lanes.values()), r.inputs)
+
+    def test_a_walled_belt_start_is_no_template_input(self):
+        # walls behind the belt start and beside both its lanes: nothing can be brought to it
+        walls = [E("stone-wall", -1, 0), E("stone-wall", 0, -1), E("stone-wall", 0, 1)]
+        ir = gear_line(walls)
+        self.assertTrue(solve(ir).ok)  # an author's design may be fed in ways the blueprint does not show
+        r = solve(ir, share_lanes=False)
+        self.assertIn("starved", {p.kind for p in r.problems})
+
+
 class FlowSimRealDesignsTest(unittest.TestCase):
     """Player designs from the second in-game review of the template book."""
 

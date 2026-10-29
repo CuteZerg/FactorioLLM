@@ -474,7 +474,7 @@ AMBIGUOUS_RETRY = 10  # times the search budget for a second search when the fir
 
 
 def run_flow(ir: IRBlueprint, hints: Optional[Dict] = None, first: str = "iron-ore",
-             share_lanes: bool = True) -> Tuple[FlowResult, str]:
+             share_lanes: bool = True, outside_only: Optional[bool] = None) -> Tuple[FlowResult, str]:
     """
     The flow simulator's verdict; designs with furnaces are tried with each smelting input in turn.
     For an author's design the search may put two items on one input lane, as the game would run
@@ -487,9 +487,9 @@ def run_flow(ir: IRBlueprint, hints: Optional[Dict] = None, first: str = "iron-o
     choices = [first] + [s for s in SMELT_CHOICES if s != first] if furnaces else [first]
     found: Optional[Tuple[FlowResult, str]] = None
     for smelt in choices:
-        result = solve(ir, smelt=smelt, hints=hints, share_lanes=share_lanes)
+        result = solve(ir, smelt=smelt, hints=hints, share_lanes=share_lanes, outside_only=outside_only)
         if result.status == "inputs_ambiguous":
-            result = solve(ir, smelt=smelt, hints=hints, share_lanes=share_lanes,
+            result = solve(ir, smelt=smelt, hints=hints, share_lanes=share_lanes, outside_only=outside_only,
                            max_leaves=MAX_LEAVES * AMBIGUOUS_RETRY)
         if result.ok:
             return result, smelt
@@ -499,7 +499,7 @@ def run_flow(ir: IRBlueprint, hints: Optional[Dict] = None, first: str = "iron-o
     return found
 
 
-REASON_ORDER = ("starved", "clog", "output_mixed", "fluid_mix", "no_output", "dangling_inserter")
+REASON_ORDER = ("starved", "clog", "lane_mixed", "output_mixed", "fluid_mix", "no_output", "dangling_inserter")
 
 
 def copies(ir: IRBlueprint, step: Tuple[int, int], n: int = 3) -> Optional[IRBlueprint]:
@@ -530,7 +530,8 @@ def _at_edge(ir: IRBlueprint, result: FlowResult, axis: int) -> bool:
 
 
 def middle_flow(ir: IRBlueprint, step: Tuple[int, int], hints: Optional[Dict] = None,
-                first: str = "iron-ore", share_lanes: bool = True) -> Optional[Tuple[FlowResult, str]]:
+                first: str = "iron-ore", share_lanes: bool = True,
+                outside_only: Optional[bool] = None) -> Optional[Tuple[FlowResult, str]]:
     """
     The verdict for a design made to dock with copies of itself (its grid says how far apart): three
     copies, and only the problems of the middle one count - the outer copies miss their own outer
@@ -539,7 +540,7 @@ def middle_flow(ir: IRBlueprint, step: Tuple[int, int], hints: Optional[Dict] = 
     tiled = copies(ir, step)
     if tiled is None:
         return None
-    result, smelt = run_flow(tiled, hints, first, share_lanes)
+    result, smelt = run_flow(tiled, hints, first, share_lanes, outside_only)
     axis = 0 if step[0] else 1
     lo = min((e.x, e.y)[axis] for e in ir.entities) + step[axis]
     middle = [p for p in result.problems if lo <= p.position[axis] < lo + step[axis]]
@@ -549,9 +550,9 @@ def middle_flow(ir: IRBlueprint, step: Tuple[int, int], hints: Optional[Dict] = 
 
 
 def reason(result: FlowResult) -> str:
-    """Why a design does not work: the search ran out, or its root problem (REASON_ORDER)."""
-    if result.status == "inputs_ambiguous":
-        return "inputs_ambiguous"
+    """Why a design does not work: the search ran out, a mixed lane, or its root problem (REASON_ORDER)."""
+    if result.status in ("inputs_ambiguous", "needs_shared_lane"):
+        return result.status
     kinds = {p.kind for p in result.problems}
     # the cause before its consequences: a starved machine leaves its inserters with nothing to move
     return next((k for k in REASON_ORDER if k in kinds), next(iter(kinds), result.status))
@@ -559,12 +560,13 @@ def reason(result: FlowResult) -> str:
 
 def shares_a_lane(result: FlowResult) -> bool:
     """
-    Whether the inputs put two items on one belt lane. The simulator allows it to judge an author's
+    Whether two items share a belt lane anywhere: put onto one input lane, side-loaded together onto
+    one lane, a product put onto a lane of ingredients. The simulator allows it to judge an author's
     design as the game would; the miner never takes such a design: a mixed lane jams as soon as one
     of its items is taken slower than the other (a belt carries two items at most, one per lane).
     """
     per_lane = Counter(k[1:3] for k, v in result.inputs.items() if k[0] == "lane" and v)
-    return any(n > 1 for n in per_lane.values())
+    return any(n > 1 for n in per_lane.values()) or any(len(items) > 1 for items in result.lanes.values())
 
 
 def build_reason(build: IRBlueprint, result: FlowResult, smelt: str, dock: Optional[Tuple[int, int]] = None) -> str:
@@ -899,20 +901,29 @@ def _mine_design(ir: IRBlueprint, category: str, name: str, stats: Counter, reje
     full, source_flow, smelt, dock = author_verdict(ir, category)
     if dock:
         stats["works docked to its copies"] += 1
-    if not source_flow.ok or shares_a_lane(source_flow):
-        why = reason(source_flow) if not source_flow.ok else "needs_shared_lane"
-        rejects.add(f"author: {why}", name, full, source_flow)
-        return None
 
-    def verdict(design: IRBlueprint) -> FlowResult:
+    def verdict(design: IRBlueprint, share_lanes: bool = True) -> FlowResult:
+        """
+        Whether the design works, as the game would run it; one that mixes two items on a lane
+        must work without (another assignment may keep the lanes apart: batteries on the free lane
+        instead of side-loaded onto the steel), else it is refused as needs_shared_lane.
+        """
         if not dock:
-            flow = run_flow(design, hints, smelt)[0]
+            flow = run_flow(design, hints, smelt, share_lanes=share_lanes, outside_only=False)[0]
         else:
-            docked = middle_flow(design, dock, hints, smelt)
+            docked = middle_flow(design, dock, hints, smelt, share_lanes=share_lanes, outside_only=False)
             flow = docked[0] if docked else FlowResult([], {}, {}, frozenset(), [], status="copies_collide")
-        if flow.ok and shares_a_lane(flow):  # a cut that works only with a mixed lane is no good either
-            flow.status = "needs_shared_lane"
+        if share_lanes and flow.ok and shares_a_lane(flow):
+            flow = verdict(design, share_lanes=False)
+            if not flow.ok:
+                flow.status = "needs_shared_lane"
         return flow
+
+    if source_flow.ok and shares_a_lane(source_flow):
+        source_flow = verdict(full)
+    if not source_flow.ok:
+        rejects.add(f"author: {reason(source_flow)}", name, full, source_flow)
+        return None
 
     cut, cut_flow = full, source_flow
     for step_no, (margin, taps) in enumerate(CROP_STEPS):

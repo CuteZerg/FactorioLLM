@@ -138,9 +138,10 @@ def _tile_of(p: Tuple[float, float]) -> Tile:
 class Layout:
     """Static structure of a blueprint: belt lane graph, inserters, machines, fluid networks."""
 
-    def __init__(self, ir: IRBlueprint, resource: str = "iron-ore"):
+    def __init__(self, ir: IRBlueprint, resource: str = "iron-ore", outside_only: bool = False):
         self.ents = list(ir.entities)
         self.resource = resource
+        self.outside_only = outside_only  # input lanes only where something can be fed from outside (_feedable)
         self.tiles: Dict[Tile, int] = {t: i for i, e in enumerate(self.ents) for t in _tiles(e)}
         self.types = [_type(e.name) for e in self.ents]
         self.storage = [t not in BELT_LIKE and is_storage(e.name) for e, t in zip(self.ents, self.types)]
@@ -167,6 +168,21 @@ class Layout:
         self._need: Optional[Dict[Lane, Optional[Set[str]]]] = None
         self.inserters = [i for i, t in enumerate(self.types) if t == "inserter"]
         self.links = [self._inserter(i) for i in self.inserters]
+        # the lanes each inserter picks from (both lanes of a belt), and for a splitter the half under
+        # its hand: what came in on that half and what the splitter sends out of it (see picks_from)
+        self.pick_lanes: List[Tuple[Lane, ...]] = []
+        self.pick_half: List[Optional[Tuple[Tuple[Lane, ...], Optional[Tuple[str, str]]]]] = []
+        for i, (src, _) in zip(self.inserters, self.links):
+            self.pick_lanes.append(self.belt_lanes(src[1]) if src[0] == "belt" else ())
+            self.pick_half.append(None)
+            if src[0] == "belt" and self.types[src[1]] == "splitter":
+                j = src[1]
+                h = self.half(j, _tile_of(_point(self.ents[i], "pickup_position")))
+                flt, prio = self.ents[j].extras_dict.get("filter"), self.ents[j].extras_dict.get("output_priority")
+                rule = None
+                if flt and prio in ("left", "right"):
+                    rule = ("only", flt) if ("left", "right")[h] == prio else ("except", flt)
+                self.pick_half[-1] = (((j, 2 * h), (j, 2 * h + 1)), rule)
         # item filters per inserter: (whitelist?, items) or None
         self.filters: List[Optional[Tuple[bool, FrozenSet[str]]]] = []
         for i in self.inserters:
@@ -230,7 +246,7 @@ class Layout:
         picks = _picks(self)
         need: Dict[Lane, Optional[Set[str]]] = {}
         for k in self.edges:
-            p = picks.get(k[0], frozenset())
+            p = picks.get(k, frozenset())
             need[k] = None if p is ANY else set(p)
         stack = list(self.edges)
         while stack:  # push what a lane needs back to the lanes feeding it
@@ -260,7 +276,7 @@ class Layout:
         picks = _picks(self)
         before: Dict[Lane, Optional[Set[str]]] = {}
         for k in self.edges:
-            p = picks.get(k[0], frozenset())
+            p = picks.get(k, frozenset())
             before[k] = None if p is ANY else set(p)
         stack = list(self.edges)
         while stack:  # push what is taken on to the lanes downstream
@@ -400,6 +416,19 @@ class Layout:
         return src, self._drop(e, drop, u)
 
     # --- machines -------------------------------------------------------------------------
+
+    def picks_from(self, idx: int, lanes: Dict[Lane, Any]) -> Set[str]:
+        """
+        What inserter number idx finds on the belt it picks from. On a splitter only its half: what
+        came in on that half and what the splitter sends out of it (a filter splitter sends science
+        packs to the half an inserter takes them from to a chest, the steel beside them to the other
+        half, where it stays: that half's output ends nowhere).
+        """
+        if self.pick_half[idx] is None:
+            return set().union(*(lanes[k] for k in self.pick_lanes[idx]))
+        own, rule = self.pick_half[idx]
+        return set().union(*(lanes[k] for k in own)) | {
+            x for k in self.pick_lanes[idx] for x in lanes[k] if _passes(rule, x)}
 
     def moves(self, idx: int, items: Iterable[str]) -> Set[str]:
         """What inserter number idx (in self.links) moves out of these items: its filter, then what its target accepts."""
@@ -695,6 +724,9 @@ class _SimStatic:
     by_entity: Dict[int, List[int]] = field(default_factory=dict)
     by_ground: Dict[Tile, List[int]] = field(default_factory=dict)
     dry: FrozenSet[int] = frozenset()  # machines with a fluid recipe and no fluid boxes
+    # inserters on a belt nothing can ever reach (a line starting at an underground exit whose entrance
+    # is in the neighbouring copy): idle in game, not broken
+    dead: FrozenSet[int] = frozenset()
 
 
 def _sim_static(L: Layout) -> _SimStatic:
@@ -712,7 +744,7 @@ def _sim_static(L: Layout) -> _SimStatic:
                             [(net, L.network.index(net)) for net in set(L.network)])
         for idx, ((kind, ref), _) in enumerate(L.links):
             if kind == "belt":
-                for k in L.belt_lanes(ref):
+                for k in L.pick_lanes[idx]:
                     L._sim.by_lane.setdefault(k, []).append(idx)
             elif kind == "entity":
                 L._sim.by_entity.setdefault(ref, []).append(idx)
@@ -721,6 +753,16 @@ def _sim_static(L: Layout) -> _SimStatic:
         recipes = {j: recipe(L.ents[j].extras_dict.get("recipe") or "") for j in every
                    if L.types[j] == "assembling-machine"}
         L._sim.dry = frozenset(j for j, r in recipes.items() if r and r.fluids & set(r.ingredients) and j not in needs_f)
+        live = {(p[1], p[2]) for p in input_ports(L) if p[0] == "lane"} | \
+               {dst[1] for _, dst in L.links if dst[0] == "lane"} | {ref for _, (kind, ref) in L.drills if kind == "lane"}
+        stack = list(live)
+        while stack:
+            for dst, _ in L.edges[stack.pop()]:
+                if dst not in live:
+                    live.add(dst)
+                    stack.append(dst)
+        L._sim.dead = frozenset(idx for idx, (src, _) in enumerate(L.links)
+                                if src[0] == "belt" and not any(k in live for k in L.pick_lanes[idx]))
     return L._sim
 
 
@@ -741,12 +783,30 @@ def _has_fluid(fluid: str, have: Set[str]) -> bool:
 
 
 def check(ir: IRBlueprint, inputs: Dict[Any, Optional[str]], layout: Optional[Layout] = None,
-          resource: str = "iron-ore") -> FlowResult:
-    """Simulates one assignment of input items ({('lane', i, l) | ('chest', j) | ('fluid', net): item})."""
+          resource: str = "iron-ore", one_per_lane: bool = False) -> FlowResult:
+    """
+    Simulates one assignment of input items ({('lane', i, l) | ('chest', j) | ('fluid', net): item}).
+    With one_per_lane a belt lane that carries two items anywhere is a problem (lane_mixed): a belt
+    carries two items at most, one per lane; a mixed lane jams as soon as one item is taken slower
+    (two input lanes side-loaded onto one, a product put onto a lane of ingredients).
+    """
     L = layout or Layout(ir, resource)
     result = _simulate(L, inputs)
     result.inputs = dict(inputs)
+    if one_per_lane:
+        result.problems += mixed_lanes(L, result)
     return result
+
+
+def mixed_lanes(L: Layout, result: FlowResult) -> List[Problem]:
+    """A problem per belt that carries two items on one lane."""
+    out = []
+    for i in L.belts:
+        mixed = sorted({x for k in L.belt_lanes(i) if len(result.lanes.get(k, ())) > 1 for x in result.lanes[k]})
+        if mixed:
+            e = L.ents[i]
+            out.append(Problem("lane_mixed", f"{' and '.join(mixed)} share a lane at {(e.x, e.y)}", (e.x, e.y)))
+    return out
 
 
 def _simulate(L: Layout, inputs: Dict[Any, Optional[str]]) -> FlowResult:
@@ -887,7 +947,7 @@ def _taken(L: Layout, idx: int, lanes, received, ground, chests, working) -> Set
     src, dst = L.links[idx]
     kind, ref = src
     if kind == "belt":
-        items = set().union(*(lanes[k] for k in L.belt_lanes(ref)))
+        items = L.picks_from(idx, lanes)
     elif kind == "ground":
         items = set(ground.get(ref, set()))
     elif kind == "entity":
@@ -917,9 +977,9 @@ def _put(L: Layout, kind: str, ref: Any, items: Set[str], lanes, received, groun
     return bool(new)
 
 
-def _picks(L: Layout) -> Dict[int, Optional[FrozenSet[str]]]:
-    """Per belt entity: the items inserters take from it (ANY if a chest or the ground takes all)."""
-    out: Dict[int, Optional[FrozenSet[str]]] = {}
+def _picks(L: Layout) -> Dict[Lane, Optional[FrozenSet[str]]]:
+    """Per belt lane: the items inserters take from it (ANY if a chest or the ground takes all)."""
+    out: Dict[Lane, Optional[FrozenSet[str]]] = {}
     for idx, (src, dst) in enumerate(L.links):
         if src[0] != "belt":
             continue
@@ -927,8 +987,9 @@ def _picks(L: Layout) -> Dict[int, Optional[FrozenSet[str]]]:
         flt = L.filters[idx]
         if flt is not None and flt[0]:  # a whitelist takes only its items
             acc = flt[1] if acc is ANY else acc & flt[1]
-        prev = out.get(src[1], frozenset())
-        out[src[1]] = ANY if acc is ANY or prev is ANY else prev | acc
+        for k in L.pick_lanes[idx]:
+            prev = out.get(k, frozenset())
+            out[k] = ANY if acc is ANY or prev is ANY else prev | acc
     return out
 
 
@@ -978,6 +1039,8 @@ def _verdict(L: Layout, lanes, received, ground, chests, working, inputs, needs_
         items = _taken(L, idx, lanes, received, ground, chests, working)
         if not items and dst[0] == "entity" and dst[1] in working and L.is_machine(dst[1]):
             continue  # an idle spare inserter of a machine that works anyway (its feed comes another way)
+        if not items and idx in static.dead:
+            continue  # on a belt nothing can reach: idle; a machine that needed it is starved
         if not items:
             problems.append(Problem("dangling_inserter", f"{e.name} at {(e.x, e.y)} has nothing to pick", (e.x, e.y)))
         elif dst[0] == "ground" and not any(s == ("ground", dst[1]) for s, _ in L.links):
@@ -1053,6 +1116,27 @@ def _verdict(L: Layout, lanes, received, ground, chests, working, inputs, needs_
 
 # --- Input assignment -----------------------------------------------------------------------
 
+def _feedable(L: Layout, k: Lane) -> bool:
+    """
+    Whether something placed from outside can feed lane k of a belt start: the tile behind it is free
+    (for a belt, or the entrance for an underground exit whose entrance lies past the design's
+    edge), or, for a straight belt, the tile beside that lane (side-loading). A start walled in by a
+    beacon behind it takes nothing: its lane would be an input nobody can bring anything to. Only
+    templates are held to this (Layout.outside_only): their labels tell the player where to feed;
+    an author's design is a piece of a bigger factory, fed in ways the blueprint does not show.
+    """
+    i, lane = k
+    e = L.ents[i]
+    vx, vy = _vec(e.direction)
+    tiles = [t for t in _tiles(e) if L.half(i, t) == lane // 2] if L.types[i] == "splitter" else [(e.x, e.y)]
+    if any((x - vx, y - vy) not in L.tiles for x, y in tiles):
+        return True
+    if L.types[i] == "transport-belt" and L.is_curve(i) is None:
+        lx, ly = _left(e.direction)
+        return ((e.x + lx, e.y + ly) if lane == 0 else (e.x - lx, e.y - ly)) not in L.tiles
+    return False
+
+
 def input_ports(L: Layout) -> List[Tuple[Any, ...]]:
     """Belt lanes nobody feeds (no belt, inserter or drill puts anything on them), unfilled chests, open pipe networks."""
     dropped: Set[Lane] = {dst[1] for _, dst in L.links if dst[0] == "lane"} | \
@@ -1064,6 +1148,8 @@ def input_ports(L: Layout) -> List[Tuple[Any, ...]]:
             continue
         if L.types[k[0]] == "splitter" and k[0] in fed:
             continue  # the free half of a splitter that a belt feeds is not an extra input
+        if L.outside_only and not _feedable(L, k):
+            continue
         ports.append(("lane", k[0], k[1]))
     filled = {dst[1] for _, dst in L.links if dst[0] == "entity"}
     for j in range(len(L.ents)):
@@ -1224,7 +1310,7 @@ def _demand(L: Layout, smelt: str, fuel: str) -> Dict[Tuple[Any, ...], Dict[str,
             if not wanted:
                 continue
             if src[0] == "belt":
-                targets = [("lane", lane) for lane in L.belt_lanes(src[1])]
+                targets = [("lane", lane) for lane in L.pick_lanes[idx]]
             elif src[0] == "ground" or (src[0] == "entity" and L.storage[src[1]]):
                 targets = [src]
             elif src[0] == "entity" and dst_takes_passed(idx) and L.passes_on(src[1]) & set(wanted):
@@ -1276,7 +1362,7 @@ def _constraints(L: Layout, ports: List[Tuple[Any, ...]], domains, static: _Stat
             if port[0] == "lane":
                 lanes = _reach(L, (port[1], port[2]), item)
                 hit = {idx for idx, (src, _) in enumerate(L.links) if src[0] == "belt"
-                       and any(k in lanes for k in L.belt_lanes(src[1]))}
+                       and any(k in lanes for k in L.pick_lanes[idx])}
             else:
                 hit = {idx for idx, (src, _) in enumerate(L.links) if src == ("entity", port[1])}
             for idx in hit:
@@ -1284,7 +1370,7 @@ def _constraints(L: Layout, ports: List[Tuple[Any, ...]], domains, static: _Stat
                     serves.setdefault(idx, []).append((port, item))
     inner_fed: Set[int] = set()  # inserters that may get something from inside
     for idx, (src, dst) in enumerate(L.links):
-        if src[0] == "belt" and any(k in static.inner for k in L.belt_lanes(src[1])):
+        if src[0] == "belt" and any(k in static.inner for k in L.pick_lanes[idx]):
             inner_fed.add(idx)
         elif src[0] == "ground" or (src[0] == "entity" and not L.storage[src[1]]):
             inner_fed.add(idx)
@@ -1426,7 +1512,7 @@ def _score(L: Layout, result: FlowResult, smelt: str, fuel: str, hints: Dict[Til
     for idx, (k, (src, dst)) in enumerate(zip(L.inserters, L.links)):
         if src[0] != "belt" or dst[0] != "entity":
             continue
-        for x in L.moves(idx, set().union(*(result.lanes[lane] for lane in L.belt_lanes(src[1])))):
+        for x in L.moves(idx, L.picks_from(idx, result.lanes)):
             supply[x] = supply.get(x, 0.0) + inserter_rate(L.ents[k].name)
     for j in result.working:
         r = recipe(L.ents[j].extras_dict.get("recipe") or "")
@@ -1448,7 +1534,7 @@ MAX_IMPROVE = 120  # simulations spent on improving the chosen assignment
 
 
 def _improve(ir: IRBlueprint, L: Layout, best: FlowResult, domains, smelt: str, fuel: str,
-             hints: Dict[Tile, Set[str]]) -> FlowResult:
+             hints: Dict[Tile, Set[str]], one_per_lane: bool = False) -> FlowResult:
     """
     Local search on a working assignment: other candidates on one port at a time, kept if the
     layout still works and more different items come in (labs fed all their science packs, not one
@@ -1476,7 +1562,7 @@ def _improve(ir: IRBlueprint, L: Layout, best: FlowResult, domains, smelt: str, 
                 if alt == current or not alt or budget <= 0:
                     continue
                 budget -= 1
-                trial = check(ir, {**best.inputs, port: alt}, L)
+                trial = check(ir, {**best.inputs, port: alt}, L, one_per_lane=one_per_lane)
                 if trial.problems:
                     continue
                 trial.score = _score(L, trial, smelt, fuel, hints)
@@ -1559,16 +1645,19 @@ def _part_blueprint(ir: IRBlueprint, L: Layout, part: List[int], hints: Dict[Til
 
 def solve(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal", resource: str = "iron-ore",
           hints: Optional[Dict[Tile, Set[str]]] = None, max_leaves: int = MAX_LEAVES,
-          share_lanes: bool = True) -> FlowResult:
+          share_lanes: bool = True, outside_only: Optional[bool] = None) -> FlowResult:
     """
-    Finds the input assignment under which the layout works (no problems), see _solve_whole
-    (share_lanes=False: never two items on one input lane - templates must be fed plainly). A
+    Finds the input assignment under which the layout works (no problems), see _solve_whole. With
+    share_lanes the layout is judged as the game would run an author's design (the golden set
+    judges so): one item per input lane first, then two, and lanes may mix inside; without it (a
+    template) no belt lane may carry two items anywhere (see check, one_per_lane). A
     layout made of parts that share no flow (furnace columns side by side, separate lines of a
     book page) is solved part by part, each with the full search budget, and identical parts only
     once: one search over all of them at once runs out of budget long before it tries every
     combination. The joined assignment is simulated on the whole layout.
     """
-    L = Layout(ir, resource)
+    walled = not share_lanes if outside_only is None else outside_only  # see _feedable
+    L = Layout(ir, resource, outside_only=walled)
     hints = hints or {}
     fluid_nets = {port[1] for port in _fluid_domains(L)}
     at_ports = {port[1] for port in input_ports(L)} | {j for b, (j, _, _, _) in enumerate(L.boxes)
@@ -1584,7 +1673,7 @@ def solve(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal", resource
         sub, order, near, _ = _part_blueprint(ir, L, part, hints)
         key = (tuple(sub.entities), tuple(sorted((t, tuple(sorted(v))) for t, v in near.items())))
         if key not in solved:
-            S = Layout(sub, resource)
+            S = Layout(sub, resource, outside_only=walled)
             solved[key] = (S, _solve_whole(sub, S, smelt, fuel, near, max_leaves, allow_shared=share_lanes))
         S, res = solved[key]
         ambiguous |= res.status == "inputs_ambiguous"
@@ -1595,7 +1684,7 @@ def solve(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal", resource
                 inputs[("fluid", L.network[box_of[(order[j], k)]])] = item
             else:
                 inputs[(port[0], order[port[1]]) + tuple(port[2:])] = item
-    result = check(ir, inputs, L)
+    result = check(ir, inputs, L, one_per_lane=not share_lanes)
     if result.problems:
         result.status = "inputs_ambiguous" if ambiguous else "inputs_unsolved"
     else:
@@ -1616,9 +1705,9 @@ def _solve_whole(ir: IRBlueprint, L: Layout, smelt: str, fuel: str, hints: Dict[
     fewest problems is returned with status 'inputs_unsolved', or 'inputs_ambiguous' when the
     search ran out of MAX_LEAVES simulations. If one item per input lane cannot work, the search
     runs again with up to MAX_LANE_ITEMS items on a lane (shared_lanes): players run two items on one
-    lane of a bus.
+    lane of a bus. Without allow_shared (a template) no lane may carry two items anywhere (one_per_lane).
     """
-    result = _search_inputs(ir, L, smelt, fuel, hints, max_leaves, shared_lanes)
+    result = _search_inputs(ir, L, smelt, fuel, hints, max_leaves, shared_lanes, one_per_lane=not allow_shared)
     if result.ok or shared_lanes or not allow_shared or result.status == "doomed":
         if result.status == "doomed":
             result.status = "inputs_unsolved"
@@ -1628,7 +1717,7 @@ def _solve_whole(ir: IRBlueprint, L: Layout, smelt: str, fuel: str, hints: Dict[
 
 
 def _search_inputs(ir: IRBlueprint, L: Layout, smelt: str, fuel: str, hints: Dict[Tile, Set[str]],
-                   max_leaves: int, shared_lanes: bool) -> FlowResult:
+                   max_leaves: int, shared_lanes: bool, one_per_lane: bool = False) -> FlowResult:
     """One run of the search of _solve_whole (status 'doomed' when no assignment can work)."""
     static = _Static(L)
     ports = input_ports(L)
@@ -1669,7 +1758,7 @@ def _search_inputs(ir: IRBlueprint, L: Layout, smelt: str, fuel: str, hints: Dic
             return None
         tried.add(key)
         leaves[0] += 1
-        result = check(ir, {p: assign.get(p) for p in ports}, L)
+        result = check(ir, {p: assign.get(p) for p in ports}, L, one_per_lane=one_per_lane)
         last[0] = result
         if not result.problems:
             solutions.append(result)
@@ -1698,7 +1787,7 @@ def _search_inputs(ir: IRBlueprint, L: Layout, smelt: str, fuel: str, hints: Dic
                 if port[0] == "lane":
                     reach = _reach(L, (port[1], port[2]), x)
                     idxs = [i for i, (src, _) in enumerate(L.links)
-                            if src[0] == "belt" and any(k in reach for k in L.belt_lanes(src[1]))]
+                            if src[0] == "belt" and any(k in reach for k in L.pick_lanes[i])]
                 else:
                     idxs = [i for i, (src, _) in enumerate(L.links) if src == ("entity", port[1])]
                 for i in idxs:
@@ -1804,8 +1893,10 @@ def _search_inputs(ir: IRBlueprint, L: Layout, smelt: str, fuel: str, hints: Dic
     if solutions:
         for s in solutions:
             s.score = _score(L, s, smelt, fuel, hints)
-        return _improve(ir, L, max(solutions, key=lambda s: s.score), domains, smelt, fuel, hints)
-    result = best_fail[0] or check(ir, {p: (fluid_domains[p][0] if p in fluid_domains else None) for p in ports}, L)
+        return _improve(ir, L, max(solutions, key=lambda s: s.score), domains, smelt, fuel, hints,
+                        one_per_lane=one_per_lane)
+    result = best_fail[0] or check(ir, {p: (fluid_domains[p][0] if p in fluid_domains else None) for p in ports}, L,
+                                   one_per_lane=one_per_lane)
     ran_out = leaves[0] >= max_leaves or steps[0] >= MAX_STEPS * max_leaves
     result.status = "doomed" if doomed else "inputs_ambiguous" if ran_out else "inputs_unsolved"
     return result
