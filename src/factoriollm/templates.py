@@ -20,6 +20,7 @@ import itertools
 import math
 from collections import Counter
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 
 from factoriollm.blueprint_ir import IRBlueprint, IREntity, _prototype, entity_type, footprint, normalized, rotated
@@ -106,6 +107,46 @@ def _inner_belts(belts: Dict[int, set], run: List[int], period: int) -> frozense
     return frozenset({b for b in last if b[1] < period / 2} | {b for b in first if b[1] >= period / 2})
 
 
+class _Cells:
+    """
+    The entities of a design prepared once for cutting into cells of every period: x, y, whether a
+    plain belt, and the key (name, direction, settings) as a small number (cells are compared as
+    sets, and hashing a number is much cheaper than hashing the settings for every grid placement).
+    """
+
+    def __init__(self, ents: List[IREntity]):
+        ids: Dict[Tuple[Any, ...], int] = {}
+        self.items = [(e.x, e.y, _is_belt(e), ids.setdefault(_key(e), len(ids))) for e in ents]
+        self.keys = list(ids)  # number -> key
+        self.spans = [_span(e) for e in ents]
+        self.x0 = min(e.x for e in ents)
+
+    def best_run(self, period: int) -> Tuple[int, frozenset, List[int]]:
+        """See _best_run; the content comes back with numbers for keys."""
+        def crossings(offset: int) -> int:  # cell borders lying inside entity footprints
+            return sum((b - 1 - offset) // period - (a - offset) // period for a, b in self.spans)
+
+        best: Tuple[int, int, int, frozenset, List[int]] = (0, 0, self.x0, frozenset(), [])
+        for offset in range(self.x0, self.x0 + period):
+            core: Dict[int, set] = {}
+            belts: Dict[int, set] = {}
+            for x, y, belt, k in self.items:
+                m = (x - offset) // period
+                (belts if belt else core).setdefault(m, set()).add((k, x - offset - m * period, y))
+                core.setdefault(m, set())
+            frozen = {m: frozenset(c) for m, c in core.items()}
+            run: List[int] = []
+            for m in sorted(frozen):
+                run = run + [m] if run and m == run[-1] + 1 and frozen[m] == frozen[run[-1]] else [m]
+                if len(run) < 2 or not frozen[m]:
+                    continue
+                content = frozen[m] | _inner_belts(belts, run, period)
+                score = (len(run) * len(content), -crossings(offset))
+                if score > best[:2]:
+                    best = (score[0], score[1], offset, content, list(run))
+        return best[2], best[3], best[4]
+
+
 def _best_run(ents: List[IREntity], period: int) -> Tuple[int, frozenset, List[int]]:
     """
     Tries every placement of the cell grid and returns (offset, cell content, run) for the longest
@@ -114,30 +155,9 @@ def _best_run(ents: List[IREntity], period: int) -> Tuple[int, frozenset, List[i
     belts away from the run's outer edges (see _inner_belts). Ties go to the placement with fewer
     entities crossing cell borders.
     """
-    x0 = min(e.x for e in ents)
-
-    def crossings(offset: int) -> int:  # cell borders lying inside entity footprints
-        return sum((_span(e)[1] - 1 - offset) // period - (_span(e)[0] - offset) // period for e in ents)
-
-    best: Tuple[int, int, int, frozenset, List[int]] = (0, 0, x0, frozenset(), [])
-    for offset in range(x0, x0 + period):
-        core: Dict[int, set] = {}
-        belts: Dict[int, set] = {}
-        for e in ents:
-            m = (e.x - offset) // period
-            (belts if _is_belt(e) else core).setdefault(m, set()).add((_key(e), e.x - offset - m * period, e.y))
-            core.setdefault(m, set())
-        frozen = {m: frozenset(c) for m, c in core.items()}
-        run: List[int] = []
-        for m in sorted(frozen):
-            run = run + [m] if run and m == run[-1] + 1 and frozen[m] == frozen[run[-1]] else [m]
-            if len(run) < 2 or not frozen[m]:
-                continue
-            content = frozen[m] | _inner_belts(belts, run, period)
-            score = (len(run) * len(content), -crossings(offset))
-            if score > best[:2]:
-                best = (score[0], score[1], offset, content, list(run))
-    return best[2], best[3], best[4]
+    cells = _Cells(ents)
+    offset, content, run = cells.best_run(period)
+    return offset, frozenset((cells.keys[k], dx, y) for k, dx, y in content), run
 
 
 def find_period(ir: IRBlueprint) -> Optional[int]:
@@ -148,9 +168,17 @@ def find_period(ir: IRBlueprint) -> Optional[int]:
     ents = _structural(ir)
     if len(ents) < 6:
         return None
-    width = max(_span(e)[1] for e in ents) - min(e.x for e in ents)
+    x0, y0 = min(e.x for e in ents), min(e.y for e in ents)
+    return _period(tuple(IREntity(e.name, e.x - x0, e.y - y0, e.direction, e.extras) for e in ents))
+
+
+@lru_cache(maxsize=256)
+def _period(ents: Tuple[IREntity, ...]) -> Optional[int]:
+    """find_period of entities moved to the origin (the miner asks again for the same design normalized)."""
+    cells = _Cells(list(ents))
+    width = max(b for _, b in cells.spans) - cells.x0
     for p in range(1, width // 2 + 1):
-        _, common, run = _best_run(ents, p)
+        _, common, run = cells.best_run(p)
         if len(run) >= 2 and len(run) * len(common) >= MIN_RUN_COVERAGE * len(ents):
             return p
     return None

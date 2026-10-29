@@ -763,8 +763,17 @@ def mine(min_favorites: int = 10, per_category: int = 8, only: Optional[set] = N
     if workers == 1:
         collect(map(this._mine_row, jobs))
     else:
+        # rows differ a lot (whole books): the biggest go first, so that no worker is left with a big
+        # one while the others idle at the end; results are collected back in row order
+        jobs = list(jobs)
+        order = sorted(range(len(rows)), key=lambda i: -len(rows[i]["blueprint_string"]))
+        results: List[Any] = [None] * len(rows)
         with multiprocessing.get_context("spawn").Pool(workers) as pool:
-            collect(pool.imap(this._mine_row, jobs, chunksize=1))  # rows differ a lot (whole books)
+            for n, (i, result) in enumerate(zip(order, pool.imap(this._mine_row, (jobs[i] for i in order), chunksize=1)), 1):
+                results[i] = result
+                if n % 1000 == 0:
+                    print(f"[*] {n}/{len(rows)} rows done, {time.time() - start:.0f} s", flush=True)
+        collect(results)
     print(f"[*] {len(rows)} rows mined in {time.time() - start:.0f} s with {workers} worker(s)")
     rejects.resolve({row["key"]: row for row in rows})
     best: Dict[str, List[Template]] = {}

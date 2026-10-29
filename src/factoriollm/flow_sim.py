@@ -154,6 +154,7 @@ class Layout:
         # a splitter has two lanes per half: 0/1 on its left half, 2/3 on its right half
         self.lanes_of: Dict[int, Tuple[int, ...]] = {i: (0, 1, 2, 3) if self.types[i] == "splitter" else (0, 1)
                                                      for i in self.belts}
+        self._belt_lanes = {i: tuple((i, l) for l in self.lanes_of[i]) for i in self.belts}
         self.edges: Dict[Lane, List[Tuple[Lane, Optional[Tuple[str, str]]]]] = {
             (i, l): [] for i in self.belts for l in self.lanes_of[i]}
         self._build_lanes()
@@ -295,7 +296,7 @@ class Layout:
         return 0 if _dot((tile[0] + 0.5 - cx, tile[1] + 0.5 - cy), _left(self.ents[j].direction)) > 0 else 1
 
     def belt_lanes(self, j: int) -> Tuple[Lane, ...]:
-        return tuple((j, l) for l in self.lanes_of[j])
+        return self._belt_lanes[j]
 
     def _feed(self, i: int, tile: Tile, d: int) -> Dict[int, int]:
         """Lane mapping {lane of i: lane of the entity at tile} for items leaving i at tile in direction d."""
@@ -681,6 +682,48 @@ def _fluid_roles(L: Layout) -> Tuple[Dict[int, List[Tuple[List[int], str]]], Dic
     return needs, makes
 
 
+@dataclass
+class _SimStatic:
+    """What every simulation of a layout needs and the inputs never change (built once per layout)."""
+    active: List[int]                # entities that may start working: machines and fluid users / makers
+    judged: List[int]                # entities judged as machines (starved or not)
+    requests: Dict[int, Set[str]]    # what each chest requests (logistic chests)
+    taken_from: FrozenSet[int]       # entities some inserter takes from
+    nets: List[Tuple[int, int]]      # (pipe network, its first fluid box)
+    # the inserters (numbers in L.links) that pick from a belt lane, an entity, a ground tile
+    by_lane: Dict[Lane, List[int]] = field(default_factory=dict)
+    by_entity: Dict[int, List[int]] = field(default_factory=dict)
+    by_ground: Dict[Tile, List[int]] = field(default_factory=dict)
+    dry: FrozenSet[int] = frozenset()  # machines with a fluid recipe and no fluid boxes
+
+
+def _sim_static(L: Layout) -> _SimStatic:
+    if getattr(L, "_sim", None) is None:
+        needs_f, makes_f = _fluid_roles(L)
+        every = range(len(L.ents))
+        requests = {}
+        for j in every:
+            if L.storage[j]:
+                req = L.ents[j].extras_dict.get("requests") or ""
+                requests[j] = {p.split("=")[0] for p in req.split(";") if p}
+        L._sim = _SimStatic([j for j in every if L.is_machine(j) or j in makes_f or j in needs_f],
+                            [j for j in every if L.is_machine(j) or j in needs_f], requests,
+                            frozenset(src[1] for src, _ in L.links if src[0] == "entity"),
+                            [(net, L.network.index(net)) for net in set(L.network)])
+        for idx, ((kind, ref), _) in enumerate(L.links):
+            if kind == "belt":
+                for k in L.belt_lanes(ref):
+                    L._sim.by_lane.setdefault(k, []).append(idx)
+            elif kind == "entity":
+                L._sim.by_entity.setdefault(ref, []).append(idx)
+            elif kind == "ground":
+                L._sim.by_ground.setdefault(ref, []).append(idx)
+        recipes = {j: recipe(L.ents[j].extras_dict.get("recipe") or "") for j in every
+                   if L.types[j] == "assembling-machine"}
+        L._sim.dry = frozenset(j for j, r in recipes.items() if r and r.fluids & set(r.ingredients) and j not in needs_f)
+    return L._sim
+
+
 def _boxes_for(fluids: List[str], boxes: List[int], index: Dict[str, int], make) -> list:
     """Each fluid on its box: the recipe's fluidbox_index, else the next box no index claims."""
     named = {f: boxes[i - 1] for f, i in index.items() if 0 < i <= len(boxes)}
@@ -737,14 +780,11 @@ def _simulate(L: Layout, inputs: Dict[Any, Optional[str]]) -> FlowResult:
 def _fixpoint(L: Layout, inputs: Dict[Any, Optional[str]], primed: FrozenSet[Tuple[int, str]]) -> FlowResult:
     """Items and fluids spread from the inputs (and the primed (network, fluid) pairs) until nothing changes."""
     ents = L.ents
+    static = _sim_static(L)
     lanes: Dict[Lane, Set[str]] = {k: set() for k in L.edges}
     received: Dict[int, Set[str]] = {}
     ground: Dict[Tile, Set[str]] = {}
-    chests: Dict[int, Set[str]] = {}
-    for j in range(len(ents)):
-        if L.storage[j]:
-            req = ents[j].extras_dict.get("requests") or ""
-            chests[j] = {p.split("=")[0] for p in req.split(";") if p}
+    chests: Dict[int, Set[str]] = {j: set(req) for j, req in static.requests.items()}
     for key, item in inputs.items():
         if not item:
             continue
@@ -769,14 +809,28 @@ def _fixpoint(L: Layout, inputs: Dict[Any, Optional[str]], primed: FrozenSet[Tup
             have = set().union(*(net_fluids.get(L.network[b], set()) for b in bs)) if bs else set()
             if not _has_fluid(fluid, have):
                 return False
-        if L.types[j] == "assembling-machine":
-            r = recipe(ents[j].extras_dict.get("recipe") or "")
-            if r and r.fluids & set(r.ingredients) and j not in needs_f:
-                return False  # a fluid recipe in a machine without fluid boxes
+        return j not in static.dry  # a fluid recipe in a machine without fluid boxes never works
+
+    # Everything only grows (items on lanes, in machines, working machines), so the end state does
+    # not depend on the order of updates: a lane is spread again only once it got new items, and an
+    # inserter is asked again only once what it picks from changed.
+    dirty: Set[Lane] = {k for k, v in lanes.items() if v}
+    pending: Set[int] = set(range(len(L.links)))
+
+    def put(kind: str, ref: Any, items: Set[str]) -> bool:
+        if not _put(L, kind, ref, items, lanes, received, ground, chests):
+            return False
+        if kind == "lane":
+            dirty.add(ref)
+        elif kind == "entity":
+            pending.update(static.by_entity.get(ref, ()))
+        elif kind == "ground":
+            pending.update(static.by_ground.get(ref, ()))
         return True
 
-    def source_items(idx: int) -> Set[str]:
-        return _taken(L, idx, lanes, received, ground, chests, working)
+    def start(j: int) -> None:
+        working.add(j)
+        pending.update(static.by_entity.get(j, ()))  # its products can be taken now
 
     changed = True
     rounds = 0
@@ -784,9 +838,11 @@ def _fixpoint(L: Layout, inputs: Dict[Any, Optional[str]], primed: FrozenSet[Tup
         changed = False
         rounds += 1
         # belts
-        stack = [k for k, v in lanes.items() if v]
+        stack = list(dirty)
+        dirty.clear()
         while stack:
             k = stack.pop()
+            pending.update(static.by_lane.get(k, ()))
             for dst, rule in L.edges[k]:
                 new = {x for x in lanes[k] if _passes(rule, x)} - lanes[dst]
                 if new:
@@ -795,19 +851,22 @@ def _fixpoint(L: Layout, inputs: Dict[Any, Optional[str]], primed: FrozenSet[Tup
         # drills
         for j, (kind, ref) in L.drills:
             if j not in working and works(j):
-                working.add(j)
+                start(j)
                 changed = True
             if j in working:
-                changed |= _put(L, kind, ref, {L.resource}, lanes, received, ground, chests)
+                changed |= put(kind, ref, {L.resource})
         # inserters
-        for idx, (src, dst) in enumerate(L.links):
-            items = source_items(idx)
+        todo = sorted(pending)
+        pending.clear()
+        for idx in todo:
+            items = _taken(L, idx, lanes, received, ground, chests, working)
             if items:
-                changed |= _put(L, dst[0], dst[1], items, lanes, received, ground, chests)
+                dst = L.links[idx][1]
+                changed |= put(dst[0], dst[1], items)
         # machines and fluids
-        for j in range(len(ents)):
-            if j not in working and (L.is_machine(j) or j in makes_f or j in needs_f) and works(j):
-                working.add(j)
+        for j in static.active:
+            if j not in working and works(j):
+                start(j)
                 changed = True
                 for b, fluid in makes_f.get(j, []):
                     net_fluids.setdefault(L.network[b], set()).add(fluid)
@@ -889,10 +948,9 @@ def _verdict(L: Layout, lanes, received, ground, chests, working, inputs, needs_
             products.add(L.resource)
     input_items = {item for item in inputs.values() if item}
 
+    static = _sim_static(L)
     # machines
-    for j in range(len(ents)):
-        if not L.is_machine(j) and j not in needs_f:
-            continue
+    for j in static.judged:
         if L.types[j] == "generator" and j not in working:
             problems.append(Problem("starved", f"{ents[j].name} gets no steam", pos(j)))
             continue
@@ -909,10 +967,9 @@ def _verdict(L: Layout, lanes, received, ground, chests, working, inputs, needs_
         missing = sorted(every_pack - received.get(j, set()))
         if missing:
             problems.append(Problem("starved", f"lab at {pos(j)} lacks {', '.join(missing)}", pos(j)))
-    taken_from = {src[1] for src, _ in L.links if src[0] == "entity"}
     for j in working:
         if L.types[j] in ("assembling-machine", "furnace") and L.products(j, frozenset(received.get(j, set()))) \
-                and j not in taken_from:
+                and j not in static.taken_from:
             problems.append(Problem("no_output", f"nobody takes the products of {ents[j].name} at {pos(j)}", pos(j)))
 
     # inserters
@@ -953,10 +1010,9 @@ def _verdict(L: Layout, lanes, received, ground, chests, working, inputs, needs_
                                     pos(k[0])))
 
     # fluids
-    for net in set(L.network):
+    for net, b in static.nets:
         fluids = net_fluids.get(net, set())
         if len(fluids) > 1:
-            b = L.network.index(net)
             problems.append(Problem("fluid_mix", f"{' and '.join(sorted(fluids))} in one pipe network",
                                     pos(L.boxes[b][0])))
 
