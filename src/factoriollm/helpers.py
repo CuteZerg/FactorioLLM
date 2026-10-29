@@ -139,15 +139,39 @@ def _entity_tiles(ent: Any) -> List[Tuple[int, int]]:
     return [(x0 + dx, y0 + dy) for dx in range(ent.tile_width) for dy in range(ent.tile_height)]
 
 
+# id(blueprint) -> [weak reference to it, its entity list, entities read, last entity read, occupied tiles]
+_OCCUPIED: Dict[int, List[Any]] = {}
+
+
 class _PlacementGuard:
-    """Appends entities to a blueprint and refuses any that overlap an already placed one."""
+    """
+    Appends entities to a blueprint and refuses any that overlap an already placed one. The occupied
+    tiles are kept per blueprint between helper calls (a script calls helpers hundreds of times, and
+    reading every entity on each call made long scripts quadratic): entities that other code
+    appended are read from the end of the list; a shorter list, a different last entity or a new list
+    means it was changed some other way, and the whole list is read again.
+    """
 
     def __init__(self, bp: Any):
+        import weakref
         self.bp = bp
-        self.occupied: Dict[Tuple[int, int], Any] = {}
-        for ent in bp.entities:
-            for tile in _entity_tiles(ent):
-                self.occupied[tile] = ent
+        ents = bp.entities
+        state = _OCCUPIED.get(id(bp))
+        if (state is None or state[0]() is not bp or state[1] is not ents or len(ents) < state[2]
+                or (state[2] and ents[state[2] - 1] is not state[3])):
+            state = [weakref.ref(bp, lambda _, key=id(bp): _OCCUPIED.pop(key, None)), ents, 0, None, {}]
+            _OCCUPIED[id(bp)] = state
+        self.state = state
+        self.occupied: Dict[Tuple[int, int], Any] = state[4]
+        self._read()
+
+    def _read(self) -> None:
+        ents = self.bp.entities
+        for k in range(self.state[2], len(ents)):
+            for tile in _entity_tiles(ents[k]):
+                self.occupied[tile] = ents[k]
+        self.state[2] = len(ents)
+        self.state[3] = ents[-1] if len(ents) else None
 
     def check(self, ent: Any) -> None:
         for tile in _entity_tiles(ent):
@@ -160,9 +184,8 @@ class _PlacementGuard:
 
     def append(self, ent: Any) -> None:
         self.check(ent)
-        self.bp.entities.append(ent)
-        for tile in _entity_tiles(ent):
-            self.occupied[tile] = ent
+        self.bp.entities.append(ent)  # draftsman stores a copy
+        self._read()
 
 
 def add_belt_line(

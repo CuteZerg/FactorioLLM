@@ -175,6 +175,14 @@ class Layout:
         self.drills = [(i, self._drop(self.ents[i], _point(self.ents[i], "vector_to_place_result")))
                        for i, t in enumerate(self.types) if t == "mining-drill" and self.ents[i].name != "pumpjack"]
         self._build_fluids()
+        # what an entity is and takes never changes during a search: looked up in the game data once
+        # per entity, not once per simulation
+        every = range(len(self.ents))
+        self._machine = [self._is_machine(j) for j in every]
+        self._accepts = [self._accepts_of(j) for j in every]
+        self._needs = [tuple(self._needs_of(j)) for j in every]
+        self._passes = [self._passes_on(j) for j in every]
+        self.keeps_burnt = [keeps_burnt_result(e.name) for e in self.ents]
 
     # --- belts ---------------------------------------------------------------------------
 
@@ -406,6 +414,10 @@ class Layout:
         return out
 
     def accepts(self, j: int) -> Optional[FrozenSet[str]]:
+        """Items an inserter may put into entity j (ANY for storage), see _accepts_of."""
+        return self._accepts[j]
+
+    def _accepts_of(self, j: int) -> Optional[FrozenSet[str]]:
         """
         Items an inserter may put into entity j, from what the entity is (its prototype): anything
         for storage (chests, wagons); ingredients of a crafting machine's recipe (a furnace: whatever
@@ -428,8 +440,11 @@ class Layout:
             out |= robot_items()
         return frozenset(out)
 
-    def needs(self, j: int) -> List[FrozenSet[str]]:
+    def needs(self, j: int) -> Tuple[FrozenSet[str], ...]:
         """Item requirements of a machine: each set must be met by at least one of its items (fuel: any it burns)."""
+        return self._needs[j]
+
+    def _needs_of(self, j: int) -> List[FrozenSet[str]]:
         e, t = self.ents[j], self.types[j]
         fuel = [fuel_items(e.name)] if is_burner(e.name) else []
         if t == "assembling-machine":
@@ -455,7 +470,7 @@ class Layout:
             out |= set(r.results) - r.fluids if r else set()
         elif t == "furnace":
             out |= {SMELTING[i] for i in received if i in SMELTING}
-        if keeps_burnt_result(e.name):
+        if self.keeps_burnt[j]:
             out |= {burnt_result(i) for i in received if burnt_result(i)}
         return frozenset(out)
 
@@ -465,11 +480,17 @@ class Layout:
         (never onto a belt or into a chest): a burner's fuel (boiler to boiler, reactor to reactor),
         a lab's science packs, a turret's ammunition.
         """
+        return self._passes[j]
+
+    def _passes_on(self, j: int) -> FrozenSet[str]:
         name = self.ents[j].name
         return fuel_items(name) | frozenset(lab_inputs(name)) | ammo_items(name)
 
     def is_machine(self, j: int) -> bool:
         """Crafting machines, labs, the rocket silo and burners that run on fuel to work (not inserters or vehicles)."""
+        return self._machine[j]
+
+    def _is_machine(self, j: int) -> bool:
         t = self.types[j]
         return t in ("assembling-machine", "furnace", "lab", "rocket-silo") or (
             is_burner(self.ents[j].name) and t not in NOT_MACHINES)
@@ -815,7 +836,7 @@ def _taken(L: Layout, idx: int, lanes, received, ground, chests, working) -> Set
         if L.storage[ref]:
             items = set(chests.get(ref, set()))
         else:
-            items = set(L.products(ref, got)) if ref in working or keeps_burnt_result(L.ents[ref].name) else set()
+            items = set(L.products(ref, got)) if ref in working or L.keeps_burnt[ref] else set()
             if dst[0] == "entity" and not L.storage[dst[1]]:
                 items |= got & L.passes_on(ref)
     else:

@@ -70,6 +70,23 @@ class TestDraftsmanHelpers(unittest.TestCase):
         add_entity_row(bp, "inserter", start=(0, 3), count=8, step=(1, 0), direction="south")
         self.assertEqual(max(occupied_tiles(bp).values()), 1)
 
+    def test_guard_sees_entities_placed_without_helpers(self):
+        # the occupied tiles are kept between helper calls: an entity the script appended itself
+        # must still block, and one it removed must free its tiles
+        from draftsman.entity import new_entity
+        bp = Blueprint()
+        add_belt_line(bp, start=(0, 0), length=3, direction="east")
+        bp.entities.append(new_entity("wooden-chest", tile_position=(5, 0)))
+        with self.assertRaises(ValueError):
+            add_belt_line(bp, start=(5, 0), length=1, direction="east")
+        bp.entities.pop()  # the chest
+        add_belt_line(bp, start=(5, 0), length=1, direction="east")
+        del bp.entities[0]  # the first belt
+        add_belt_line(bp, start=(0, 0), length=1, direction="east")
+        with self.assertRaises(ValueError):
+            add_belt_line(bp, start=(1, 0), length=1, direction="east")
+        self.assertEqual(max(occupied_tiles(bp).values()), 1)
+
     def test_add_entity_row_passes_recipe(self):
         bp = Blueprint()
         add_entity_row(bp, "assembling-machine-2", start=(0, 0), count=3, step=(3, 0), recipe="iron-gear-wheel")
