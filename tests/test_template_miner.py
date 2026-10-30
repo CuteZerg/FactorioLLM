@@ -246,6 +246,22 @@ class DockingCellTest(unittest.TestCase):
         self.assertEqual(len({p.tile for p in outputs}), 2)  # the two output belts end at the head only
 
 
+class SmeltingInputTest(unittest.TestCase):
+    def test_a_steel_block_smelts_plates_not_copper(self):
+        # fed iron ore, its steel furnaces would mix ore with the plates handed to them; copper ore
+        # "works" (copper plates smelt no further), but the block is made for iron plates -> steel
+        import json
+        from collections import Counter
+        from pathlib import Path
+        from factoriollm.template_miner import Rejects, _mine_design
+        data = json.loads((Path(__file__).parent / "fixtures" / "flow" / "steel_from_plates_block.json").read_text(encoding="utf-8"))
+        ir = IRBlueprint([IREntity(n, x, y, d, tuple(sorted(ex.items()))) for n, x, y, d, ex in data["entities"]],
+                         data["label"] or "", tuple(data["version"]), snap=tuple(data["snap"]) if data["snap"] else None)
+        t = _mine_design(ir, "smelting_steel", "Steel", Counter(), Rejects())
+        self.assertEqual(t.metrics["smelt"], "iron-plate")
+        self.assertEqual(t.metrics["input"], "steel")
+
+
 class AmbiguousRetryTest(unittest.TestCase):
     def test_a_search_out_of_budget_runs_again_with_more(self):
         # a big utility science block: the first search spends its budget on other inputs

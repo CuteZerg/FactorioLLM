@@ -36,7 +36,7 @@ from factoriollm.blueprint_ir import (
     rotated,
 )
 from factoriollm.flow_sim import MAX_LEAVES, FlowResult, Layout, mixed_lane_keys, solve
-from factoriollm.game_data import final_products, places_entity, recipe
+from factoriollm.game_data import SMELTING, final_products, places_entity, recipe
 from factoriollm.base_game import ENTITIES
 from factoriollm.templates import (
     CROP_STEPS,
@@ -561,8 +561,9 @@ AMBIGUOUS_RETRY = 10  # times the search budget for a second search when the fir
 def run_flow(ir: IRBlueprint, hints: Optional[Dict] = None, first: str = "iron-ore",
              share_lanes: bool = True, outside_only: Optional[bool] = None) -> Tuple[FlowResult, str]:
     """
-    The flow simulator's verdict; designs with furnaces are tried with each smelting input in turn.
-    For an author's design the search may put two items on one input lane, as the game would run
+    The flow simulator's verdict; designs with furnaces are tried with each smelting input in turn,
+    and a result that smelts exactly what was asked for wins over one where the search smelts
+    something else (the first such is the fallback). For an author's design the search may put two items on one input lane, as the game would run
     it (the golden set judges this way; the miner then rejects the design, see shares_a_lane); a
     template build is searched with one item per lane only (share_lanes=False). A search that runs out
     of budget runs once more with AMBIGUOUS_RETRY times the budget: big designs with many input
@@ -571,17 +572,24 @@ def run_flow(ir: IRBlueprint, hints: Optional[Dict] = None, first: str = "iron-o
     furnaces = any(entity_type(e.name) == "furnace" for e in ir.entities)
     choices = [first] + [s for s in SMELT_CHOICES if s != first] if furnaces else [first]
     found: Optional[Tuple[FlowResult, str]] = None
+    other: Optional[Tuple[FlowResult, str]] = None  # works, but on another smelting input than asked for
     for smelt in choices:
         result = solve(ir, smelt=smelt, hints=hints, share_lanes=share_lanes, outside_only=outside_only)
         if result.status == "inputs_ambiguous":
             result = solve(ir, smelt=smelt, hints=hints, share_lanes=share_lanes, outside_only=outside_only,
                            max_leaves=MAX_LEAVES * AMBIGUOUS_RETRY)
         if result.ok:
-            return result, smelt
+            # the smelting input is a preference of the search: a steel block whose ore would mix with the
+            # plates it makes works with copper ore too (copper plates smelt no further), yet it is made for
+            # iron plates; the next choices may smelt what they ask for (in-game review of 30.10)
+            if {x for x in result.inputs.values() if x in SMELTING} <= {smelt}:
+                return result, smelt
+            other = other or (result, smelt)
+            continue
         found = found or (result, smelt)
         if not any(p.kind == "starved" and "furnace" in p.message for p in result.problems):
             break  # another smelting input only helps a furnace that got nothing
-    return found
+    return other or found
 
 
 REASON_ORDER = ("starved", "clog", "lane_mixed", "output_mixed", "fluid_mix", "no_output", "dangling_inserter")
