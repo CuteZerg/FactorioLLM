@@ -217,6 +217,27 @@ class PlainlyFedTemplatesTest(unittest.TestCase):
         self.assertEqual(set(rejects.seen), {"author: needs_shared_lane"})
 
 
+class DockingCellTest(unittest.TestCase):
+    def test_a_docking_cell_is_taken_whole(self):
+        # the splitters tapping the copper bus and the output line at the cell's edge join the copies
+        # (checked in game 30.10: the cut cell left gaps between the copies' belts)
+        import json
+        from collections import Counter
+        from pathlib import Path
+        from factoriollm.template_miner import Rejects, _mine_design
+        data = json.loads((Path(__file__).parent / "fixtures" / "flow" / "green_circuits_docking_cell.json").read_text(encoding="utf-8"))
+        ir = IRBlueprint([IREntity(n, x, y, d, tuple(sorted(ex.items()))) for n, x, y, d, ex in data["entities"]],
+                         data["label"] or "", tuple(data["version"]), snap=tuple(data["snap"]) if data["snap"] else None)
+        stats = Counter()
+        t = _mine_design(ir, "green_circuits", "EC 02", stats, Rejects())
+        self.assertIn("works docked to its copies", stats)
+        base = lambda name: name.replace("fast-", "").replace("express-", "")  # noqa: E731 (the belt tier may change)
+        names = Counter(base(e.name) for e in t.segment)
+        author = Counter(base(n) for n, *_ in data["entities"])
+        for belt in ("splitter", "transport-belt", "underground-belt"):
+            self.assertEqual(names[belt], author[belt], belt)
+
+
 class AmbiguousRetryTest(unittest.TestCase):
     def test_a_search_out_of_budget_runs_again_with_more(self):
         # a big utility science block: the first search spends its budget on other inputs
