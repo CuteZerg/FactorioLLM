@@ -128,7 +128,9 @@ what inserters move (with their filters, over the ground, through chests; a burn
 next burner, a lab its science packs, a turret its ammunition), what machines make and which fluids fill each
 pipe network (one-way pumps, paired pipes-to-ground, loops primed once). `solve()` searches the items to feed
 into the inputs so that every machine gets its ingredients, products leave, no lane clogs and no fluids mix;
-problems are reported with their positions.
+problems are reported with their positions. Templates are judged strictly: a belt lane never carries two items
+(not on the way in, inside or out), inputs sit only where a belt or a pipe can be brought from outside; an
+author's design is judged as the game would run it.
 
 A **golden set** (`tests/fixtures/golden/`) of player designs checked in game ("works" / "broken") keeps the
 simulator honest: `test_golden_set` fails when it disagrees with the game.
@@ -150,10 +152,23 @@ Outputs:
 * `outputs/templates/rejects_book.txt` — a few rejected designs per reason, to check the reasons in game.
 
 ```bash
-uv run python -m factoriollm.template_miner --min-favorites 10   # ~20 min on 11 processes
+uv run python -m factoriollm.template_miner --min-favorites 10   # ~9 min on 11 processes
 uv run python -m factoriollm.template_miner --only defense,labs  # re-mine some categories into the catalog
 uv run python tools/extract_balancers.py          # balancer templates (Raynquist's book first) -> helpers.py
 uv run python tools/extract_game_data.py         # base-game recipes, items, signals, entity properties, recipe history
+```
+
+## Generic templates
+
+A player's blueprint stores machines, inserters and belts, but not which item goes on which lane. So a row of
+machines is generic: `generic.py` puts another recipe of the same shape into the row's machines (the passport
+of every production template holds its roles and cross-section, e.g. `in[A1,A2] out[B1]`), lets the simulator
+find the lanes, closes the row with its own ends (what the end segments take from the neighbouring copy) or the
+author's, drops pipe networks the recipe does not need and checks the build like a mined template.
+`rank_templates` picks a template for a recipe: same recipe shape first, then density, then popularity.
+
+```bash
+uv run python -m factoriollm.generic   # every row template x recipes of its shape: report + book for the game
 ```
 
 ## Training and evaluation
@@ -197,7 +212,7 @@ uv run python -m unittest tests.test_golden_set   # the simulator against design
       self-contained templates, computed grids, strict power checks, density-first defaults)
 - [x] Flow simulator; only working templates; labels per lane; base-game data and recipe history; defence
 - [x] Simulator checked against in-game verdicts (golden set); entity properties from the game data (2.1)
-- [ ] Generic templates (assembler rows by number of input lanes, fluid rows, furnace lines) for any recipe
+- [x] Generic templates: assembler, chemical plant and furnace rows built with any recipe of their shape
 - [ ] Modules API on top of templates; synthetic and repair examples; dataset v5; fine-tuning
 - [ ] Iterative refinement (edit a generated blueprint by instruction); mod support via game data dumps
 
