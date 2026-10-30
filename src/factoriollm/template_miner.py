@@ -20,6 +20,7 @@ import asyncio
 import json
 import math
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1141,8 +1142,23 @@ def blueprint_string(ir: IRBlueprint, label: str) -> str:
 
 
 def labelled(t: Template, ir: IRBlueprint) -> IRBlueprint:
-    """The build with input / output labels from the flow simulator (furnaces: the smelting input found when mining)."""
-    return add_port_labels(ir, smelt=t.metrics.get("smelt") or "iron-ore")
+    """
+    The build with input / output labels from the flow simulator (furnaces: the smelting input found
+    when mining), judged as the miner judges builds (run_flow: one item per lane, a second search
+    when the first runs out). Labels read off a failed search would show its best failure: two items
+    mixed on a lane, one item on a lane meant for a product made inside.
+    """
+    flow, smelt = run_flow(ir, first=t.metrics.get("smelt") or "iron-ore", share_lanes=False)
+    if t.metrics.get("docks") and not flow.ok:
+        # copies docked side by side: the outer ones miss their outer neighbours (see middle_flow)
+        lo = min(e.x for e in ir.entities) + t.period
+        if not any(lo <= p.position[0] < lo + t.period for p in flow.problems):
+            flow = replace(flow, problems=[], status="ok")
+    try:
+        return add_port_labels(ir, smelt=smelt, flow=flow)
+    except ValueError as e:  # no labels rather than wrong ones; the entry keeps its place in the book
+        print(f"    [!] {t.category}: {(t.source.get('label') or t.source.get('title') or '')[:40]}: {e}")
+        return ir
 
 
 def write_book(best: Dict[str, List[Template]], path: Path = Path("outputs/templates/catalog_book.txt")) -> None:

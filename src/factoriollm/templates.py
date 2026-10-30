@@ -1006,6 +1006,9 @@ def add_port_labels(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal"
     LABEL_REACH = 6
     ents = list(ir.entities)
     flow = flow or solve(ir, smelt=smelt, fuel=fuel, resource=resource, share_lanes=False)
+    if not flow.ok:  # its best failure would be labelled: mixed lanes, an input where a product goes
+        raise ValueError(f"no working input assignment to label ({flow.status}: "
+                         f"{', '.join(sorted({p.kind for p in flow.problems}))})")
     layout = Layout(ir, resource)
     used = {t for e in ents for t in _tiles(e)}
     xs, ys = [t[0] for t in used], [t[1] for t in used]

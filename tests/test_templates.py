@@ -253,10 +253,14 @@ class TestSelfContained(unittest.TestCase):
     def test_lanes_with_different_items_get_a_label_each(self):
         # iron plates (steel) and coal on the two lanes of the input belt: even where the furnaces take
         # both from either lane, one label with two items reads as both on each lane (review of 28.10)
-        ir = add_port_labels(furnace_row(3), smelt="iron-plate")
-        labels = sorted(e.extras_dict["signals"] for e in ir.entities if e.name == "constant-combinator")
-        self.assertEqual(labels, ["item:coal=1;virtual:signal-L=1", "item:iron-plate=1;virtual:signal-R=1"])
-        inside = add_port_labels(furnace_row(3), inside_only=True)
+        row = furnace_row(3)
+        out = [IREntity("inserter", u, 4, 0) for u in range(2, 14, 2)] + [IREntity("transport-belt", x, 5, 4) for x in range(2, 15)]
+        row = row.with_entities(row.entities + out)  # the steel goes out (labels need a working design)
+        ir = add_port_labels(row, smelt="iron-plate")
+        labels = sorted({e.extras_dict["signals"] for e in ir.entities if e.name == "constant-combinator"})  # per splitter half
+        self.assertEqual(labels, ["item:coal=1;virtual:signal-L=1", "item:iron-plate=1;virtual:signal-R=1",
+                                  "item:steel-plate=1"])
+        inside = add_port_labels(row, inside_only=True)
         self.assertTrue(all(e.x >= 0 and e.y >= 0 for e in inside.entities))
 
     def test_crop_keeps_the_underground_copies_join_at(self):
