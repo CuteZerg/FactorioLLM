@@ -11,7 +11,8 @@ feed a machine, how many fluid connections it has, whether its products leave on
 - instantiate: a working build of it, with labels, our own bare ends first and the author's head and
   tail as the fallback;
 - throughput: how much a machine eats and how many a lane and an inserter can feed;
-- shaped_like: recipes of the same shape to try a template with (the template x recipe check).
+- shaped_like: recipes of the same shape to try a template with (the template x recipe check);
+- check_catalog, write_report, write_test_book: that check over the catalog, its report and a book for the game.
 """
 
 from __future__ import annotations
@@ -403,6 +404,57 @@ def write_report(results: List[Dict[str, Any]], path: str = REPORT) -> None:
     print(f"[*] Report: {path}")
 
 
+BOOK = "outputs/templates/generic_book.txt"
+FAMILY_NAMES = {"machine_row": "Ряды сборщиков", "furnace_column": "Колонны печей", "chem_row": "Ряды химзаводов",
+                "centrifuge_row": "Центрифуги", "refinery_block": "НПЗ"}
+
+
+def write_test_book(results: List[Dict[str, Any]], per_family: int = 4, path: str = BOOK) -> List[str]:
+    """
+    A book to check substitutions in game: per family the most popular row templates that took
+    other recipes, each with up to two of them (our own ends first), built with labels. Returns the
+    lines of its table of contents (sub-book, position, what was built).
+    """
+    from pathlib import Path
+
+    from draftsman.blueprintable import BlueprintBook, get_blueprintable_from_string
+
+    from factoriollm.helpers import game_string
+    from factoriollm.template_miner import blueprint_string, load_catalog
+
+    catalog = load_catalog()
+    works: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+    for r in results:
+        if r["ok"] and r["recipe"] != (row_machines(catalog[r["cat"]][r["i"]])[1] or recipe_of_smelt(catalog[r["cat"]][r["i"]])):
+            works.setdefault((r["cat"], r["i"]), []).append(r)
+    book = BlueprintBook()
+    book.label = "FactorioLLM generic templates"
+    toc = []
+    for family, title in FAMILY_NAMES.items():
+        chosen = sorted((k for k in works if catalog[k[0]][k[1]].metrics.get("family") == family),
+                        key=lambda k: -(catalog[k[0]][k[1]].source.get("favorites") or 0))[:per_family]
+        if not chosen:
+            continue
+        sub = BlueprintBook()
+        sub.label = title
+        for k in chosen:
+            t = catalog[k[0]][k[1]]
+            name = (t.source.get("label") or t.source.get("title") or "").strip()[:30]
+            for r in sorted(works[k], key=lambda r: r["ends"] != "own")[:2]:
+                try:
+                    g = instantiate(t, r["recipe"], segments=3 if segment_form(t) else 1)
+                    text = f"{name} | {r['recipe']} | {g.ends} ends"
+                    sub.blueprints.append(get_blueprintable_from_string(blueprint_string(g.build, text)))
+                    toc.append(f"{len(book.blueprints) + 1} «{title}» #{len(sub.blueprints)}: {text}")
+                except Exception as e:  # reported, not hidden
+                    print(f"    [!] {name} with {r['recipe']}: {type(e).__name__}: {e}")
+        book.blueprints.append(sub)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(game_string(book), encoding="utf-8")
+    print(f"[*] Test book: {path}")
+    return toc
+
+
 def main():
     import argparse
     import json
@@ -415,6 +467,7 @@ def main():
     results = check_catalog(args.workers, args.limit)
     Path("data/templates/generic_check.json").write_text(json.dumps(results, ensure_ascii=False, indent=0), encoding="utf-8")
     write_report(results)
+    print("\n".join(write_test_book(results)))
 
 
 if __name__ == "__main__":
