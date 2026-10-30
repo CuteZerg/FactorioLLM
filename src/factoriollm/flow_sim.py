@@ -793,7 +793,7 @@ def check(ir: IRBlueprint, inputs: Dict[Any, Optional[str]], layout: Optional[La
     L = layout or Layout(ir, resource)
     result = _simulate(L, inputs)
     result.inputs = dict(inputs)
-    if one_per_lane:
+    if one_per_lane and any(len(items) > 1 for items in result.lanes.values()):
         result.problems += mixed_lanes(L, result)
     return result
 
@@ -1794,14 +1794,39 @@ def _search_inputs(ir: IRBlueprint, L: Layout, smelt: str, fuel: str, hints: Dic
 
     port_set = set(ports)
 
-    def simulate(assign: Dict[Tuple[Any, ...], str]) -> Optional[bool]:
-        """Whether the assignment works; None if it was simulated before."""
+    reach: Dict[Tuple[Tuple[Any, ...], str], Set[Lane]] = {}
+
+    def mixes(inputs: Dict[Tuple[Any, ...], Optional[str]]) -> bool:
+        """
+        Whether two input lanes with different items reach a common lane (through the splitter filters
+        each item passes): with one item per lane, a sure failure (lane_mixed) known without simulating.
+        """
+        fed = [(p, x) for p, x in inputs.items() if x and p[0] == "lane"]
+        for (p, x), (q, y) in itertools.combinations(fed, 2):
+            if x == y:
+                continue
+            for k, item in ((p, x), (q, y)):
+                if (k, item) not in reach:
+                    reach[(k, item)] = _reach(L, (k[1], k[2]), item)
+            if reach[(p, x)] & reach[(q, y)]:
+                return True
+        return False
+
+    def simulate(assign: Dict[Tuple[Any, ...], str], quick: bool = True) -> Optional[bool]:
+        """
+        Whether the assignment works; None if it was simulated before. With one item per lane, an
+        assignment that surely mixes two inputs on a lane counts as tried without being simulated
+        (quick; the greedy repair needs the simulated result, see repair).
+        """
         key = frozenset(assign.items())
         if key in tried:
             return None
         tried.add(key)
         leaves[0] += 1
-        result = check(ir, {p: assign.get(p) for p in ports}, L, one_per_lane=one_per_lane)
+        inputs = {p: assign.get(p) for p in ports}
+        if quick and one_per_lane and mixes(inputs):
+            return False
+        result = check(ir, inputs, L, one_per_lane=one_per_lane)
         last[0] = result
         if not result.problems:
             solutions.append(result)
@@ -1843,7 +1868,7 @@ def _search_inputs(ir: IRBlueprint, L: Layout, smelt: str, fuel: str, hints: Dic
                 else fluid_domains[p][0]
         moves = Counter()
         for _ in range(REPAIR_ROUNDS):
-            if done() or simulate(assign) is not False:
+            if done() or simulate(assign, quick=False) is not False:
                 return
             result = last[0]
             changed = False
