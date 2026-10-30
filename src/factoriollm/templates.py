@@ -561,6 +561,101 @@ def _uncovered(ents: List[IREntity]) -> List[int]:
     return [i for i, e in enumerate(ents) if is_electric_consumer(e.name) and not any(_supplies(p, e) for p in poles)]
 
 
+# Families of generic rows by what their machine crafts (game data, not names): the first category the
+# machine crafts in this order names its family.
+FAMILY_OF_CATEGORY = (("smelting", "furnace_column"), ("oil-processing", "refinery_block"), ("chemistry", "chem_row"),
+                      ("centrifuging", "centrifuge_row"), ("crafting", "machine_row"), ("advanced-crafting", "machine_row"))
+
+
+def machine_family(name: str) -> Optional[str]:
+    """The family of a row of these machines (furnace_column, machine_row ...), None for other entities."""
+    from factoriollm.game_data import entity
+    categories = set(entity(name).get("crafting_categories") or ())
+    return next((family for category, family in FAMILY_OF_CATEGORY if category in categories), None)
+
+
+def segment_slots(template: Template) -> Dict[str, Any]:
+    """
+    Roles of the entities of one segment, read off the flow simulator's layout of a build of three
+    segments (the middle one is fed and continued as in a row; a cell is judged whole): the
+    machines; for each inserter of a machine whether it feeds it from a belt, takes its products
+    onto a belt or hands them straight to the next machine (direct), on which side of the machine
+    and with what reach (1 or 2 tiles); the belt lanes a machine can be fed from (not carrying
+    products); the fluid connections; the poles. Entities are segment indices. The cross-section
+    uses the notation of the research note: in[A1,A2] out[B1] = belts on side A at reach 1 and 2
+    feed the machines, products go onto a belt on side B (A: the side most inputs come from).
+    """
+    from factoriollm.flow_sim import BELT_LIKE, Layout, _reach_all, _vec
+
+    form = bool(template.head or template.repeats > 1 or template.tail)
+    shift = template.period if form else 0
+    n = 3 if form else 1
+    build = template.build(n)
+    placed = template._place(template._tiered_parts(template.belt), n)  # build() moves the design to the origin
+    dx = min(e.x for e in build.entities) - min(e.x for e in placed)
+    dy = min(e.y for e in build.entities) - min(e.y for e in placed)
+    L = Layout(build)
+    at = {(e.x, e.y): j for j, e in enumerate(L.ents)}
+    seg = {at[(e.x + shift + dx, e.y + dy)]: k for k, e in enumerate(template.segment) if (e.x + shift + dx, e.y + dy) in at}
+    machines = [j for j in seg if L.types[j] in ("assembling-machine", "furnace")]
+    dropped = {dst[1] for _, dst in L.links if dst[0] == "lane"} | {ref for _, (kind, ref) in L.drills if kind == "lane"}
+    products = _reach_all(L, dropped)
+
+    def side(j: int, belt: int) -> int:
+        """-1 / +1: which side of machine j the belt runs on (across the belt's direction)."""
+        horizontal = _vec(L.ents[belt].direction)[0] != 0
+        (mx, my), (bx, by) = _center(L.ents[j]), _center(L.ents[belt])
+        return (1 if (by if horizontal else bx) > (my if horizontal else mx) else -1)
+
+    hands = []
+    for idx, (src, dst) in enumerate(L.links):
+        k = L.inserters[idx]
+        if k not in seg:
+            continue
+        vec = (_prototype(L.ents[k].name) or {}).get("pickup_position") or (0, 0)
+        reach = round(math.hypot(float(vec[0]), float(vec[1])))
+        if src[0] == "belt" and dst[0] == "entity" and dst[1] in machines:
+            lanes = [lane for lane in L.pick_lanes[idx] if lane not in products]
+            hands.append({"inserter": seg[k], "machine": dst[1], "role": "in", "side": side(dst[1], src[1]),
+                          "reach": reach, "lanes": lanes})
+        elif src[0] == "entity" and src[1] in machines and dst[0] == "lane":
+            hands.append({"inserter": seg[k], "machine": src[1], "role": "out", "side": side(src[1], dst[1][0]),
+                          "reach": reach, "lanes": [dst[1]]})
+        elif src[0] == "entity" and src[1] in machines and dst[0] == "entity" and dst[1] in machines:
+            hands.append({"inserter": seg[k], "machine": src[1], "role": "direct", "side": 0, "reach": reach, "lanes": []})
+    sides = Counter(h["side"] for h in hands if h["role"] == "in")
+    a = sides.most_common(1)[0][0] if sides else -1
+    name = {a: "A", -a: "B", 0: ""}
+
+    def topology(j: int) -> str:
+        mine = [h for h in hands if h["machine"] == j]
+        ins = sorted({f"{name[h['side']]}{h['reach']}" for h in mine if h["role"] == "in"})
+        outs = sorted({f"{name[h['side']]}{h['reach']}" for h in mine if h["role"] == "out"})
+        direct = ["direct"] if any(h["role"] == "direct" for h in mine) else []
+        return f"in[{','.join(ins)}] out[{','.join(outs + direct)}]"
+
+    inputs = {j: {lane for h in hands if h["machine"] == j and h["role"] == "in" for lane in h["lanes"]} for j in machines}
+    linked = Counter(L.network)
+    opened = {L.network[b] for b, _, _ in L.open_ends}
+
+    def fluid_nets(j: int, production: str) -> int:
+        nets = {L.network[b] for b, (m, _, ptype, _) in enumerate(L.boxes) if m == j and ptype in (production, "input-output")}
+        return sum(1 for n in nets if linked[n] > 1 or n in opened)
+
+    tops = Counter(topology(j) for j in machines)
+    return {
+        "machines": sorted(seg[j] for j in machines),
+        "topology": tops.most_common(1)[0][0] if tops else None,
+        "max_item_inputs": min((len(v) for v in inputs.values()), default=0),
+        "max_fluid_in": min((fluid_nets(j, "input") for j in machines), default=0),
+        "max_fluid_out": min((fluid_nets(j, "output") for j in machines), default=0),
+        "inserters": [{**h, "machine": seg[h["machine"]], "side": name[h["side"]],
+                       "lanes": [[L.ents[i].x - shift - dx, L.ents[i].y - dy, lane] for i, lane in h["lanes"]]} for h in hands],
+        "poles": sorted(seg[j] for j in seg if L.types[j] == "electric-pole"),
+        "belts": sorted(seg[j] for j in seg if L.types[j] in BELT_LIKE),
+    }
+
+
 def metrics(template: Template) -> Dict[str, Any]:
     """
     Per-segment machine counts, size, density (tiles per production machine; beacons are counted

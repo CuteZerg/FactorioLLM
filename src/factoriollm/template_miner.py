@@ -49,12 +49,14 @@ from factoriollm.templates import (
     extract,
     extract_cell,
     has_weaving,
+    machine_family,
     main_belt,
     metrics,
     normalize_modules,
     prepare,
     strip_unused,
     repair_power,
+    segment_slots,
     signature,
     tiling_check,
 )
@@ -214,6 +216,23 @@ def main_machine(t: Template) -> str:
     family = FAMILIES.get(t.category, set(ASSEMBLERS))
     own = {k: v for k, v in machines.items() if k in family} or machines
     return max(own, key=own.get) if own else "-"
+
+
+def passport_slots(t: Template) -> Dict[str, Any]:
+    """
+    The generic-row part of the passport: the family of the main machine and, read off the segment's
+    roles (segment_slots), its cross-section and how many solid inputs and fluids a machine can get.
+    Empty for designs of other machines (power, mining, labs, defence).
+    """
+    family = machine_family(main_machine(t))
+    if family is None:
+        return {}
+    try:
+        slots = segment_slots(t)
+    except (BlueprintIRError, ValueError) as e:  # a build the miner already accepted; report, do not hide
+        print(f"    [!] slots of {t.category}: {(t.source.get('label') or '')[:40]}: {type(e).__name__}: {e}")
+        return {"family": family}
+    return {"family": family, **{k: slots[k] for k in ("topology", "max_item_inputs", "max_fluid_in", "max_fluid_out")}}
 
 
 def _belts_along_x(t: Template) -> int:
@@ -808,6 +827,7 @@ def _mine_row(job: Tuple[Dict[str, Any], Optional[set]]) -> Tuple[Counter, list,
         if category == "multi":
             template.metrics["products"] = products(ir)
         template.metrics["traits"] = traits(template)
+        template.metrics.update(passport_slots(template))
         found.append((category, template))
     return stats, rejects.items, found
 

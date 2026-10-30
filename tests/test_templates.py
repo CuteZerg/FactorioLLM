@@ -16,6 +16,7 @@ from factoriollm.templates import (
     prune_poles,
     repair_power,
     retier,
+    segment_slots,
     tiling_check,
     underground_pairs,
 )
@@ -322,6 +323,36 @@ class TestSelfContained(unittest.TestCase):
         ir = IRBlueprint([IREntity(n, x, y, d, tuple(sorted(ex.items()))) for n, x, y, d, ex in data["entities"]])
         labels = [e.extras_dict["signals"] for e in add_port_labels(ir).entities if e.name == "constant-combinator"]
         self.assertEqual([s for s in labels if s.startswith("item:")], ["item:coal=1"])
+
+
+class SegmentSlotsTest(unittest.TestCase):
+    """Roles of a segment from the flow simulator (step 2b)."""
+
+    def row(self, far: bool) -> Template:
+        # one machine per 3 tiles: fed from a belt north of it (near, or far behind a near one with a
+        # long-handed inserter), products onto a belt south of it
+        machine = IREntity("assembling-machine-2", 0, 2, 0, (("recipe", "iron-gear-wheel"),))
+        feed = [IREntity("long-handed-inserter" if far else "inserter", 1, 1, 0)]
+        belts = [IREntity("transport-belt", x, -1 if far else 0, 4) for x in range(3)]
+        if far:
+            belts += [IREntity("transport-belt", x, 0, 4) for x in range(3)]
+        out = [IREntity("inserter", 1, 5, 0)] + [IREntity("transport-belt", x, 6, 4) for x in range(3)]
+        return Template("assembly_1in", 3, [], [machine] + feed + belts + out, [], 3, (3, 8))
+
+    def test_near_and_far_inputs(self):
+        near = segment_slots(self.row(far=False))
+        self.assertEqual(near["topology"], "in[A1] out[B1]")
+        self.assertEqual(near["max_item_inputs"], 2)  # both lanes of the input belt
+        self.assertEqual(near["machines"], [0])
+        far = segment_slots(self.row(far=True))
+        self.assertEqual(far["topology"], "in[A2] out[B1]")
+        self.assertEqual((far["max_fluid_in"], far["max_fluid_out"]), (0, 0))
+
+    def test_family_from_crafting_categories(self):
+        from factoriollm.templates import machine_family
+        self.assertEqual([machine_family(n) for n in ("assembling-machine-2", "chemical-plant", "oil-refinery", "steel-furnace", "centrifuge", "lab")],
+                         ["machine_row", "chem_row", "refinery_block", "furnace_column", "centrifuge_row", None])
+
 
 
 if __name__ == "__main__":
