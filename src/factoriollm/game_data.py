@@ -45,6 +45,7 @@ class Recipe:
     # fluid -> 1-based index among the machine's input / output fluid boxes, where the recipe says so
     box_in: Dict[str, int] = field(default_factory=dict)
     box_out: Dict[str, int] = field(default_factory=dict)
+    productivity: bool = False  # productivity modules allowed (intermediates)
 
 
 @lru_cache(maxsize=None)
@@ -56,7 +57,8 @@ def recipe(name: str) -> Optional[Recipe]:
     boxes = data.get("fluid_boxes") or {}
     return Recipe(name=name, ingredients=dict(data["ingredients"]), results=dict(data["results"]),
                   fluids=frozenset(data["fluids"]), time=float(data["time"]), category=data["category"],
-                  box_in=dict(boxes.get("in") or {}), box_out=dict(boxes.get("out") or {}))
+                  box_in=dict(boxes.get("in") or {}), box_out=dict(boxes.get("out") or {}),
+                  productivity=bool(data.get("productivity")))
 
 
 @lru_cache(maxsize=None)

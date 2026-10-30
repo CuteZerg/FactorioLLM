@@ -279,6 +279,8 @@ def recipe_record(proto: Dict[str, Any]) -> Optional[Dict[str, Any]]:
              for side, key in (("in", "ingredients"), ("out", "results"))}
     if boxes["in"] or boxes["out"]:
         record["fluid_boxes"] = boxes
+    if proto.get("allow_productivity"):  # productivity modules may go into its machines (intermediates)
+        record["productivity"] = True
     return record
 
 
