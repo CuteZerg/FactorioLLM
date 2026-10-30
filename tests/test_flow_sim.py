@@ -243,6 +243,17 @@ class TemplateFeedTest(unittest.TestCase):
         self.assertTrue(r.ok, r.problems)
         self.assertIn(frozenset({"iron-gear-wheel", "pipe"}), set(r.lanes.values()))
 
+    def test_a_bare_fluid_box_is_no_template_input(self):
+        # a template's fluid comes in through a pipe: the bare box of a lone machine is no input
+        from factoriollm.flow_sim import _fluid_domains
+        plant = E("chemical-plant", 0, 0, 0, recipe="lubricant")
+        bare = Layout(IRBlueprint([plant]), outside_only=True)
+        self.assertEqual(_fluid_domains(bare), {})
+        self.assertTrue(_fluid_domains(Layout(IRBlueprint([plant]))))  # an author's design may be fed so
+        box_tile = next(tile for b, tile, _ in bare.open_ends if bare.boxes[b][2] == "input")
+        piped = Layout(IRBlueprint([plant, E("pipe", *box_tile)]), outside_only=True)
+        self.assertEqual([v[0] for v in _fluid_domains(piped).values()], ["heavy-oil"])
+
     def test_a_walled_belt_start_is_no_template_input(self):
         # walls behind the belt start and beside both its lanes: nothing can be brought to it
         walls = [E("stone-wall", -1, 0), E("stone-wall", 0, -1), E("stone-wall", 0, 1)]
