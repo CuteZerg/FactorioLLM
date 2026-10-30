@@ -236,6 +236,14 @@ class DockingCellTest(unittest.TestCase):
         author = Counter(base(n) for n, *_ in data["entities"])
         for belt in ("splitter", "transport-belt", "underground-belt"):
             self.assertEqual(names[belt], author[belt], belt)
+        # closed at the ends (checked in game 30.10: the first copy dropped circuits onto the missing
+        # neighbour's collecting belt): the head continues the output line, every copy works
+        from factoriollm.template_miner import run_flow
+        self.assertTrue(t.head)
+        flow, _ = run_flow(t.build(3), share_lanes=False)
+        self.assertTrue(flow.ok, flow.problems[:3])
+        outputs = [p for p in flow.ports if p.role == "output" and "electronic-circuit" in p.items]
+        self.assertEqual(len({p.tile for p in outputs}), 2)  # the two output belts end at the head only
 
 
 class AmbiguousRetryTest(unittest.TestCase):

@@ -230,6 +230,71 @@ def _docking_cell(ir: IRBlueprint, category: str, step: Tuple[int, int]) -> Temp
     return template
 
 
+ROW_COPIES = 3  # copies of a docking cell built to find what closes the row
+
+
+def close_row(template: Template, smelt: str) -> Optional[Template]:
+    """
+    A cell made to dock with its copies, closed at both ends so that a row of copies works on its
+    own: the first copy hands to / takes from the copy before it, the last one the copy after it
+    (green circuits dropped onto the neighbour's collecting belt, processing units put onto the belt
+    pair the next copy's machines take from). From the neighbour on each side the row keeps what the
+    end copy works with: the belts its inserters drop onto and where they lead, the belts it picks
+    from and what feeds them, the neighbour's inserters serving an end copy's machine; then the
+    neighbour's poles that are still needed (prune_poles). Returns head + segment + tail, or None if
+    the closed row does not work (every copy judged, one item per lane).
+    """
+    from factoriollm.flow_sim import BELT_LIKE, _reach_all
+    from factoriollm.templates import prune_poles
+
+    p, seg = template.period, template.segment
+
+    def shift(ents: List[IREntity], dx: int) -> List[IREntity]:
+        return [IREntity(e.name, e.x + dx, e.y, e.direction, e.extras) for e in ents]
+
+    def pool(ents: List[IREntity]) -> List[IREntity]:
+        return [e for e in ents if entity_type(e.name) in BELT_LIKE | {"inserter", "electric-pole"}]
+
+    body = [e for k in range(ROW_COPIES) for e in shift(seg, k * p)]
+    head, tail = pool(shift(seg, -p)), pool(shift(seg, ROW_COPIES * p))  # tail in row coordinates
+    caps = set(head) | set(tail)
+    L = Layout(IRBlueprint(list(dict.fromkeys(head + body + tail))))
+    keep: set = set()
+    down: List[Any] = []
+    up: List[Any] = []
+    for idx, (src, dst) in enumerate(L.links):
+        hand = L.ents[L.inserters[idx]]
+        if hand in caps:  # the neighbour's inserter: kept if it serves a machine of the row
+            if not any(end[0] == "entity" and L.ents[end[1]] not in caps for end in (src, dst)):
+                continue
+            keep.add(hand)
+        if src[0] == "belt" and L.ents[src[1]] in caps:
+            up += L.pick_lanes[idx]
+        if dst[0] == "lane" and L.ents[dst[1][0]] in caps:
+            down.append(dst[1])
+    # a line of products running from the row on into the neighbour (the output line through every
+    # copy) goes on as it would; a line of inputs simply starts at the first copy
+    dropped = {dst[1] for _, dst in L.links if dst[0] == "lane"}
+    for k in _reach_all(L, dropped):
+        if L.ents[k[0]] not in caps:
+            down += [d for d, _ in L.edges[k] if L.ents[d[0]] in caps]
+    reached = set(L.upstream(up))
+    stack = list(down)
+    while stack:
+        k = stack.pop()
+        if k not in reached:
+            reached.add(k)
+            stack += [d for d, _ in L.edges[k]]
+    keep |= {L.ents[k[0]] for k in reached if L.ents[k[0]] in caps}
+    keep |= {e for e in caps if entity_type(e.name) == "electric-pole"}
+    head, tail = [e for e in head if e in keep], [e for e in tail if e in keep]
+    powered = set(prune_poles(list(dict.fromkeys(head + body + tail))))
+    head, tail = [e for e in head if e in powered], [e for e in tail if e in powered]
+    closed = replace(template, head=head, tail=shift(tail, -(ROW_COPIES - 1) * p), repeats=1)
+    flow, _ = run_flow(closed.build(ROW_COPIES), first=smelt, share_lanes=False)
+    return closed if flow.ok else None
+
+
 def mine_one(ir: IRBlueprint, category: str) -> Optional[Template]:
     """
     Best template of one blueprint: an inner repeat if there is one; otherwise the whole blueprint
@@ -955,10 +1020,17 @@ def _mine_design(ir: IRBlueprint, category: str, name: str, stats: Counter, reje
     if template is None:
         stats["no_template"] += 1
         return None
+    docked = bool(dock)
+    if dock:  # closed at both ends, a row of copies works on its own: a segment template from here on
+        template = close_row(template, smelt)
+        if template is None:
+            stats["row_ends_not_closed"] += 1
+            return None
+        dock = None
     template.belt = main_belt(template.head + template.segment + template.tail)
     try:
-        check = tiling_check(template, docks=bool(dock))
-        if not check["ok"] and check["power_only"] and not dock:
+        check = tiling_check(template)
+        if not check["ok"] and check["power_only"]:
             repaired = repair_power(template)
             repaired_check = tiling_check(repaired) if repaired is not None else None
             if repaired_check and repaired_check["ok"]:
@@ -982,21 +1054,13 @@ def _mine_design(ir: IRBlueprint, category: str, name: str, stats: Counter, reje
         stats["defense_not_a_straight_wall"] += 1  # an outpost, a ring or a perimeter, not a piece of wall to repeat
         return None
     build_flow = None
-    if dock:  # a docking cell works in a row of copies: judge the middle one of three
-        build = template.build(1)
-        docked = middle_flow(build, (template.period, 0), None, smelt, share_lanes=False)
-        build_flow, smelt = docked if docked else (FlowResult([], {}, {}, frozenset(), [], status="collide"), smelt)
-        if not build_flow.ok:
-            why = build_reason(build, build_flow, smelt, (template.period, 0))
-            rejects.add(f"template: {why}", name, template.build(3), build_flow)
-            return None
-    for n in () if dock else (1, 2) if segment else (1,):
+    for n in (1, 2) if segment else (1,):
         build = template.build(n)
         build_flow, smelt = run_flow(build, first=smelt, share_lanes=False)  # plainly fed, see run_flow
         if not build_flow.ok:
             rejects.add(f"template: {build_reason(build, build_flow, smelt)}", name, build, build_flow)
             return None
-    template.metrics = {"source_warnings": check["source_warnings"], "smelt": smelt, "docks": bool(dock)}
+    template.metrics = {"source_warnings": check["source_warnings"], "smelt": smelt, "docks": docked}
     if category.startswith("smelting_"):
         template.metrics["input"] = furnace_input(build_flow)
     return template
