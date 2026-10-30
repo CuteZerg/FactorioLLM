@@ -49,6 +49,7 @@ Tile = Tuple[int, int]
 Lane = Tuple[int, int]  # (entity index, 0 = left / 1 = right)
 
 BELT_LIKE = frozenset({"transport-belt", "underground-belt", "splitter"})
+PIPE_ENTITY_TYPES = frozenset({"pipe", "pipe-to-ground", "storage-tank", "pump"})  # what carries fluid between machines
 ANY = None  # "accepts any item" (chests, belts, the ground)
 # Burner entities that are no machine of a design (they burn fuel to move, not to make anything)
 NOT_MACHINES = frozenset({"inserter", "car", "locomotive", "spider-vehicle"})
@@ -1186,10 +1187,17 @@ def _fluid_domains(L: Layout) -> Dict[Tuple[Any, ...], List[Optional[str]]]:
                 for up in [n for n in set(L.network) if net in L.downstream_nets(n)]:
                     for f in _choices(fluid):
                         wanted.setdefault(up, {})[f] = wanted.setdefault(up, {}).get(f, 0) + 1
+    # a template's fluid comes in through a network (Layout.outside_only): pipes, or boxes joining
+    # machines (boilers pass water on); the bare box of a single machine is no input, else every machine
+    # of a row would be piped one by one (a spare box the recipe does not need)
+    owners: Dict[int, Set[int]] = {}
+    for b, (j, _, _, _) in enumerate(L.boxes):
+        owners.setdefault(L.network[b], set()).add(j)
+    piped = {net for net, js in owners.items() if len(js) > 1 or any(L.types[j] in PIPE_ENTITY_TYPES for j in js)}
     out: Dict[Tuple[Any, ...], List[Optional[str]]] = {}
     for b, _, _ in L.open_ends:
         net = L.network[b]
-        if net in produced or net not in wanted or ("fluid", net) in out:
+        if net in produced or net not in wanted or ("fluid", net) in out or (L.outside_only and net not in piped):
             continue
         out[("fluid", net)] = sorted(wanted[net], key=lambda f: (-wanted[net][f], f)) + [None]
     return out

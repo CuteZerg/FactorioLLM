@@ -122,6 +122,55 @@ def with_recipe(t: Template, name: str, machine: Optional[str] = None) -> Templa
                    metrics={**t.metrics, "recipe": name, "machine": target})
 
 
+def drop_spare_pipes(t: Template, smelt: str) -> Template:
+    """
+    The template without the pipe networks its new recipe does not need: a row built for two input
+    fluids (sulfur: water and petroleum gas) fed one (solid fuel from heavy oil) would carry the same
+    fluid in two networks to every machine, where one straight pipe does (in-game review of 30.10).
+    Each fed input network is taken out in turn (its pipes and pipes-to-ground) and stays out if the
+    row still works with one item per lane; the validator check of the caller follows.
+    """
+    from factoriollm.flow_sim import Layout
+    from factoriollm.template_miner import run_flow
+    from factoriollm.templates import PIPE_TYPES
+
+    form = segment_form(t)
+    n = 2 if form else 1
+    while True:
+        build = t.build(n)
+        flow, _ = run_flow(build, first=smelt, share_lanes=False)
+        fed = sorted({k[1] for k, v in flow.inputs.items() if k[0] == "fluid" and v})
+        if not flow.ok or len(fed) < 2:
+            return t
+        L = Layout(build)
+        parts = t._tiered_parts(t.belt)
+        placed = t._place(parts, n)
+        dx = min(e.x for e in build.entities) - min(e.x for e in placed)
+        dy = min(e.y for e in build.entities) - min(e.y for e in placed)
+        where: Dict[Tuple[int, int], Tuple[str, int]] = {}  # build tile -> (part, index) of the template
+        for part, shift in (("head", [0]), ("segment", [k * t.period for k in range(n)]),
+                            ("tail", [(n - t.repeats) * t.period])):
+            for i, e in enumerate(parts[part]):
+                for s in shift:
+                    where[(e.x + s + dx, e.y + dy)] = (part, i)
+        for net in fed:
+            pipes = {where[(L.ents[j].x, L.ents[j].y)] for j in {b[0] for b in L.boxes}
+                     if L.types[j] in PIPE_TYPES and (L.ents[j].x, L.ents[j].y) in where
+                     and all(L.network[b] == net for b, box in enumerate(L.boxes) if box[0] == j)}
+            if not pipes:
+                continue
+            thinner = replace(t, **{part: [e for i, e in enumerate(getattr(t, part)) if (part, i) not in pipes]
+                                    for part in ("head", "segment", "tail")})
+            flows = [run_flow(thinner.build(k), first=smelt, share_lanes=False)[0] for k in range(1, n + 1)]
+            # fewer networks to feed, not a box of every machine left open to be piped one by one
+            fewer = len({k[1] for k, v in flows[-1].inputs.items() if k[0] == "fluid" and v}) < len(fed)
+            if all(f.ok for f in flows) and fewer:
+                t = thinner
+                break
+        else:
+            return t
+
+
 def bare(t: Template, smelt: str = "iron-ore") -> Template:
     """
     The template with our own ends instead of the author's head and tail: the segments' belts simply
@@ -165,6 +214,7 @@ def instantiate(t: Template, name: str, segments: int = 2, machine: Optional[str
     tries.append(("author", generic))
     reasons = []
     for ends, candidate in tries:
+        candidate = drop_spare_pipes(candidate, smelt)
         # our own ends start and end the belts where the author's head and tail took them on
         candidate, why, used = _verify(candidate, smelt, allowed | OWN_ENDS_WARNINGS if ends == "own" else allowed,
                                        repair=ends == "own")
