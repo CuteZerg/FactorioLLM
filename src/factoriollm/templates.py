@@ -581,9 +581,12 @@ def segment_slots(template: Template) -> Dict[str, Any]:
     machines; for each inserter of a machine whether it feeds it from a belt, takes its products
     onto a belt or hands them straight to the next machine (direct), on which side of the machine
     and with what reach (1 or 2 tiles); the belt lanes a machine can be fed from (not carrying
-    products); the fluid connections; the poles. Entities are segment indices. The cross-section
-    uses the notation of the research note: in[A1,A2] out[B1] = belts on side A at reach 1 and 2
-    feed the machines, products go onto a belt on side B (A: the side most inputs come from).
+    products); the fluid connections; the poles. Entities are segment indices (an inserter of a
+    neighbouring copy that serves a machine of the segment counts too). The cross-section uses the
+    notation of the research note: in[A1,A2] out[B1] = belts on side A at reach 1 and 2 feed the
+    machines, products go onto a belt on side B (A: the side most inputs come from); "direct" =
+    straight from / into a neighbouring machine. Cross-section and capacities are those of the
+    machines of the row's main (most common) recipe: a science block also makes its gears.
     """
     from factoriollm.flow_sim import BELT_LIKE, Layout, _reach_all, _vec
 
@@ -607,22 +610,26 @@ def segment_slots(template: Template) -> Dict[str, Any]:
         (mx, my), (bx, by) = _center(L.ents[j]), _center(L.ents[belt])
         return (1 if (by if horizontal else bx) > (my if horizontal else mx) else -1)
 
+    # an inserter serving a machine of the middle segment may belong to a neighbouring copy (or the head)
+    copy_of = {at[(e.x + k * template.period + dx, e.y + dy)]: i for k in range(n) for i, e in enumerate(template.segment)
+               if (e.x + k * template.period + dx, e.y + dy) in at}
+    is_machine = {j for j, t in enumerate(L.types) if t in ("assembling-machine", "furnace")}
     hands = []
     for idx, (src, dst) in enumerate(L.links):
         k = L.inserters[idx]
-        if k not in seg:
-            continue
         vec = (_prototype(L.ents[k].name) or {}).get("pickup_position") or (0, 0)
         reach = round(math.hypot(float(vec[0]), float(vec[1])))
+        hand = {"inserter": copy_of.get(k), "reach": reach}
         if src[0] == "belt" and dst[0] == "entity" and dst[1] in machines:
             lanes = [lane for lane in L.pick_lanes[idx] if lane not in products]
-            hands.append({"inserter": seg[k], "machine": dst[1], "role": "in", "side": side(dst[1], src[1]),
-                          "reach": reach, "lanes": lanes})
+            hands.append({**hand, "machine": dst[1], "role": "in", "side": side(dst[1], src[1]), "lanes": lanes})
         elif src[0] == "entity" and src[1] in machines and dst[0] == "lane":
-            hands.append({"inserter": seg[k], "machine": src[1], "role": "out", "side": side(src[1], dst[1][0]),
-                          "reach": reach, "lanes": [dst[1]]})
-        elif src[0] == "entity" and src[1] in machines and dst[0] == "entity" and dst[1] in machines:
-            hands.append({"inserter": seg[k], "machine": src[1], "role": "direct", "side": 0, "reach": reach, "lanes": []})
+            hands.append({**hand, "machine": src[1], "role": "out", "side": side(src[1], dst[1][0]), "lanes": [dst[1]]})
+        elif src[0] == "entity" and dst[0] == "entity" and src[1] in is_machine and dst[1] in is_machine:
+            if src[1] in machines:  # straight into the next machine (cable into the circuit machine)
+                hands.append({**hand, "machine": src[1], "role": "direct", "side": 0, "lanes": []})
+            if dst[1] in machines:
+                hands.append({**hand, "machine": dst[1], "role": "direct_in", "side": 0, "lanes": []})
     sides = Counter(h["side"] for h in hands if h["role"] == "in")
     a = sides.most_common(1)[0][0] if sides else -1
     name = {a: "A", -a: "B", 0: ""}
@@ -631,10 +638,15 @@ def segment_slots(template: Template) -> Dict[str, Any]:
         mine = [h for h in hands if h["machine"] == j]
         ins = sorted({f"{name[h['side']]}{h['reach']}" for h in mine if h["role"] == "in"})
         outs = sorted({f"{name[h['side']]}{h['reach']}" for h in mine if h["role"] == "out"})
+        direct_in = ["direct"] if any(h["role"] == "direct_in" for h in mine) else []
         direct = ["direct"] if any(h["role"] == "direct" for h in mine) else []
-        return f"in[{','.join(ins)}] out[{','.join(outs + direct)}]"
+        return f"in[{','.join(ins + direct_in)}] out[{','.join(outs + direct)}]"
 
-    inputs = {j: {lane for h in hands if h["machine"] == j and h["role"] == "in" for lane in h["lanes"]} for j in machines}
+    # the row's own machines: those of its most common recipe (a science block also makes its gears)
+    recipes = Counter(L.ents[j].extras_dict.get("recipe") for j in machines)
+    top = recipes.most_common(1)[0][0] if recipes else None
+    main = [j for j in machines if L.ents[j].extras_dict.get("recipe") == top]
+    inputs = {j: {lane for h in hands if h["machine"] == j and h["role"] == "in" for lane in h["lanes"]} for j in main}
     linked = Counter(L.network)
     opened = {L.network[b] for b, _, _ in L.open_ends}
 
@@ -642,13 +654,17 @@ def segment_slots(template: Template) -> Dict[str, Any]:
         nets = {L.network[b] for b, (m, _, ptype, _) in enumerate(L.boxes) if m == j and ptype in (production, "input-output")}
         return sum(1 for n in nets if linked[n] > 1 or n in opened)
 
-    tops = Counter(topology(j) for j in machines)
+    tops = Counter(topology(j) for j in main)
     return {
         "machines": sorted(seg[j] for j in machines),
+        "main_recipe": top,
         "topology": tops.most_common(1)[0][0] if tops else None,
-        "max_item_inputs": min((len(v) for v in inputs.values()), default=0),
-        "max_fluid_in": min((fluid_nets(j, "input") for j in machines), default=0),
-        "max_fluid_out": min((fluid_nets(j, "output") for j in machines), default=0),
+        # the typical machine of the row: one odd machine (an author's inserter picking off the output
+        # belt) does not set the row's capacity
+        "max_item_inputs": max(Counter(len(v) for v in inputs.values()).most_common(),
+                               key=lambda kv: (kv[1], kv[0]), default=(0, 0))[0],
+        "max_fluid_in": min((fluid_nets(j, "input") for j in main), default=0),
+        "max_fluid_out": min((fluid_nets(j, "output") for j in main), default=0),
         "inserters": [{**h, "machine": seg[h["machine"]], "side": name[h["side"]],
                        "lanes": [[L.ents[i].x - shift - dx, L.ents[i].y - dy, lane] for i, lane in h["lanes"]]} for h in hands],
         "poles": sorted(seg[j] for j in seg if L.types[j] == "electric-pole"),
