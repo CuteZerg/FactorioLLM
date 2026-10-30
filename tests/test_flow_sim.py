@@ -234,14 +234,14 @@ class TemplateFeedTest(unittest.TestCase):
         self.assertTrue(r.ok, r.problems)
         self.assertTrue(all(len(items) <= 1 for items in r.lanes.values()), r.inputs)
 
-    def test_mixed_products_may_leave_together(self):
-        # gears and pipes dropped onto the same lane of the output belt: sorted further on, no jam
+    def test_mixed_products_may_not_leave_together(self):
+        # gears and pipes dropped onto the same lane of the output belt: the player would have to sort
+        # them (in-game review of 30.10), a template hands over one item per lane
         ir = IRBlueprint(belts(0, 6, 0) + [E("inserter", 1, 1, 0), E("assembling-machine-1", 0, 2, recipe="iron-gear-wheel"),
                                             E("inserter", 4, 1, 0), E("assembling-machine-1", 3, 2, recipe="pipe"),
                                             E("inserter", 1, 5, 0), E("inserter", 4, 5, 0)] + belts(0, 6, 6))
-        r = solve(ir, share_lanes=False)
-        self.assertTrue(r.ok, r.problems)
-        self.assertIn(frozenset({"iron-gear-wheel", "pipe"}), set(r.lanes.values()))
+        self.assertIn("lane_mixed", {p.kind for p in solve(ir, share_lanes=False).problems})
+        self.assertTrue(solve(ir).ok)  # as the game would run it: the line works, mixed
 
     def test_a_bare_fluid_box_is_no_template_input(self):
         # a template's fluid comes in through a pipe: the bare box of a lone machine is no input

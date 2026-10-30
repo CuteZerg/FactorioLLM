@@ -305,11 +305,12 @@ class TestSelfContained(unittest.TestCase):
         self.assertIn(loader, kept)
 
     def test_spare_semi_finished_goods_get_no_label(self):
-        # gears are made for the belt machine; the gears it leaves on the output belt are no product
-        ir = IRBlueprint([IREntity("transport-belt", x, y, 4) for x in range(8) for y in (0, 6)] + [
+        # gears are made for the belt machine; the gears it leaves on the output belt are no product.
+        # The belt machine stands below the output belt: belts and spare gears leave on lanes of their own
+        ir = IRBlueprint([IREntity("transport-belt", x, y, 4) for x in range(8) for y in (0, 6, 12)] + [
             IREntity("inserter", 1, 1, 0), IREntity("assembling-machine-2", 0, 2, 0, (("recipe", "iron-gear-wheel"),)),
-            IREntity("inserter", 1, 5, 0), IREntity("inserter", 5, 1, 0), IREntity("inserter", 4, 5, 8),
-            IREntity("assembling-machine-2", 4, 2, 0, (("recipe", "transport-belt"),)), IREntity("inserter", 6, 5, 0)])
+            IREntity("inserter", 1, 5, 0), IREntity("inserter", 5, 7, 0), IREntity("inserter", 4, 7, 8),
+            IREntity("assembling-machine-2", 4, 8, 0, (("recipe", "transport-belt"),)), IREntity("inserter", 5, 11, 8)])
         labels = [e.extras_dict["signals"] for e in add_port_labels(ir).entities if e.name == "constant-combinator"]
         self.assertTrue(any("item:transport-belt" in s for s in labels), labels)
         self.assertFalse(any("iron-gear-wheel" in s for s in labels), labels)

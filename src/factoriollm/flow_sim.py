@@ -801,13 +801,12 @@ def check(ir: IRBlueprint, inputs: Dict[Any, Optional[str]], layout: Optional[La
 
 def mixed_lane_keys(L: Layout, result: FlowResult) -> Set[Lane]:
     """
-    Lanes that carry two items where it can jam: anywhere, except products alone on their way out
-    of the design (uranium-235 and -238 from the centrifuges, modules of two tiers): a mixed
-    output is sorted further on, as players do (the user's rule, 29.10).
+    Lanes that carry two items, anywhere: on the way in, inside, and on the way out too. Products
+    leaving mixed would have to be sorted by the player (the in-game review of 30.10: rocket fuel
+    and spare solid fuel on both lanes); a template hands over one item per lane, and a sorter at
+    the output is the job of the code that builds the whole design (step 3).
     """
-    inputs = {x for x in result.inputs.values() if x}
-    leads_out = L.upstream({(p.entity, p.lane) for p in result.ports if p.kind == "lane" and p.role == "output"})
-    return {k for k, items in result.lanes.items() if len(items) > 1 and (items & inputs or k not in leads_out)}
+    return {k for k, items in result.lanes.items() if len(items) > 1}
 
 
 def mixed_lanes(L: Layout, result: FlowResult) -> List[Problem]:

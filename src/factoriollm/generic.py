@@ -347,6 +347,40 @@ def shaped_like(t: Template, limit: int = 4) -> List[str]:
     return [name for *_, name in sorted(picks)[:limit]]
 
 
+def _shape(name: Optional[str]) -> Tuple[int, int, int]:
+    """(solid ingredients, fluid ingredients, fluid products) of a recipe; a furnace's smelting is (1, 0, 0)."""
+    r = recipe(name) if name else None
+    if r is None:
+        return (1, 0, 0)
+    return (sum(i not in r.fluids for i in r.ingredients), sum(i in r.fluids for i in r.ingredients),
+            sum(i in r.fluids for i in r.results))
+
+
+def rank_templates(name: str, catalog: Dict[str, List[Template]]) -> List[Tuple[Template, str]]:
+    """
+    Row templates that take recipe `name`, best first: those the author built for a recipe of the
+    same shape (a fluid-only recipe in a row of chemical plants fed by pipes alone, not in one with
+    input belts for solids it would not use), then the dense ones (fewer tiles per machine: a row
+    with gaps is a choice, not the default), then the popular ones. Only with_recipe is checked
+    here; instantiate verifies the chosen one. Pairs (template, why it ranks so).
+    """
+    from factoriollm.template_miner import score
+
+    target = _shape(name)
+    out = []
+    for cat, i, t in rows(catalog):
+        try:
+            with_recipe(t, name)
+        except Incompatible:
+            continue
+        own = row_machines(t)[1] or recipe_of_smelt(t)
+        distance = sum(abs(a - b) for a, b in zip(_shape(own), target))
+        density = t.metrics.get("tiles_per_machine") or 50
+        out.append(((distance, density, -score(t)), t, f"shape {_shape(own)} vs {target}, {density} tiles per machine, "
+                    f"{cat} {(t.source.get('label') or t.source.get('title') or '')[:30]}"))
+    return [(t, why) for _, t, why in sorted(out, key=lambda x: x[0])]
+
+
 # --- The template x recipe check (step 2b.5) --------------------------------------------------------
 
 REPORT = "outputs/templates/generic.md"
