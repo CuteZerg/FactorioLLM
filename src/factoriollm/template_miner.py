@@ -930,7 +930,11 @@ def _mine_design(ir: IRBlueprint, category: str, name: str, stats: Counter, reje
         return None
 
     cut, cut_flow = full, source_flow
-    for step_no, (margin, taps) in enumerate(CROP_STEPS):
+    # a design made to dock with its copies is the tile itself: what lies at its edges joins the copies
+    # (the output line running through every copy, the bus taps, the belt pair the next copy's machines
+    # take from), and a cut there still passes the docked verdict, which treats a cut line as a new
+    # input or output
+    for step_no, (margin, taps) in enumerate(CROP_STEPS if not dock else CROP_STEPS[-1:], 0 if not dock else len(CROP_STEPS) - 1):
         candidate = prepare(ir, margin, defense, taps) if margin is not None else full
         flow = verdict(candidate) if margin is not None else source_flow
         # a cut bus tap whose column now starts inside the design: a gentler cut keeps the tap
