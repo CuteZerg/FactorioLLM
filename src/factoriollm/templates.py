@@ -585,7 +585,9 @@ def segment_slots(template: Template) -> Dict[str, Any]:
     neighbouring copy that serves a machine of the segment counts too). The cross-section uses the
     notation of the research note: in[A1,A2] out[B1] = belts on side A at reach 1 and 2 feed the
     machines, products go onto a belt on side B (A: the side most inputs come from); "direct" =
-    straight from / into a neighbouring machine. Cross-section and capacities are those of the
+    straight from / into a neighbouring machine, "chest" = products into a chest. A lane counts as
+    carrying products if the row's own machines put them on it (what the author's head makes for
+    the row, gears for science, is an input of the row). Cross-section and capacities are those of the
     machines of the row's main (most common) recipe: a science block also makes its gears.
     """
     from factoriollm.flow_sim import BELT_LIKE, Layout, _reach_all, _vec
@@ -601,7 +603,12 @@ def segment_slots(template: Template) -> Dict[str, Any]:
     at = {(e.x, e.y): j for j, e in enumerate(L.ents)}
     seg = {at[(e.x + shift + dx, e.y + dy)]: k for k, e in enumerate(template.segment) if (e.x + shift + dx, e.y + dy) in at}
     machines = [j for j in seg if L.types[j] in ("assembling-machine", "furnace")]
-    dropped = {dst[1] for _, dst in L.links if dst[0] == "lane"} | {ref for _, (kind, ref) in L.drills if kind == "lane"}
+    # lanes carrying the row's own products: a lane its machines (in any copy) put products on, and
+    # on from there; gears the author's head makes for the row are an input of the row like any other
+    kinds = Counter((L.ents[j].name, L.ents[j].extras_dict.get("recipe")) for j in machines)
+    row_kind = kinds.most_common(1)[0][0] if kinds else None
+    dropped = {dst[1] for src, dst in L.links if dst[0] == "lane" and src[0] == "entity"
+               and (L.ents[src[1]].name, L.ents[src[1]].extras_dict.get("recipe")) == row_kind}
     products = _reach_all(L, dropped)
 
     def side(j: int, belt: int) -> int:
@@ -625,6 +632,8 @@ def segment_slots(template: Template) -> Dict[str, Any]:
             hands.append({**hand, "machine": dst[1], "role": "in", "side": side(dst[1], src[1]), "lanes": lanes})
         elif src[0] == "entity" and src[1] in machines and dst[0] == "lane":
             hands.append({**hand, "machine": src[1], "role": "out", "side": side(src[1], dst[1][0]), "lanes": [dst[1]]})
+        elif src[0] == "entity" and src[1] in machines and dst[0] == "entity" and L.storage[dst[1]]:
+            hands.append({**hand, "machine": src[1], "role": "chest", "side": 0, "lanes": []})  # products into a chest
         elif src[0] == "entity" and dst[0] == "entity" and src[1] in is_machine and dst[1] in is_machine:
             if src[1] in machines:  # straight into the next machine (cable into the circuit machine)
                 hands.append({**hand, "machine": src[1], "role": "direct", "side": 0, "lanes": []})
@@ -640,7 +649,8 @@ def segment_slots(template: Template) -> Dict[str, Any]:
         outs = sorted({f"{name[h['side']]}{h['reach']}" for h in mine if h["role"] == "out"})
         direct_in = ["direct"] if any(h["role"] == "direct_in" for h in mine) else []
         direct = ["direct"] if any(h["role"] == "direct" for h in mine) else []
-        return f"in[{','.join(ins + direct_in)}] out[{','.join(outs + direct)}]"
+        chest = ["chest"] if any(h["role"] == "chest" for h in mine) else []
+        return f"in[{','.join(ins + direct_in)}] out[{','.join(outs + chest + direct)}]"
 
     # the row's own machines: those of its most common recipe (a science block also makes its gears)
     recipes = Counter(L.ents[j].extras_dict.get("recipe") for j in machines)
