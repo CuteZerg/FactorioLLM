@@ -1001,7 +1001,7 @@ def add_port_labels(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal"
     Labels go behind a start / in front of an end first, then to the sides, then to the nearest free
     tile (designs walled in by beacons); with inside_only the bounding box is not left.
     """
-    from factoriollm.flow_sim import Layout, solve
+    from factoriollm.flow_sim import Layout, check, solve
 
     LABEL_REACH = 6
     ents = list(ir.entities)
@@ -1057,21 +1057,40 @@ def add_port_labels(ir: IRBlueprint, smelt: str = "iron-ore", fuel: str = "coal"
         return [behind, (x + lx, y + ly), (x - lx, y - ly), (behind[0] + lx, behind[1] + ly),
                 (behind[0] - lx, behind[1] - ly)]
 
+    def lane_matters(i: int, half: int, by_lane: Dict[int, Set[str]]) -> bool:
+        """
+        Whether the input belt must be fed lane by lane: its two items swapped, or its single item
+        on both lanes, the design no longer works (copper on the left lane only, the right one runs
+        into the iron lane further on). Otherwise one label shows what goes in, one item per lane in
+        any order (the in-game review of 30.10).
+        """
+        lanes = (2 * half, 2 * half + 1)
+        if any(len(v) != 1 for v in by_lane.values()):
+            return True
+        if len(by_lane) == 2:
+            (a, x), (b, y) = sorted((lane, next(iter(v))) for lane, v in by_lane.items())
+            trial = {("lane", i, a): y, ("lane", i, b): x}
+        else:
+            (lane, v), = by_lane.items()
+            other = lanes[0] if lane == lanes[1] else lanes[1]
+            trial = {("lane", i, other): next(iter(v))}
+        return bool(check(ir, {**flow.inputs, **trial}, layout, one_per_lane=True).problems)
+
     def label_belt(i: int, half: int, by_lane: Dict[int, Set[str]], start: bool, mixed: bool) -> bool:
         """
-        One label in line with the belt end. Where the lanes carry different items, one label per
-        lane, each with the virtual signal L or R (left / right lane in the direction of travel): one
-        label with two items reads as both on either lane (the in-game review of 28.10), and a label
-        beside a belt reads as the label of the next belt. Returns whether the lanes got labels of
-        their own.
+        One label in line with the belt end. Where the lane matters (an input belt, see lane_matters;
+        a mixed line: one lane in, one out), one label per lane, each with the virtual signal L or R
+        (left / right lane in the direction of travel); otherwise one label with both items, one per
+        lane in any order (the in-game review of 30.10). A label beside a belt reads as the label
+        of the next belt. Returns whether the lanes got labels of their own.
         """
         items = set().union(*by_lane.values())
         whole = belt_ring(i, half, start)
         home = tile_of(i, half)
         # both lanes carry the same: L / R tell nothing, even on a mixed line; a single lane on a
-        # mixed line still needs its side
+        # mixed line still needs its side; an input belt gets sides only where the lane matters
         same = len(by_lane) == 2 and len({frozenset(v) for v in by_lane.values()}) == 1
-        if same or (len(by_lane) < 2 and not mixed):
+        if same or (len(by_lane) < 2 and not mixed and not start) or (start and not lane_matters(i, half, by_lane)):
             put(whole, [f"item:{x}" for x in items], home)
             return False
         for lane, v in sorted(by_lane.items()):

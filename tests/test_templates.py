@@ -251,8 +251,8 @@ class TestSelfContained(unittest.TestCase):
         self.assertFalse(has_weaving([ug("underground-belt", 0), ug("underground-belt", 4, True)]))
 
     def test_lanes_with_different_items_get_a_label_each(self):
-        # iron plates (steel) and coal on the two lanes of the input belt: even where the furnaces take
-        # both from either lane, one label with two items reads as both on each lane (review of 28.10)
+        # iron plates (steel) and coal on the two lanes of each splitter half: the halves merge, so the
+        # lanes matter (swapped on one half, coal and iron share a lane): a label per lane
         row = furnace_row(3)
         out = [IREntity("inserter", u, 4, 0) for u in range(2, 14, 2)] + [IREntity("transport-belt", x, 5, 4) for x in range(2, 15)]
         row = row.with_entities(row.entities + out)  # the steel goes out (labels need a working design)
@@ -262,6 +262,19 @@ class TestSelfContained(unittest.TestCase):
                                   "item:steel-plate=1"])
         inside = add_port_labels(row, inside_only=True)
         self.assertTrue(all(e.x >= 0 and e.y >= 0 for e in inside.entities))
+
+    def test_interchangeable_lanes_get_one_label(self):
+        # iron on one lane, copper on the other, both taken by the same inserter: any order works,
+        # one label with both items (the in-game review of 30.10)
+        ents = [IREntity("transport-belt", x, 0, 4) for x in range(4)] + [
+            IREntity("inserter", 1, 1, 0), IREntity("assembling-machine-1", 0, 2, 0, (("recipe", "electronic-circuit"),)),
+            IREntity("inserter", 1, 5, 0)] + [IREntity("transport-belt", x, 6, 4) for x in range(4)]
+        ir = IRBlueprint(ents)
+        from factoriollm.flow_sim import Layout, check
+        flow = check(ir, {("lane", 0, 0): "iron-plate", ("lane", 0, 1): "copper-cable"}, Layout(ir))
+        self.assertTrue(flow.ok, flow.problems)
+        labels = [e.extras_dict["signals"] for e in add_port_labels(ir, flow=flow).entities if e.name == "constant-combinator"]
+        self.assertIn("item:copper-cable=1;item:iron-plate=1", labels)
 
     def test_crop_keeps_the_underground_copies_join_at(self):
         # a yellow pair weaves from one copy of the cell into the next: in one copy its exit has no

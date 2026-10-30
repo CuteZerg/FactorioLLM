@@ -1545,6 +1545,37 @@ def _score(L: Layout, result: FlowResult, smelt: str, fuel: str, hints: Dict[Til
 MAX_IMPROVE = 120  # simulations spent on improving the chosen assignment
 
 
+def _fewer_items(ir: IRBlueprint, L: Layout, best: FlowResult, smelt: str, fuel: str,
+                 hints: Dict[Tile, Set[str]]) -> FlowResult:
+    """
+    A template's belt fed two different items is fed one where that works: the same item on both
+    lanes, else one lane left empty (copper on the left lane only, its right lane runs into the iron
+    lane further on). The search and _improve favour more items coming in (labs want every pack on
+    their belts); a belt asking for an item the design gets elsewhere anyway is harder to feed for
+    nothing (the in-game review of 30.10).
+    """
+    belts: Dict[Tuple[int, int], Dict[Tuple[Any, ...], str]] = {}
+    for k, x in best.inputs.items():
+        if k[0] == "lane" and len(k) == 3 and x:
+            belts.setdefault((k[1], k[2] // 2), {})[k] = x
+    for lanes in belts.values():
+        if len(lanes) != 2 or len(set(lanes.values())) != 2:
+            continue
+        a, b = sorted(lanes)
+        x, y = lanes[a], lanes[b]
+        for va, vb in ((x, x), (y, y), (x, None), (None, y)):
+            inputs = {**best.inputs, a: va, b: vb}
+            # the item must still come in elsewhere: a lab works on any one pack, but wants them all
+            if {v for v in inputs.values() if v} != {v for v in best.inputs.values() if v}:
+                continue
+            trial = check(ir, inputs, L, one_per_lane=True)
+            if not trial.problems:
+                trial.score = _score(L, trial, smelt, fuel, hints)
+                best = trial
+                break
+    return best
+
+
 def _improve(ir: IRBlueprint, L: Layout, best: FlowResult, domains, smelt: str, fuel: str,
              hints: Dict[Tile, Set[str]], one_per_lane: bool = False) -> FlowResult:
     """
@@ -1905,8 +1936,9 @@ def _search_inputs(ir: IRBlueprint, L: Layout, smelt: str, fuel: str, hints: Dic
     if solutions:
         for s in solutions:
             s.score = _score(L, s, smelt, fuel, hints)
-        return _improve(ir, L, max(solutions, key=lambda s: s.score), domains, smelt, fuel, hints,
+        best = _improve(ir, L, max(solutions, key=lambda s: s.score), domains, smelt, fuel, hints,
                         one_per_lane=one_per_lane)
+        return _fewer_items(ir, L, best, smelt, fuel, hints) if one_per_lane else best
     result = best_fail[0] or check(ir, {p: (fluid_domains[p][0] if p in fluid_domains else None) for p in ports}, L,
                                    one_per_lane=one_per_lane)
     ran_out = leaves[0] >= max_leaves or steps[0] >= MAX_STEPS * max_leaves
